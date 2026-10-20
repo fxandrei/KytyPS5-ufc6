@@ -8745,6 +8745,30 @@ public:
               !texture_cache.IsMeta(base + variant_htile_d32) &&
                   !texture_cache.IsMeta(base + variant_htile_d32s8),
               "a non-depth replacement kept the surface's HTile clear state");
+      (void)bind_variant(variant_d32s8);
+      (void)bind_variant(variant_d32);
+      Require(name, "HTile state while a depth variant remains",
+              texture_cache.IsMeta(base + variant_htile_d32) &&
+                  texture_cache.IsMeta(base + variant_htile_d32s8),
+              "the depth variants did not re-register both HTiles");
+      // A kept HTile reused by another depth surface starts from that surface's own state.
+      (void)texture_cache.ClearMeta(base + variant_htile_d32);
+      auto other_surface = MakeMetadataDepth(variant_data + 0x800, variant_htile_d32);
+      other_surface.info.htile_initial_clear = false;
+      (void)bind_variant(other_surface);
+      Require(name, "HTile clear does not move to another surface",
+              !texture_cache.IsMetaCleared(base + variant_htile_d32, 0),
+              "a depth surface inherited another surface's pending HTile clear");
+      texture_cache.UnmapMemory(base + variant_data, sizeof(uint32_t));
+      Require(name, "HTile state of a rebinding surface survives the old surface",
+              texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "retiring a surface erased an HTile another surface had rebound");
+      texture_cache.UnmapMemory(base + variant_data + 0x800, sizeof(uint32_t));
+      Require(name, "HTile state retires with the last depth image",
+              !texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "deleting the surface's last depth image kept its HTile clear state");
 
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =
