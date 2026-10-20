@@ -7061,6 +7061,66 @@ public:
                   ", column 32 = " +
                   std::to_string(std::bit_cast<float>(grown_init_words[32])) + ")");
 
+      // Stencil written by the GPU (as by a draw: the association is not marked) lives only in
+      // the cached image and must survive the recreate; the grown region comes from guest memory.
+      constexpr uint64_t grown_stencil_depth_offset = 0x2e20000;
+      constexpr uint64_t grown_stencil_offset = 0x2e30000;
+      constexpr uint64_t grown_stencil_size = grown_depth_pitch * 32u;
+      constexpr uint8_t grown_stencil_guest = 0x11;
+      constexpr uint8_t grown_stencil_gpu = 0x35;
+      std::memset(memory + grown_stencil_offset, grown_stencil_guest, grown_stencil_size);
+      const auto make_padded_depth_stencil = [&](uint32_t width) {
+        auto desc = make_padded_depth(width, grown_stencil_depth_offset);
+        desc.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+        desc.info.stencil = {base + grown_stencil_offset, grown_stencil_size};
+        desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+        desc.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        return desc;
+      };
+      auto small_stencil = make_padded_depth_stencil(32);
+      const auto small_stencil_image = texture_cache.FindImage(small_stencil);
+      (void)texture_cache.FindDepthTarget(small_stencil_image, small_stencil);
+      {
+        auto &image = texture_cache.GetImage(small_stencil_image);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        const vk::ClearDepthStencilValue stencil_value{0.f, grown_stencil_gpu};
+        const vk::ImageSubresourceRange stencil_range{
+            vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearDepthStencilImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &stencil_value, 1,
+            &stencil_range);
+      }
+      auto grown_stencil = make_padded_depth_stencil(128);
+      const auto grown_stencil_image = texture_cache.FindImage(grown_stencil);
+      (void)texture_cache.FindDepthTarget(grown_stencil_image, grown_stencil);
+      auto grown_stencil_readback = CreateHostBuffer(
+          name, 128, vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::BufferImageCopy grown_stencil_row{
+          0, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {0, 31, 0}, {128, 1, 1}};
+      texture_cache.GetImage(grown_stencil_image).Download(
+          std::span{&grown_stencil_row, 1}, grown_stencil_readback.buffer, 0,
+          grown_stencil_readback.size);
+      HostReadBarrier(grown_stencil_readback.buffer, grown_stencil_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      const auto grown_stencil_words = ReadBuffer(name, grown_stencil_readback, 32);
+      std::array<uint8_t, 128> grown_stencil_bytes{};
+      std::memcpy(grown_stencil_bytes.data(), grown_stencil_words.data(),
+                  grown_stencil_bytes.size());
+      std::array<uint8_t, 128> grown_stencil_expected{};
+      grown_stencil_expected.fill(grown_stencil_guest);
+      std::fill_n(grown_stencil_expected.begin(), 32, grown_stencil_gpu);
+      Require(name, "grown depth target stencil",
+              grown_stencil_image != small_stencil_image &&
+                  grown_stencil_bytes == grown_stencil_expected,
+              "the recreated depth target lost the cached stencil or left the grown region "
+              "uninitialized (column 0 = " + std::to_string(grown_stencil_bytes[0]) +
+                  ", column 32 = " + std::to_string(grown_stencil_bytes[32]) + ")");
+
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),
