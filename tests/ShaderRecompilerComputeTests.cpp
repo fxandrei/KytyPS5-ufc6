@@ -6985,6 +6985,37 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
+      // A depth target reusing a smaller depth surface's address and padded pitch must not
+      // bind the smaller image: the render area follows the requested extent.
+      constexpr uint64_t grown_depth_offset = 0x2e00000;
+      constexpr uint32_t grown_depth_pitch = 128;
+      constexpr uint64_t grown_depth_size = grown_depth_pitch * 32u * sizeof(float);
+      const auto make_padded_depth = [&](uint32_t width) {
+        auto desc = MakeLinearDesc(
+            base + grown_depth_offset, grown_depth_size, vk::Format::eD32Sfloat,
+            Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+            {width, 32, 1}, 1, sizeof(float), 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.pitch = grown_depth_pitch;
+        desc.info.mip_layout[0].pitch = grown_depth_pitch;
+        desc.info.mip_layout[0].linear_pitch = grown_depth_pitch;
+        desc.view_info.format = vk::Format::eD32Sfloat;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      auto small_depth = make_padded_depth(32);
+      const auto small_depth_image = texture_cache.FindImage(small_depth);
+      (void)texture_cache.FindDepthTarget(small_depth_image, small_depth);
+      auto grown_depth = make_padded_depth(128);
+      const auto grown_depth_image = texture_cache.FindImage(grown_depth);
+      const auto &grown_info = texture_cache.GetImage(grown_depth_image).info;
+      Require(name, "grown depth target extent",
+              grown_info.extent.width >= 128u && grown_info.extent.height >= 32u,
+              "a 128x32 depth target bound a " + std::to_string(grown_info.extent.width) +
+                  "x" + std::to_string(grown_info.extent.height) +
+                  " image created for a smaller target at the same address");
+
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),

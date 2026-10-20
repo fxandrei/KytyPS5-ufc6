@@ -675,6 +675,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			// A padded pitch lets a larger target match a smaller one here; the render area
+			// follows the requested extent, so the attachment must cover it.
+			recreate |= requested.extent.width > cached.info.extent.width ||
+			            requested.extent.height > cached.info.extent.height;
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
