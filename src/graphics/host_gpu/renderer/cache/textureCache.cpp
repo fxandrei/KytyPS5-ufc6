@@ -663,6 +663,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	// A padded pitch lets a larger depth target match a smaller one at the same address.
+	const bool grown_depth_target = binding == BindingType::DepthTarget &&
+	                                (requested.extent.width > cached.info.extent.width ||
+	                                 requested.extent.height > cached.info.extent.height);
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
@@ -675,10 +679,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
-			// A padded pitch lets a larger target match a smaller one here; the render area
-			// follows the requested extent, so the attachment must cover it.
-			recreate |= requested.extent.width > cached.info.extent.width ||
-			            requested.extent.height > cached.info.extent.height;
+			// The render area follows the requested extent, so the attachment must cover it.
+			recreate |= grown_depth_target;
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
@@ -709,6 +711,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
+			if (grown_depth_target) {
+				// The copy covers only the cached extent and marks the replacement current, so
+				// upload the rest from guest memory first.
+				RefreshImage(replacement_id);
+			}
 			CopyImage(replacement_id, cached_id);
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,

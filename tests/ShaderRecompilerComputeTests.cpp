@@ -6990,9 +6990,10 @@ public:
       constexpr uint64_t grown_depth_offset = 0x2e00000;
       constexpr uint32_t grown_depth_pitch = 128;
       constexpr uint64_t grown_depth_size = grown_depth_pitch * 32u * sizeof(float);
-      const auto make_padded_depth = [&](uint32_t width) {
+      const auto make_padded_depth = [&](uint32_t width,
+                                         uint64_t offset = grown_depth_offset) {
         auto desc = MakeLinearDesc(
-            base + grown_depth_offset, grown_depth_size, vk::Format::eD32Sfloat,
+            base + offset, grown_depth_size, vk::Format::eD32Sfloat,
             Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
             {width, 32, 1}, 1, sizeof(float), 1);
         desc.type = BindingType::DepthTarget;
@@ -7015,6 +7016,50 @@ public:
               "a 128x32 depth target bound a " + std::to_string(grown_info.extent.width) +
                   "x" + std::to_string(grown_info.extent.height) +
                   " image created for a smaller target at the same address");
+
+      // The recreated target is larger than the cached image: the part outside the old extent
+      // comes from guest memory, the old extent from the cached GPU contents.
+      constexpr uint64_t grown_init_offset = 0x2e10000;
+      constexpr float grown_guest_inside = 0.25f;
+      constexpr float grown_guest_outside = 0.5f;
+      constexpr float grown_gpu_value = 0.75f;
+      for (uint32_t texel = 0; texel < grown_depth_pitch * 32u; texel++) {
+        const float value =
+            texel % grown_depth_pitch < 32u ? grown_guest_inside : grown_guest_outside;
+        std::memcpy(memory + grown_init_offset + texel * sizeof(float), &value, sizeof(value));
+      }
+      auto small_init = make_padded_depth(32, grown_init_offset);
+      const auto small_init_image = texture_cache.FindImage(small_init);
+      (void)texture_cache.FindDepthTarget(small_init_image, small_init);
+      vk::ClearValue grown_gpu_clear{};
+      grown_gpu_clear.depthStencil.depth = grown_gpu_value;
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), small_init_image,
+          {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, grown_gpu_clear);
+      auto grown_init = make_padded_depth(128, grown_init_offset);
+      const auto grown_init_image = texture_cache.FindImage(grown_init);
+      (void)texture_cache.FindDepthTarget(grown_init_image, grown_init);
+      auto grown_init_readback = CreateHostBuffer(
+          name, 128 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::BufferImageCopy grown_init_row{
+          0, 0, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {0, 31, 0}, {128, 1, 1}};
+      texture_cache.GetImage(grown_init_image).Download(
+          std::span{&grown_init_row, 1}, grown_init_readback.buffer, 0,
+          grown_init_readback.size);
+      HostReadBarrier(grown_init_readback.buffer, grown_init_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      std::vector<uint32_t> grown_init_expected(128,
+                                                std::bit_cast<uint32_t>(grown_guest_outside));
+      std::fill_n(grown_init_expected.begin(), 32, std::bit_cast<uint32_t>(grown_gpu_value));
+      const auto grown_init_words = ReadBuffer(name, grown_init_readback, 128);
+      Require(name, "grown depth target contents",
+              grown_init_image != small_init_image && grown_init_words == grown_init_expected,
+              "the recreated depth target lost the cached depth or left the grown region "
+              "uninitialized (column 0 = " +
+                  std::to_string(std::bit_cast<float>(grown_init_words[0])) +
+                  ", column 32 = " +
+                  std::to_string(std::bit_cast<float>(grown_init_words[32])) + ")");
 
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
