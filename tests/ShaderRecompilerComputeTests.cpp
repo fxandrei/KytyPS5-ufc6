@@ -5686,13 +5686,13 @@ public:
               "unmapping the table kept its images pinned");
       // A smaller table enters once a second draw acquires it and leaves at the suspend point
       // after a frame that did not acquire it. Larger tables stay.
-      const IR::ImageHeapRequest small{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
-      Require(name, "first small draw",
-              acquire(sampled, idle_table) && !heap.Acquire(small, view) &&
-                  !heap.Acquire(small, view),
+      const IR::ImageHeapRequest small_table{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
+      Require(name, "first small_table draw",
+              acquire(sampled, idle_table) && !heap.Acquire(small_table, view) &&
+                  !heap.Acquire(small_table, view),
               "a smaller table entered on its first draw");
       draw();
-      Require(name, "second small draw", heap.Acquire(small, view),
+      Require(name, "second small_table draw", heap.Acquire(small_table, view),
               "a smaller table was declined on its second draw");
       context.RunGarbageCollector();
       Require(name, "acquired frame", ImageHeapTestAccess::MemoryCount(heap) == 2u,
