@@ -582,6 +582,32 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.width == std::numeric_limits<uint32_t>::max() ||
 	        state.height == std::numeric_limits<uint32_t>::max());
+	// The guest extents above can exceed the host image an attachment was placed in. Rendering past
+	// an attachment faults NVIDIA GPUs ("3D WIDTH ZT Violation") and loses the device, so keep the
+	// render area, and with it the scissors, inside every attachment.
+	const auto clamp_to_attachment = [&](const char* kind, ImageId id, uint32_t level) {
+		const auto&    host   = cache.GetImage(id);
+		const uint32_t width  = std::max(host.info.extent.width >> level, 1u);
+		const uint32_t height = std::max(host.info.extent.height >> level, 1u);
+		if (state.width <= width && state.height <= height) {
+			return;
+		}
+		static std::atomic_int reported = 0;
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("render area %ux%u exceeds the %s attachment %ux%u (level %u, %s, guest "
+			            "0x%" PRIx64 ")\n",
+			            state.width, state.height, kind, width, height, level,
+			            vk::to_string(host.info.pixel_format).c_str(), host.info.data.address);
+		}
+		state.width  = std::min(state.width, width);
+		state.height = std::min(state.height, height);
+	};
+	for (uint32_t i = 0; i < color_count; i++) {
+		clamp_to_attachment("color", colors[i].image_id, colors[i].desc.view_info.base_level);
+	}
+	if (depth.image_id) {
+		clamp_to_attachment("depth", depth.image_id, depth.desc.view_info.base_level);
+	}
 	return state;
 }
 
