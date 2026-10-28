@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <atomic>
 
 namespace Libs::Graphics::HW {
 
@@ -642,39 +643,63 @@ public:
 
 	void Reset() { *this = Context(); }
 
-	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
-	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; }
-	void SetColorInfo(uint32_t slot, const ColorInfo& info) { m_render_targets[slot].info = info; }
+	void SetColorBase(uint32_t slot, const ColorBase& base) {
+		m_render_targets[slot].base = base;
+		StampTarget(slot);
+	}
+	void SetColorView(uint32_t slot, const ColorView& view) {
+		m_render_targets[slot].view = view;
+		StampTarget(slot);
+	}
+	void SetColorInfo(uint32_t slot, const ColorInfo& info) {
+		m_render_targets[slot].info = info;
+		StampTarget(slot);
+	}
 	void SetColorAttrib(uint32_t slot, const ColorAttrib& attrib) {
 		m_render_targets[slot].attrib = attrib;
+		StampTarget(slot);
 	}
 	void SetColorAttrib2(uint32_t slot, const ColorAttrib2& attrib2) {
 		m_render_targets[slot].attrib2 = attrib2;
+		StampTarget(slot);
 	}
 	void SetColorAttrib3(uint32_t slot, const ColorAttrib3& attrib3) {
 		m_render_targets[slot].attrib3 = attrib3;
+		StampTarget(slot);
 	}
 	void SetColorDccControl(uint32_t slot, const ColorDccControl& dcc) {
 		m_render_targets[slot].dcc = dcc;
+		StampTarget(slot);
 	}
 	void SetColorCmask(uint32_t slot, const ColorCmask& cmask) {
 		m_render_targets[slot].cmask = cmask;
+		StampTarget(slot);
 	}
 	void SetColorFmask(uint32_t slot, const ColorFmask& fmask) {
 		m_render_targets[slot].fmask = fmask;
+		StampTarget(slot);
 	}
 	void SetColorClearWord0(uint32_t slot, const ColorClearWord0& clear_word0) {
 		m_render_targets[slot].clear_word0 = clear_word0;
+		StampTarget(slot);
 	}
 	void SetColorClearWord1(uint32_t slot, const ColorClearWord1& clear_word1) {
 		m_render_targets[slot].clear_word1 = clear_word1;
+		StampTarget(slot);
 	}
 	void SetColorDccAddr(uint32_t slot, const ColorDccAddr& dcc_addr) {
 		m_render_targets[slot].dcc_addr = dcc_addr;
+		StampTarget(slot);
 	}
 	[[nodiscard]] const RenderTarget& GetRenderTarget(uint32_t slot) const {
 		return m_render_targets[slot];
 	}
+	// A value that no other state of the slot's registers has had (0 before the first write): a
+	// render-target lookup may reuse its last result while the stamp stays the same.
+	[[nodiscard]] uint64_t GetRenderTargetStamp(uint32_t slot) const {
+		return m_target_stamps[slot];
+	}
+	[[nodiscard]] uint64_t GetDepthTargetStamp() const { return m_target_stamps[8]; }
 
 	void SetBlendControl(uint32_t slot, const BlendControl& control) {
 		m_blend_control[slot] = control;
@@ -693,32 +718,56 @@ public:
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
 	[[nodiscard]] uint32_t GetShaderStages() const { return m_shader_stages; }
 
-	void SetDepthRenderTarget(const DepthRenderTarget& target) { m_depth_render_target = target; }
+	void SetDepthRenderTarget(const DepthRenderTarget& target) {
+		m_depth_render_target = target;
+		StampTarget(8);
+	}
 	[[nodiscard]] const DepthRenderTarget& GetDepthRenderTarget() const {
 		return m_depth_render_target;
 	}
-	void SetDepthZInfo(const DepthZInfo& info) { m_depth_render_target.z_info = info; }
+	void SetDepthZInfo(const DepthZInfo& info) {
+		m_depth_render_target.z_info = info;
+		StampTarget(8);
+	}
 	[[nodiscard]] const DepthZInfo& GetDepthZInfo() const { return m_depth_render_target.z_info; }
 	void                            SetDepthStencilInfo(const DepthStencilInfo& info) {
 		m_depth_render_target.stencil_info = info;
+		StampTarget(8);
 	}
 	[[nodiscard]] const DepthStencilInfo& GetDepthStencilInfo() const {
 		return m_depth_render_target.stencil_info;
 	}
-	void SetDepthZReadBase(uint64_t addr) { m_depth_render_target.z_read_base_addr = addr; }
+	void SetDepthZReadBase(uint64_t addr) {
+		m_depth_render_target.z_read_base_addr = addr;
+		StampTarget(8);
+	}
 	void SetDepthStencilReadBase(uint64_t addr) {
 		m_depth_render_target.stencil_read_base_addr = addr;
+		StampTarget(8);
 	}
-	void SetDepthZWriteBase(uint64_t addr) { m_depth_render_target.z_write_base_addr = addr; }
+	void SetDepthZWriteBase(uint64_t addr) {
+		m_depth_render_target.z_write_base_addr = addr;
+		StampTarget(8);
+	}
 	void SetDepthStencilWriteBase(uint64_t addr) {
 		m_depth_render_target.stencil_write_base_addr = addr;
+		StampTarget(8);
 	}
-	void SetDepthHTileDataBase(uint64_t addr) { m_depth_render_target.htile_data_base_addr = addr; }
-	void SetDepthDepthView(const DepthDepthView& view) { m_depth_render_target.depth_view = view; }
+	void SetDepthHTileDataBase(uint64_t addr) {
+		m_depth_render_target.htile_data_base_addr = addr;
+		StampTarget(8);
+	}
+	void SetDepthDepthView(const DepthDepthView& view) {
+		m_depth_render_target.depth_view = view;
+		StampTarget(8);
+	}
 	[[nodiscard]] const DepthDepthView& GetDepthDepthView() const {
 		return m_depth_render_target.depth_view;
 	}
-	void SetDepthDepthSizeXY(const DepthDepthSizeXY& size) { m_depth_render_target.size = size; }
+	void SetDepthDepthSizeXY(const DepthDepthSizeXY& size) {
+		m_depth_render_target.size = size;
+		StampTarget(8);
+	}
 	[[nodiscard]] const DepthDepthSizeXY& GetDepthDepthSizeXY() const {
 		return m_depth_render_target.size;
 	}
@@ -942,6 +991,12 @@ private:
 	uint32_t m_shader_stages = 0;
 
 	DepthRenderTarget   m_depth_render_target;
+	std::array<uint64_t, 9> m_target_stamps {}; // Eight color slots, then depth.
+
+	void StampTarget(uint32_t index) {
+		static std::atomic_uint64_t next {1};
+		m_target_stamps[index] = next.fetch_add(1, std::memory_order_relaxed);
+	}
 	RenderControl       m_render_control;
 	DepthRenderOverride m_depth_render_override;
 	DepthControl        m_depth_control;

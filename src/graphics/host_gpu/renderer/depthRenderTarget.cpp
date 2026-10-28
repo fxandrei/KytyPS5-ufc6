@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -310,7 +311,15 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	// Unchanged depth registers and image set resolve to the same descriptor and image.
+	auto&      cache = m_context.GetTextureCache();
+	auto&      memo  = m_depth_target_memo;
+	const auto stamp = hw.GetDepthTargetStamp();
+	const bool memo_enabled =
+	    stamp != 0 && Common::AbSwitch::Enabled(Common::AbSwitch::TARGET_LOOKUP_MEMO);
+	const bool reuse =
+	    memo_enabled && memo.stamp == stamp && memo.generation == cache.StructureGeneration();
+	r.desc                    = reuse ? memo.desc : MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -347,8 +356,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	if (reuse) {
+		r.image_id = memo.image_id;
+		cache.ReuseImage(r.image_id, r.desc, memo.metadata_base_layer);
+	} else {
+		const auto metadata_base_layer = r.desc.view_info.base_layer;
+		r.image_id                     = cache.FindImage(r.desc);
+		if (memo_enabled) {
+			memo = {stamp, cache.StructureGeneration(), metadata_base_layer, r.desc, r.image_id};
+		}
+	}
 	BindRenderTarget(r.image_id);
 }
 

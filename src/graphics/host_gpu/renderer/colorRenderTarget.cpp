@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -47,6 +48,36 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
+	// Unchanged slot registers and image set resolve to the same descriptor and image.
+	auto&      texture_cache = m_context.GetTextureCache();
+	auto&      memo          = m_color_target_memo[rt_slot];
+	const auto stamp         = hw.GetRenderTargetStamp(rt_slot);
+	const bool memo_enabled =
+	    stamp != 0 && Common::AbSwitch::Enabled(Common::AbSwitch::TARGET_LOOKUP_MEMO);
+	if (memo_enabled && memo.stamp == stamp && memo.target_mask == hw.GetRenderTargetMask() &&
+	    memo.slice_offset == render_target_slice_offset &&
+	    memo.ignore_target_mask == ignore_target_mask && memo.exact_format == exact_format &&
+	    memo.generation == texture_cache.StructureGeneration()) {
+		r = memo.target;
+		if (r.image_id) {
+			texture_cache.ReuseImage(r.image_id, r.desc, memo.metadata_base_layer);
+			BindRenderTarget(r.image_id);
+		}
+		return;
+	}
+	const auto remember = [&](uint32_t metadata_base_layer) {
+		if (memo_enabled) {
+			memo = {stamp,
+			        texture_cache.StructureGeneration(),
+			        hw.GetRenderTargetMask(),
+			        render_target_slice_offset,
+			        ignore_target_mask,
+			        exact_format,
+			        metadata_base_layer,
+			        r};
+		}
+	};
+
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
@@ -69,6 +100,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			}
 		}
 
+		remember(0);
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
@@ -262,12 +294,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	remember(view.base_layer);
 }
 
 } // namespace Libs::Graphics

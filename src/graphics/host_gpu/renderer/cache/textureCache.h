@@ -53,6 +53,12 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Changes whenever an image is registered or unregistered, i.e. whenever FindImage could
+	// resolve an unchanged render-target descriptor differently (AbSwitch TARGET_LOOKUP_MEMO).
+	[[nodiscard]] uint64_t StructureGeneration() const noexcept { return m_structure_generation; }
+	// FindImage's work after the lookup, for an image that an identical earlier lookup returned
+	// while StructureGeneration was the same; desc is that lookup's (possibly remapped) descriptor.
+	void ReuseImage(ImageId id, ImageDesc& desc, uint32_t metadata_base_layer);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -140,6 +146,7 @@ private:
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
+	uint64_t                    m_structure_generation = 1;
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,

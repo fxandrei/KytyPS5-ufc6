@@ -216,7 +216,28 @@ private:
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+	// AbSwitch TARGET_LOOKUP_MEMO: the last resolution of each render-target slot.
+	struct ColorTargetMemo {
+		uint64_t        stamp               = 0;
+		uint64_t        generation          = 0;
+		uint32_t        target_mask         = 0;
+		uint32_t        slice_offset        = 0;
+		bool            ignore_target_mask  = false;
+		bool            exact_format        = false;
+		uint32_t        metadata_base_layer = 0;
+		RenderColorInfo target;
+	};
+	struct DepthTargetMemo {
+		uint64_t                stamp               = 0;
+		uint64_t                generation          = 0;
+		uint32_t                metadata_base_layer = 0;
+		TextureCache::ImageDesc desc;
+		ImageId                 image_id;
+	};
+
 	RenderContext&                        m_context;
+	std::array<ColorTargetMemo, 8>        m_color_target_memo;
+	DepthTargetMemo                       m_depth_target_memo;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

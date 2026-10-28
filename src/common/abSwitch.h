@@ -14,11 +14,11 @@ inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
 // SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT,
-// DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES and
-// PIPELINE_BIND_DEDUPE. KYTY_AB=0 turns them all off.
-inline constexpr uint32_t DEFAULT_MASK = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) |
-                                         (1u << 7) | (1u << 9) | (1u << 10) | (1u << 11) |
-                                         (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16);
+// DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
+// PIPELINE_BIND_DEDUPE and TARGET_LOOKUP_MEMO. KYTY_AB=0 turns them all off.
+inline constexpr uint32_t DEFAULT_MASK =
+    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 9) | (1u << 10) |
+    (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -93,6 +93,9 @@ inline constexpr uint32_t LAZY_GPU_POLL = 14;
 inline constexpr uint32_t BDA_SYNC_WRITE_RANGES = 15;
 // A draw does not bind the graphics pipeline that the command buffer already has bound.
 inline constexpr uint32_t PIPELINE_BIND_DEDUPE = 16;
+// A render-target slot whose registers have not changed (HW::Context stamps) reuses its last
+// resolved descriptor and image while the texture cache's image set is the same.
+inline constexpr uint32_t TARGET_LOOKUP_MEMO = 17;
 
 } // namespace Common::AbSwitch
 

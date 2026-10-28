@@ -233,6 +233,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	++m_structure_generation;
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
@@ -253,6 +254,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	++m_structure_generation;
 	image.HeapChanged();
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
@@ -1468,6 +1470,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 	}
 	return result;
+}
+
+void TextureCache::ReuseImage(ImageId id, ImageDesc& desc, uint32_t metadata_base_layer) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image   = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.AgeTick();
+		TouchImage(image);
+	}
+	MaterializeColorClear(id, desc, metadata_base_layer);
 }
 
 void TextureCache::UpdateImage(ImageId id) {
