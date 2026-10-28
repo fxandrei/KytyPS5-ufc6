@@ -919,6 +919,16 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+bool TryReadGpuCleanBytes(uint64_t vaddr, void* data, uint64_t size) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->ReadCleanBytes(vaddr, data, size);
+}
+
+void TraceGpuDirtyRead(const char* what, uint64_t vaddr) noexcept {
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->TraceDirtyRead(what, vaddr);
+	}
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

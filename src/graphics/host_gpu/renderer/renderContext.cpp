@@ -1,12 +1,18 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -72,6 +78,30 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::ReadCleanBytes(uint64_t vaddr, void* data, uint64_t size) noexcept {
+	// The buffer cache belongs to the guest GPU thread.
+	return GuestGpu::IsGpuThread() && IsMapped(vaddr, size) &&
+	       m_buffer_cache.IsRegionGpuModified(vaddr, size) &&
+	       !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	       LibKernel::Memory::TryReadBacking(vaddr, data, size);
+}
+
+void RenderContext::TraceDirtyRead(const char* what, uint64_t vaddr) noexcept {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_TRACE_WRITES");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	static std::atomic_int printed = 0;
+	if (limit <= 0 || !GuestGpu::IsGpuThread() ||
+	    printed.fetch_add(1, std::memory_order_relaxed) >= limit) {
+		return;
+	}
+	const auto [begin, end] = m_buffer_cache.GpuDirtyRangeAt(vaddr);
+	std::printf("%s read 0x%" PRIx64 " waits for GPU-dirty range 0x%" PRIx64 "-0x%" PRIx64
+	            " (%" PRIu64 " KiB)\n",
+	            what, vaddr, begin, end, (end - begin) / 1024);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -105,10 +135,16 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		const bool registered = m_command_scheduler.Active() &&
+		                        (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                         m_texture_cache.IsRegionRegistered(vaddr, size));
+		if (registered || (m_command_scheduler.Active() &&
+		                   m_command_scheduler.HasPendingPriorityOperations())) {
+			if (!registered) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::UnmapWaitsUnregistered);
+			}
+			Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::UnmapWaits,
+			                                         Common::DebugCounters::Counter::UnmapWaitNs);
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

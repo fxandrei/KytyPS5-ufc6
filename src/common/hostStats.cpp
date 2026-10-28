@@ -14,6 +14,7 @@
 #include <windows.h> // IWYU pragma: keep
 // clang-format off
 #include <psapi.h>
+#include <tlhelp32.h>
 // clang-format on
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -107,6 +108,41 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 		                            : system.dwMemoryLoad >= 80 ? MemoryPressure::Warning
 		                                                        : MemoryPressure::Normal;
 	}
+
+	// Per-thread CPU time, named by SetThreadDescription (guest threads and Tracy-named ones).
+	const DWORD pid      = GetCurrentProcessId();
+	HANDLE      snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	for (BOOL found = Thread32First(snapshot, &entry); found != 0;
+	     found      = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != pid) {
+			continue;
+		}
+		HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+		if (thread == nullptr) {
+			continue;
+		}
+		if (GetThreadTimes(thread, &creation, &exit, &kernel, &user) != 0) {
+			Counters::Thread sample {(FileTimeTo100Ns(kernel) + FileTimeTo100Ns(user)) * 100u, {}};
+			PWSTR            description = nullptr;
+			if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+				char      name[128] {};
+				const int length = WideCharToMultiByte(CP_UTF8, 0, description, -1, name,
+				                                       static_cast<int>(sizeof(name)), nullptr, nullptr);
+				if (length > 1) {
+					sample.name = name;
+				}
+				LocalFree(description);
+			}
+			now.threads.emplace(entry.th32ThreadID, std::move(sample));
+		}
+		CloseHandle(thread);
+	}
+	CloseHandle(snapshot);
 }
 
 #else

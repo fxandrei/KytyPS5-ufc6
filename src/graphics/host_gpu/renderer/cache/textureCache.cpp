@@ -21,9 +21,12 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <span>
 #include <tuple>
 #include <utility>
@@ -114,6 +117,25 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	}
 	clear.float32 = channels;
 	return true;
+}
+
+// KYTY_TRACE_WRITES=<n>: print the first n distinct images refreshed from guest memory.
+void TraceTextureRefresh(const ImageInfo& info, bool from_gpu) {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_TRACE_WRITES");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (limit <= 0) {
+		return;
+	}
+	static std::set<std::pair<uint64_t, bool>> seen;
+	if (static_cast<int>(seen.size()) >= limit || !seen.emplace(info.data.address, from_gpu).second) {
+		return;
+	}
+	std::printf("texture refresh (%s) 0x%" PRIx64 " %ux%ux%u %s %s, %" PRIu64 " KiB\n",
+	            from_gpu ? "gpu buffer write" : "cpu write", info.data.address, info.extent.width,
+	            info.extent.height, info.resources.layers, vk::to_string(info.pixel_format).c_str(),
+	            info.IsTiled() ? "tiled" : "linear", info.data.size / 1024);
 }
 
 } // namespace
@@ -1086,6 +1108,13 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
+		// Diagnostics: GPU buffer writes over the image (refresh from the buffer copy) or guest
+		// CPU writes.
+		const bool from_gpu = image.IsBufferModified();
+		Common::DebugCounters::Add(from_gpu ? Common::DebugCounters::Counter::TextureRefreshesGpu
+		                                    : Common::DebugCounters::Counter::TextureRefreshesCpu,
+		                           image.info.data.size);
+		TraceTextureRefresh(image.info, from_gpu);
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 	}
@@ -1952,11 +1981,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+uint32_t TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
-		return;
+		return 0;
 	}
 	std::scoped_lock lock {m_lock};
+	uint32_t         marked = 0;
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
@@ -1966,7 +1996,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
+		marked++;
 	}
+	return marked;
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {

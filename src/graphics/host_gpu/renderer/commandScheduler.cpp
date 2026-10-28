@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <optional>
 
@@ -101,6 +102,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_gpu_timer_pool) {
+		m_graphics.device.destroyQueryPool(m_gpu_timer_pool);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -210,6 +214,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
+	ReadGpuTimers();
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -336,7 +341,60 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	StartGpuTimer();
 	return m_command;
+}
+
+void CommandScheduler::StartGpuTimer() {
+	m_gpu_timer_query = UINT32_MAX;
+	if (!Common::DebugCounters::Enabled()) {
+		return;
+	}
+	if (!m_gpu_timer_pool) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = GPU_TIMER_QUERIES;
+		if (m_graphics.device.createQueryPool(&info, nullptr, &m_gpu_timer_pool) !=
+		    vk::Result::eSuccess) {
+			m_gpu_timer_pool = nullptr;
+			return;
+		}
+	}
+	if (m_gpu_timer_pending.size() * 2 >= GPU_TIMER_QUERIES) {
+		return; // Every pair is in flight.
+	}
+	const auto query = m_gpu_timer_next;
+	m_gpu_timer_next = (m_gpu_timer_next + 2) % GPU_TIMER_QUERIES;
+	const auto native = m_command.Handle();
+	native.resetQueryPool(m_gpu_timer_pool, query, 2);
+	native.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_gpu_timer_pool, query);
+	m_gpu_timer_query = query;
+}
+
+void CommandScheduler::EndGpuTimer(uint64_t tick) {
+	if (m_gpu_timer_query != UINT32_MAX) {
+		m_gpu_timer_pending.emplace_back(tick, m_gpu_timer_query);
+		m_gpu_timer_query = UINT32_MAX;
+	}
+}
+
+void CommandScheduler::ReadGpuTimers() {
+	const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
+	while (!m_gpu_timer_pending.empty() && m_master.IsFree(m_gpu_timer_pending.front().first)) {
+		const auto query = m_gpu_timer_pending.front().second;
+		m_gpu_timer_pending.pop_front();
+		std::array<uint64_t, 2> stamps {};
+		if (m_graphics.device.getQueryPoolResults(m_gpu_timer_pool, query, 2, sizeof(stamps),
+		                                          stamps.data(), sizeof(uint64_t),
+		                                          vk::QueryResultFlagBits::e64) ==
+		        vk::Result::eSuccess &&
+		    stamps[1] >= stamps[0]) {
+			Common::DebugCounters::Add(
+			    Common::DebugCounters::Counter::GpuBusyNs,
+			    static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period));
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuTimedBuffers);
+		}
+	}
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -344,6 +402,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_gpu_timer_query != UINT32_MAX) {
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+		                                  m_gpu_timer_pool, m_gpu_timer_query + 1);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -383,6 +445,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	EndGpuTimer(tick);
 
 	m_command.m_buffer = nullptr;
 	return tick;

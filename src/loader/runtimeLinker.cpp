@@ -1,5 +1,6 @@
 #include "loader/runtimeLinker.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -668,6 +669,37 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
+		}
+		// The resource-table walker reads tables the game writes on the CPU, often on pages the GPU
+		// also wrote. Complete such a load of clean bytes from the backing store instead of
+		// downloading the page and waiting for the GPU (A/B bit SRT_READ_BACKING).
+		if (const auto length =
+		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
+		    length != 0 && access == GpuAccess::Read) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtWalkerFaults);
+			const auto address = Loader::X64InstructionEmulator::ReadGpr(info->native_context, 10);
+			uint32_t   value   = 0;
+			if (Common::AbSwitch::Enabled(Common::AbSwitch::SRT_READ_BACKING) &&
+			    Libs::LibKernel::Memory::TryReadGpuCleanBytes(address, &value, sizeof(value))) {
+				Loader::X64InstructionEmulator::CompleteLoad(info->native_context, value, length);
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtReadsFromBacking);
+				return true;
+			}
+			Libs::LibKernel::Memory::TraceGpuDirtyRead("srt", address);
+			// Did the GPU really change the bytes this load waits for? Compare guest memory
+			// before and after the download.
+			uint32_t before = 0;
+			uint32_t after  = 0;
+			if (Libs::LibKernel::Memory::TryReadBacking(address, &before, sizeof(before)) &&
+			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				if (Libs::LibKernel::Memory::TryReadBacking(address, &after, sizeof(after))) {
+					Common::DebugCounters::Add(
+					    after == before ? Common::DebugCounters::Counter::DirtyReadsUnchanged
+					                    : Common::DebugCounters::Counter::DirtyReadsChanged);
+				}
+				return true;
+			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);

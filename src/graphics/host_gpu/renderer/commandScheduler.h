@@ -8,8 +8,11 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <mutex>
 #include <queue>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -83,6 +86,9 @@ private:
 	};
 
 	void BeginNext();
+	void StartGpuTimer();
+	void EndGpuTimer(uint64_t tick);
+	void ReadGpuTimers();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -101,6 +107,14 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+
+	// Diagnostics while the counters are on: GPU execution time of each command buffer, from
+	// timestamps at its start and end, read once its tick completes (Counter::GpuBusyNs).
+	static constexpr uint32_t                 GPU_TIMER_QUERIES = 2048;
+	vk::QueryPool                             m_gpu_timer_pool;
+	uint32_t                                  m_gpu_timer_next  = 0;
+	uint32_t                                  m_gpu_timer_query = UINT32_MAX;
+	std::deque<std::pair<uint64_t, uint32_t>> m_gpu_timer_pending; // tick, first query
 };
 
 } // namespace Libs::Graphics

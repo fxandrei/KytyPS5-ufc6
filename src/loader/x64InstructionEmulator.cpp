@@ -823,9 +823,18 @@ bool TryEmulate(void* native_context) {
 }
 
 void SkipLoad(void* native_context, size_t length) {
+	CompleteLoad(native_context, 0, length);
+}
+
+void CompleteLoad(void* native_context, uint32_t value, size_t length) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
-	context.Gpr(0) = 0;
+	context.Gpr(0) = value;
 	context.Advance(length);
+}
+
+uint64_t ReadGpr(void* native_context, uint8_t index) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	return context.Gpr(index);
 }
 
 } // namespace Loader::X64InstructionEmulator

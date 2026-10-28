@@ -1,5 +1,6 @@
 #include "graphics/presentation/performanceOverlay.h"
 
+#include "common/abSwitch.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
@@ -14,6 +15,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -82,6 +84,7 @@ struct Snapshot {
 
 std::mutex            g_frame_mutex;
 FrameWindow           g_frames;
+std::atomic<uint64_t> g_flip_total {0}; // Never reset, unlike the panel's window.
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
 std::atomic<uint64_t> g_revision {0};
@@ -145,6 +148,156 @@ void SamplerThread(const std::stop_token& stop) {
 void EnsureSampler() {
 	static std::once_flag once;
 	std::call_once(once, [] { g_sampler = std::jthread(SamplerThread); });
+}
+
+// KYTY_PERF_CSV=<path> writes one row per second for unattended A/B runs: guest flips, frame
+// time percentiles, the GPU counters and process CPU. The counters it reads also drive the
+// panel, so it turns the panel on.
+std::jthread g_perf_csv;
+
+void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
+	std::fputs("t_s,unix_s,flips,fps,frame_p50_ms,frame_p99_ms,frame_max_ms,draws,dispatches,"
+	           "indirect_draws,submits,gpu_waits,gpu_wait_ms,gpu_faults,tex_up_mb,tex_down_mb,"
+	           "buf_up_mb,buf_down_mb,shaders,shader_ms,pipelines,pipeline_ms,cmask_readback_ms,"
+	           "late_vblanks,cpu_pct,gpu_thread_waits,gpu_thread_wait_ms,unmap_waits,unmap_wait_ms,"
+	           "unmap_waits_unregistered,flip_waits,shreg_reads,shreg_clean,shreg_dirty,dargs_reads,"
+	           "dargs_clean,dargs_dirty,cp_backing_reads,srt_faults,srt_backing,label_writes,"
+	           "label_clean,label_dirty,label_in_order,written_bindings,written_mb,"
+	           "dirty_reads_unchanged,dirty_reads_changed,tex_refresh_gpu_mb,tex_refresh_cpu_mb,"
+	           "gpu_busy_ms,gpu_timed_buffers,ab,"
+	           "thread1,"
+	           "thread1_pct,thread2,thread2_pct,"
+	           "thread3,thread3_pct\n",
+	           file);
+	const char*              ab_file = std::getenv("KYTY_AB_FILE");
+	uint32_t                 ab      = Common::AbSwitch::Mask();
+	Common::HostStatsSampler sampler;
+	(void)sampler.Sample(); // CPU usage needs a previous sample.
+	std::array<uint64_t, COUNTER_COUNT> last {};
+	for (size_t i = 0; i < COUNTER_COUNT; i++) {
+		last[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
+	}
+	uint64_t                    last_flips = g_flip_total.load(std::memory_order_relaxed);
+	const auto                  start      = Clock::now();
+	auto                        last_time  = start;
+	std::mutex                  mutex;
+	std::condition_variable_any wait;
+	std::unique_lock            lock(mutex);
+	for (;;) {
+		wait.wait_for(lock, stop, REFRESH_INTERVAL, [] { return false; });
+		if (stop.stop_requested()) {
+			break;
+		}
+		const auto   now     = Clock::now();
+		const double seconds = std::chrono::duration<double>(now - last_time).count();
+		last_time            = now;
+		const auto flips     = g_flip_total.load(std::memory_order_relaxed);
+		const auto new_flips = flips - last_flips;
+		last_flips           = flips;
+
+		std::array<float, FRAME_HISTORY> intervals {};
+		size_t                           count = 0;
+		{
+			std::scoped_lock frame_lock(g_frame_mutex);
+			count = std::min<size_t>(new_flips, g_frames.count);
+			for (size_t i = 0; i < count; i++) {
+				intervals[i] =
+				    g_frames.intervals_ms[(g_frames.next + FRAME_HISTORY - count + i) % FRAME_HISTORY];
+			}
+		}
+		std::sort(intervals.begin(), intervals.begin() + static_cast<ptrdiff_t>(count));
+		const auto percentile = [&](size_t percent) {
+			return count != 0 ? intervals[std::min(count - 1, count * percent / 100)] : 0.0f;
+		};
+
+		std::array<double, COUNTER_COUNT> rates {};
+		for (size_t i = 0; i < COUNTER_COUNT; i++) {
+			const auto value = Common::DebugCounters::Get(static_cast<Counter>(i));
+			rates[i]         = static_cast<double>(value - last[i]) / seconds;
+			last[i]          = value;
+		}
+		const auto rate = [&](Counter counter) { return rates[static_cast<size_t>(counter)]; };
+		constexpr double MIB  = 1024.0 * 1024.0;
+		const auto       host = sampler.Sample();
+		std::fprintf(
+		    file,
+		    "%.1f,%.3f,%llu,%.2f,%.1f,%.1f,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.0f,%.1f,%.1f,%.1f,"
+		    "%.1f,%.0f,%.1f,%.0f,%.1f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,"
+		    "%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.0f,%.0f,%.1f,%.1f,%.1f,"
+		    "%.0f,%u",
+		    std::chrono::duration<double>(now - start).count(),
+		    std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+		        .count(),
+		    static_cast<unsigned long long>(new_flips), static_cast<double>(new_flips) / seconds,
+		    percentile(50), percentile(99), count != 0 ? intervals[count - 1] : 0.0f,
+		    rate(Counter::Draws), rate(Counter::Dispatches), rate(Counter::IndirectDraws),
+		    rate(Counter::QueueSubmits), rate(Counter::GpuWaits), rate(Counter::GpuWaitNs) / 1e6,
+		    rate(Counter::GpuFaults), rate(Counter::TextureUploadBytes) / MIB,
+		    rate(Counter::TextureDownloadBytes) / MIB, rate(Counter::BufferUploadBytes) / MIB,
+		    rate(Counter::BufferDownloadBytes) / MIB, rate(Counter::ShadersCompiled),
+		    rate(Counter::ShaderCompileNs) / 1e6, rate(Counter::PipelinesCreated),
+		    rate(Counter::PipelineCreateNs) / 1e6, rate(Counter::ColorMetadataReadbackNs) / 1e6,
+		    rate(Counter::LateVblanks), host.process_cpu_percent.value_or(-1.0),
+		    rate(Counter::GpuThreadWaits), rate(Counter::GpuThreadWaitNs) / 1e6,
+		    rate(Counter::UnmapWaits), rate(Counter::UnmapWaitNs) / 1e6,
+		    rate(Counter::UnmapWaitsUnregistered), rate(Counter::FlipWaits),
+		    rate(Counter::ShRegTableReads), rate(Counter::ShRegTableReadsClean),
+		    rate(Counter::ShRegTableReadsDirty), rate(Counter::DispatchArgReads),
+		    rate(Counter::DispatchArgReadsClean), rate(Counter::DispatchArgReadsDirty),
+		    rate(Counter::CpReadsFromBacking), rate(Counter::SrtWalkerFaults),
+		    rate(Counter::SrtReadsFromBacking), rate(Counter::LabelWrites),
+		    rate(Counter::LabelWritesClean), rate(Counter::LabelWritesDirty),
+		    rate(Counter::LabelWritesInOrder), rate(Counter::WrittenBindings),
+		    rate(Counter::WrittenBindingBytes) / MIB, rate(Counter::DirtyReadsUnchanged),
+		    rate(Counter::DirtyReadsChanged), rate(Counter::TextureRefreshesGpu) / MIB,
+		    rate(Counter::TextureRefreshesCpu) / MIB, rate(Counter::GpuBusyNs) / 1e6,
+		    rate(Counter::GpuTimedBuffers), ab);
+		// The three busiest threads, in percent of one core.
+		for (size_t i = 0; i < 3; i++) {
+			if (i < host.busiest_threads.size()) {
+				auto name = host.busiest_threads[i].name;
+				std::replace(name.begin(), name.end(), ',', ';');
+				std::fprintf(file, ",%s,%.1f", name.c_str(), host.busiest_threads[i].cpu_percent);
+			} else {
+				std::fputs(",,", file);
+			}
+		}
+		std::fputc('\n', file);
+		std::fflush(file);
+		// The variant applies from the next row on, so every row measures a single variant.
+		if (ab_file != nullptr) {
+			if (std::FILE* control = std::fopen(ab_file, "r"); control != nullptr) {
+				unsigned long mask = 0;
+				if (std::fscanf(control, "%lu", &mask) == 1) {
+					Common::AbSwitch::g_mask.store(static_cast<uint32_t>(mask),
+					                               std::memory_order_relaxed);
+				}
+				std::fclose(control);
+			}
+		}
+		ab = Common::AbSwitch::Mask();
+	}
+	std::fclose(file);
+}
+
+void EnsurePerfCsv() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* path = std::getenv("KYTY_PERF_CSV");
+		if (path == nullptr || *path == '\0') {
+			return;
+		}
+		std::FILE* file = std::fopen(path, "w");
+		if (file == nullptr) {
+			std::printf("KYTY_PERF_CSV: cannot open %s\n", path);
+			return;
+		}
+		if (!Common::DebugCounters::Enabled()) {
+			SetOverlayEnabled(true);
+			g_revision.fetch_add(1, std::memory_order_acq_rel);
+		}
+		g_perf_csv = std::jthread(PerfCsvThread, file);
+	});
 }
 
 ImU32 FrameTimeColor(double ms) {
@@ -593,10 +746,12 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
+	EnsurePerfCsv();
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
 	std::scoped_lock lock(g_frame_mutex);
+	g_flip_total.fetch_add(1, std::memory_order_relaxed);
 	const auto       now = Clock::now();
 	if (g_frames.window_start == Clock::time_point {}) {
 		g_frames.window_start = now;

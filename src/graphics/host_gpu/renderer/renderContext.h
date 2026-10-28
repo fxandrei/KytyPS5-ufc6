@@ -54,6 +54,10 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// See LibKernel::Memory::TryReadGpuCleanBytes.
+	[[nodiscard]] bool ReadCleanBytes(uint64_t vaddr, void* data, uint64_t size) noexcept;
+	// KYTY_TRACE_WRITES diagnostics: the GPU-dirty range under a read that has to wait for it.
+	void TraceDirtyRead(const char* what, uint64_t vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

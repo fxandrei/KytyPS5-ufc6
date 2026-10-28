@@ -20,6 +20,33 @@ enum class Counter {
 	QueueSubmits,
 	GpuWaits, // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
+	GpuThreadWaits, // The same, on the guest GPU thread only.
+	GpuThreadWaitNs,
+	UnmapWaits, // A guest unmap waited until the GPU was idle.
+	UnmapWaitNs,
+	UnmapWaitsUnregistered, // Only because priority operations were pending.
+	FlipWaits,              // The command processor suspended on WaitFlipDone.
+	ShRegTableReads,        // SET_SH_REG_INDIRECT tables the command processor read.
+	ShRegTableReadsClean,   // On a GPU-written page, but none of their bytes GPU-written.
+	ShRegTableReadsDirty,   // GPU-written bytes: the read waits for the GPU.
+	DispatchArgReads,       // Thread-dimension DispatchIndirect arguments read on the CPU.
+	DispatchArgReadsClean,
+	DispatchArgReadsDirty,
+	CpReadsFromBacking, // Served from the backing store instead (A/B CP_READ_BACKING).
+	SrtWalkerFaults,    // SrtWalker JIT loads that faulted on GPU-tracked memory.
+	SrtReadsFromBacking,
+	LabelWrites, // End-of-pipe label writes by the command processor.
+	LabelWritesClean,
+	LabelWritesDirty, // Over GPU-written bytes: downloads them first unless written in order.
+	LabelWritesInOrder,
+	WrittenBindings, // Shader-written buffer bindings, each marking its whole range GPU-written.
+	WrittenBindingBytes,
+	DirtyReadsUnchanged, // A read that waited for GPU-dirty bytes found guest memory unchanged.
+	DirtyReadsChanged,   // ... found that the GPU had changed them.
+	TextureRefreshesGpu, // Bytes of images refreshed after a GPU buffer write over them.
+	TextureRefreshesCpu, // Bytes of images refreshed after guest CPU writes.
+	GpuBusyNs,           // GPU execution time of command buffers, from timestamps.
+	GpuTimedBuffers,
 	GpuFaults, // Guest writes to GPU-tracked memory.
 	ShadersCompiled,
 	ShaderCompileNs,

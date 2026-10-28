@@ -81,6 +81,14 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// A command-processor label over GPU-written bytes: writes it to guest memory and, after the
+	// work recorded so far, to the cached copy, so the GPU bytes under it need no download.
+	// False when it cannot; then store through the guest mapping.
+	[[nodiscard]] bool WriteLabelInOrder(uint64_t vaddr, const void* value, uint64_t size);
+	// The GPU-dirty range holding `vaddr` as {begin, end}, or {0, 0}. For diagnostics.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> GpuDirtyRangeAt(uint64_t vaddr) const {
+		return m_gpu_modified_ranges.Containing(vaddr);
+	}
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);

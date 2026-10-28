@@ -1888,6 +1888,15 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	thread_local std::vector<uint32_t> table;
+	table.resize(static_cast<size_t>(indirect_num_dw) * 2u);
+	const auto read = cp.ReadGuestMemory(indirect_address, table.data(),
+	                                     table.size() * sizeof(uint32_t),
+	                                     GuestReadSite::IndirectShRegs);
+	if (read.served) {
+		indirect_buffer = table.data();
+	}
+	TraceGuestRead("sh regs", indirect_address, read, indirect_buffer, indirect_num_dw * 2u);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];

@@ -33,9 +33,14 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
+#include <set>
 #include <span>
+#include <utility>
 #include <vector>
 
 #ifdef min
@@ -112,6 +117,24 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// KYTY_TRACE_WRITES=<n>: the first n distinct shader-written bindings that start at an image,
+// which then refreshes from the buffer copy.
+static void TraceImageWriteBinding(uint64_t address, uint64_t size,
+                                   const ShaderRecompiler::IR::BufferResource& resource) {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_TRACE_WRITES");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	static std::set<std::pair<uint64_t, uint64_t>> seen;
+	if (limit <= 0 || static_cast<int>(seen.size()) >= limit || !seen.emplace(address, size).second) {
+		return;
+	}
+	std::printf("image write binding 0x%" PRIx64 " size 0x%" PRIx64 " write_extent 0x%x "
+	            "max_byte_extent 0x%x formatted %d stride 0x%x image_alias 0x%x\n",
+	            address, size, resource.write_extent, resource.max_byte_extent,
+	            resource.formatted ? 1 : 0, resource.packed_stride, resource.image_alias);
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
@@ -137,8 +160,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	if (resource.written && context.GetTextureCache().InvalidateMemoryFromGPU(address, size) != 0) {
+		TraceImageWriteBinding(address, size, resource);
 	}
 	return result;
 }

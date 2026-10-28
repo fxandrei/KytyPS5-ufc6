@@ -3234,6 +3234,12 @@ static void* RunThread(void* arg) {
 		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
 #endif
 	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Names guest threads in host tools: debuggers, profilers and the per-thread CPU statistics.
+	if (!thread->name.empty()) {
+		const std::wstring name(thread->name.begin(), thread->name.end());
+		SetThreadDescription(GetCurrentThread(), name.c_str());
+	}
 #endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64

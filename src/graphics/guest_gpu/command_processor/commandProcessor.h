@@ -49,6 +49,19 @@ private:
 	bool                      m_made_progress = false;
 };
 
+enum class GuestReadSite { IndirectShRegs, DispatchArgs };
+enum class GuestReadState { Untracked, TrackedClean, GpuDirty };
+
+struct GuestRead {
+	GuestReadState state  = GuestReadState::Untracked;
+	bool           served = false; // The data was copied; otherwise read the address directly.
+};
+
+// KYTY_TRACE_CP_READS=<n> prints the first n traced reads of GPU-tracked memory: the site, the
+// state and the dwords.
+void TraceGuestRead(const char* what, uint64_t address, const GuestRead& read,
+                    const uint32_t* dwords, uint32_t count);
+
 class CommandProcessor {
 public:
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
@@ -95,6 +108,11 @@ public:
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void WaitForRewind(bool valid);
+
+	// A read of guest memory that the GPU may have written. A page the GPU wrote to faults on
+	// any read and waits for the GPU; when none of these bytes are GPU-written, A/B bit
+	// CP_READ_BACKING copies them from the backing store instead. Counts every read by state.
+	GuestRead ReadGuestMemory(uint64_t address, void* data, uint64_t size, GuestReadSite site);
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);

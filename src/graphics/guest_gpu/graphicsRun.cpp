@@ -1,11 +1,13 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/abSwitch.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/threadSampler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -24,11 +26,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -408,6 +414,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::ThreadSampler::StartForCurrentThread();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -940,11 +947,77 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	}
 }
 
+void TraceGuestRead(const char* what, uint64_t address, const GuestRead& read,
+                    const uint32_t* dwords, uint32_t count) {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_TRACE_CP_READS");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	static std::atomic_int printed = 0;
+	// Reads of untracked memory never wait for the GPU, so they are not worth a line.
+	if (limit <= 0 || read.state == GuestReadState::Untracked ||
+	    printed.fetch_add(1, std::memory_order_relaxed) >= limit) {
+		return;
+	}
+	static constexpr std::array STATES {"untracked", "gpu-page", "gpu-dirty"};
+	char        word[16];
+	std::string text = std::string("cp read ") + what + " " +
+	                   std::to_string(count) + " dwords, " +
+	                   STATES[static_cast<size_t>(read.state)] +
+	                   (read.served ? " (backing)" : "") + ":";
+	std::snprintf(word, sizeof(word), " @%" PRIx64, address);
+	text += word;
+	for (uint32_t i = 0; i < count && i < 64; i++) {
+		std::snprintf(word, sizeof(word), " %08" PRIx32, dwords[i]);
+		text += word;
+	}
+	std::printf("%s\n", text.c_str());
+}
+
+GuestRead CommandProcessor::ReadGuestMemory(uint64_t address, void* data, uint64_t size,
+                                            GuestReadSite site) {
+	using Common::DebugCounters::Counter;
+	const bool shregs = site == GuestReadSite::IndirectShRegs;
+	auto&      buffers = m_renderer.GetBufferCache();
+	Common::DebugCounters::Add(shregs ? Counter::ShRegTableReads : Counter::DispatchArgReads);
+	if (!buffers.IsRegionGpuModified(address, size)) {
+		return {};
+	}
+	if (buffers.HasGpuDirtyBytes(address, size)) {
+		Common::DebugCounters::Add(shregs ? Counter::ShRegTableReadsDirty
+		                                  : Counter::DispatchArgReadsDirty);
+		m_renderer.TraceDirtyRead(shregs ? "sh regs" : "dispatch args", address);
+		return {.state = GuestReadState::GpuDirty};
+	}
+	Common::DebugCounters::Add(shregs ? Counter::ShRegTableReadsClean
+	                                  : Counter::DispatchArgReadsClean);
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::CP_READ_BACKING) ||
+	    !LibKernel::Memory::TryReadBacking(address, data, size)) {
+		return {.state = GuestReadState::TrackedClean};
+	}
+	Common::DebugCounters::Add(Counter::CpReadsFromBacking);
+	return {.state = GuestReadState::TrackedClean, .served = true};
+}
+
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		vk::DispatchIndirectCommand args {};
+		const auto read = ReadGuestMemory(args_addr, &args, sizeof(args), GuestReadSite::DispatchArgs);
+		vk::DispatchIndirectCommand before {};
+		const bool compare = read.state == GuestReadState::GpuDirty &&
+		                     LibKernel::Memory::TryReadBacking(args_addr, &before, sizeof(before));
+		if (!read.served) {
+			args = *reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+		}
+		if (compare) {
+			Common::DebugCounters::Add(
+			    std::memcmp(&args, &before, sizeof(args)) == 0
+			        ? Common::DebugCounters::Counter::DirtyReadsUnchanged
+			        : Common::DebugCounters::Counter::DirtyReadsChanged);
+		}
+		TraceGuestRead("dispatch args", args_addr, read, &args.x, 3);
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -963,6 +1036,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	// Stall only this command processor, not the host command lane or other queues.
 	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
 	                                                 static_cast<int>(display_buffer_index))) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipWaits);
 		SuspendPm4();
 	}
 }
@@ -998,12 +1072,24 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
 	// downloads GPU-written bytes under the label before the store.
+	// With A/B bit LABEL_IN_ORDER, a label over GPU-written bytes replaces them in command order
+	// instead of downloading them first.
 	const auto write_label = [this, address](const void* value, uint64_t size) {
+		using Common::DebugCounters::Counter;
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		const bool tracked = GuestRange {vaddr, size}.Valid() && buffers.IsRegionGpuModified(vaddr, size);
+		const bool dirty   = tracked && buffers.HasGpuDirtyBytes(vaddr, size);
+		Common::DebugCounters::Add(Counter::LabelWrites);
+		if (tracked) {
+			Common::DebugCounters::Add(dirty ? Counter::LabelWritesDirty : Counter::LabelWritesClean);
+		}
+		if (dirty && Common::AbSwitch::Enabled(Common::AbSwitch::LABEL_IN_ORDER) &&
+		    buffers.WriteLabelInOrder(vaddr, value, size)) {
+			Common::DebugCounters::Add(Counter::LabelWritesInOrder);
+			return;
+		}
+		if (!tracked || dirty || !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 			std::memcpy(address, value, size);
 		}
 	};

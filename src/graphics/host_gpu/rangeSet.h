@@ -93,6 +93,17 @@ public:
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
+	// The range holding `address` as {begin, end}, or {0, 0}.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> Containing(uint64_t address) const {
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return {0, 0};
+		}
+		--it;
+		return address < it->second ? std::pair {it->first, it->second}
+		                            : std::pair<uint64_t, uint64_t> {0, 0};
+	}
+
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {
 		if (size == 0 || size > UINT64_MAX - address) {

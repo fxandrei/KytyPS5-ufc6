@@ -16,8 +16,12 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -46,6 +50,26 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	auto* buffer = temporary.get();
 	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
+}
+
+// KYTY_TRACE_WRITES=<n>: print the first n distinct shader-written buffer bindings, which mark
+// their whole range GPU-written.
+void TraceWrittenBinding(uint64_t vaddr, uint64_t size) {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_TRACE_WRITES");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (limit <= 0) {
+		return;
+	}
+	static std::mutex                                    mutex;
+	static std::set<std::pair<uint64_t, uint64_t>>       seen;
+	std::scoped_lock                                     lock(mutex);
+	if (static_cast<int>(seen.size()) >= limit || !seen.emplace(vaddr, size).second) {
+		return;
+	}
+	std::printf("written binding 0x%" PRIx64 " size 0x%" PRIx64 " (%" PRIu64 " KiB)\n", vaddr, size,
+	            size / 1024);
 }
 
 } // namespace
@@ -521,6 +545,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		// The whole bound range counts as GPU-written, whatever the shader stores to.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::WrittenBindings);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::WrittenBindingBytes, size);
+		TraceWrittenBinding(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
@@ -656,6 +684,26 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+bool BufferCache::WriteLabelInOrder(uint64_t vaddr, const void* value, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
+	    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		return false;
+	}
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, value, size);
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	ForgetColorMetadataChecks(vaddr, size);
+	// A GPU-modified tracker page must keep GPU-written bytes, or a read of it faults forever.
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
+	return true;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

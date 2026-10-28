@@ -1,5 +1,6 @@
 #include "graphics/presentation/videoOut.h"
 
+#include "common/abSwitch.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -1220,9 +1221,21 @@ void FlipQueue::SignalDoneLocked() {
 bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-	const bool safe = cfg.flip_status.currentBuffer != index &&
-	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
-	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	bool safe    = cfg.flip_status.currentBuffer != index &&
+	            std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	            std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	// Run-ahead: Prepare records the copy of a display buffer into a presenter frame in the flip's
+	// own command buffer, so later GPU writes cannot reach what is shown. Once every flip of the
+	// buffer is prepared, only the queue depth bounds how far the GPU runs ahead of the display.
+	if (!safe && Common::AbSwitch::Enabled(Common::AbSwitch::FLIP_RUNAHEAD)) {
+		constexpr ptrdiff_t RUNAHEAD_FLIPS = 1;
+		safe = std::count_if(m_requests.begin(), m_requests.end(),
+		                     [&cfg](const auto& r) { return r.cfg == &cfg; }) <= RUNAHEAD_FLIPS &&
+		       std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches) &&
+		       std::none_of(m_requests.begin(), m_requests.end(), [&](const auto& r) {
+			       return matches(r) && r.frame == nullptr;
+		       });
+	}
 	m_gpu_waiting = !safe;
 	return safe;
 }
@@ -1294,6 +1307,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
+			if (tracy::ProfilerAvailable()) {
+				FrameMarkNamed("guest flip");
+			}
 		}
 	}
 
