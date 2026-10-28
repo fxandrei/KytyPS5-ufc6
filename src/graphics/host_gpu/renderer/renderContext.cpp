@@ -83,6 +83,7 @@ bool RenderContext::ReadCleanBytes(uint64_t vaddr, void* data, uint64_t size) no
 	return GuestGpu::IsGpuThread() && IsMapped(vaddr, size) &&
 	       m_buffer_cache.IsRegionGpuModified(vaddr, size) &&
 	       !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	       !m_texture_cache.HasPendingBackingPublish() &&
 	       LibKernel::Memory::TryReadBacking(vaddr, data, size);
 }
 

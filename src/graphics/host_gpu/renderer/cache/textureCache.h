@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <type_traits>
@@ -70,6 +71,11 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	uint32_t           InvalidateMemoryFromGPU(uint64_t address, uint64_t size); // Images marked.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	// An image download still has to write guest memory: reads or writes of the backing store
+	// that skip the fault path would race with it.
+	[[nodiscard]] bool HasPendingBackingPublish() const {
+		return m_pending_publishes.load(std::memory_order_acquire) != 0;
+	}
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -175,6 +181,7 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;
+	std::atomic<uint32_t>                             m_pending_publishes {0};
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;

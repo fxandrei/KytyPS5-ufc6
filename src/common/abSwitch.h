@@ -12,12 +12,16 @@ namespace Common::AbSwitch {
 
 inline std::atomic<uint32_t> g_mask {0};
 
+// The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
+// SRT_READ_BACKING, LABEL_IN_ORDER and EAGER_FLUSH. KYTY_AB=0 turns them all off.
+inline constexpr uint32_t DEFAULT_MASK = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6);
+
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
-		if (const char* value = std::getenv("KYTY_AB"); value != nullptr) {
-			g_mask.store(static_cast<uint32_t>(std::strtoul(value, nullptr, 0)),
-			             std::memory_order_relaxed);
-		}
+		const char* value = std::getenv("KYTY_AB");
+		g_mask.store(value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+		                              : DEFAULT_MASK,
+		             std::memory_order_relaxed);
 		return true;
 	}();
 	(void)initialized;
@@ -39,6 +43,18 @@ inline constexpr uint32_t SRT_READ_BACKING = 2;
 // End-of-pipe labels over GPU-written bytes are written to guest memory and, in command order, to
 // the cached GPU copy, instead of first downloading the GPU bytes under them.
 inline constexpr uint32_t LABEL_IN_ORDER = 3;
+// Experiment: a shader-written buffer that covers less than a quarter of an image starting at the
+// same address does not make the whole image refresh from the buffer copy. Frostbite reuses
+// render-target memory for small transient buffers; the bytes written there are lost to the image.
+inline constexpr uint32_t PARTIAL_IMAGE_WRITES = 4;
+// Compute dispatches are ordered by the guest's own synchronization (partial flushes, end-of-pipe
+// and acquire events, submission starts), as on the hardware, instead of a full barrier around
+// each dispatch. Dispatches with emulated LDS or GDS keep their barriers.
+inline constexpr uint32_t GUEST_BARRIERS = 5;
+// The open command buffer is submitted, without waiting, as soon as the GPU has run out of work
+// (checked every 16 recorded draws or dispatches) or after 256 of them, so recording and GPU
+// execution overlap instead of alternating at the sync points.
+inline constexpr uint32_t EAGER_FLUSH = 6;
 
 } // namespace Common::AbSwitch
 

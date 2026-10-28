@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -874,7 +875,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	const auto current_tick = m_scheduler.CurrentTick();
+	const auto current_tick = m_scheduler.AgeTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
 	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
@@ -1115,7 +1116,9 @@ void TextureCache::InitializeImage(ImageId id) {
 		                                    : Common::DebugCounters::Counter::TextureRefreshesCpu,
 		                           image.info.data.size);
 		TraceTextureRefresh(image.info, from_gpu);
+		const auto scope = m_scheduler.BeginGpuScope();
 		UploadImage(image, *source, source_offset);
+		m_scheduler.EndGpuScope(scope, Common::DebugCounters::Counter::TextureUploadGpuNs);
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1447,7 +1450,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
-		image.tick_accessed_last = m_scheduler.CurrentTick();
+		image.tick_accessed_last = m_scheduler.AgeTick();
 		TouchImage(image);
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
@@ -1974,9 +1977,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_pending_publishes.fetch_add(1, std::memory_order_acq_rel);
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_pending_publishes.fetch_sub(1, std::memory_order_acq_rel);
 	});
 	return true;
 }
@@ -1990,6 +1995,12 @@ uint32_t TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) 
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
+			continue;
+		}
+		if (size < image.info.data.size / 4 &&
+		    Common::AbSwitch::Enabled(Common::AbSwitch::PARTIAL_IMAGE_WRITES)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::PartialImageWritesSkipped,
+			                           image.info.data.size);
 			continue;
 		}
 		if (image.IsGpuModified()) {

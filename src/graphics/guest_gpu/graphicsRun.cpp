@@ -234,6 +234,12 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 
 void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
+	// Another queue's work may come next in the host command stream.
+	GuestFlush();
+}
+
+void CommandProcessor::GuestFlush() {
+	m_renderer.GetRenderExecutor().GuestFlush();
 }
 
 void CommandProcessor::BufferFlush() {
@@ -787,6 +793,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	GetScheduler().RecordedWork();
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -945,6 +952,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
 	}
+	GetScheduler().RecordedWork();
 }
 
 void TraceGuestRead(const char* what, uint64_t address, const GuestRead& read,
@@ -974,6 +982,23 @@ void TraceGuestRead(const char* what, uint64_t address, const GuestRead& read,
 	std::printf("%s\n", text.c_str());
 }
 
+void CommandProcessor::PushGpuMarker(std::string_view name) {
+	auto& scheduler = GetScheduler();
+	if (!scheduler.Active() || m_gpu_markers.size() >= 64) {
+		return;
+	}
+	m_gpu_markers.emplace_back(scheduler.BeginGpuMarker(), std::string(name));
+}
+
+void CommandProcessor::PopGpuMarker() {
+	if (m_gpu_markers.empty()) {
+		return;
+	}
+	auto [scope, name] = std::move(m_gpu_markers.back());
+	m_gpu_markers.pop_back();
+	GetScheduler().EndGpuMarker(scope, name);
+}
+
 GuestRead CommandProcessor::ReadGuestMemory(uint64_t address, void* data, uint64_t size,
                                             GuestReadSite site) {
 	using Common::DebugCounters::Counter;
@@ -992,6 +1017,7 @@ GuestRead CommandProcessor::ReadGuestMemory(uint64_t address, void* data, uint64
 	Common::DebugCounters::Add(shregs ? Counter::ShRegTableReadsClean
 	                                  : Counter::DispatchArgReadsClean);
 	if (!Common::AbSwitch::Enabled(Common::AbSwitch::CP_READ_BACKING) ||
+	    m_renderer.GetTextureCache().HasPendingBackingPublish() ||
 	    !LibKernel::Memory::TryReadBacking(address, data, size)) {
 		return {.state = GuestReadState::TrackedClean};
 	}
@@ -1023,6 +1049,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
+	GetScheduler().RecordedWork();
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
@@ -1030,6 +1057,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	GetScheduler().RecordedWork();
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1062,6 +1090,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	    (interrupt_selector == 1 && !IsAsyncComputeQueue())) {
 		data_sel = 0;
 	}
+	// An end-of-pipe event follows all earlier work of the queue.
+	m_renderer.GetRenderExecutor().GuestFlush();
 	if (data_sel == 0 && !interrupt) {
 		return;
 	}
@@ -1089,7 +1119,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			Common::DebugCounters::Add(Counter::LabelWritesInOrder);
 			return;
 		}
-		if (!tracked || dirty || !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		if (!tracked || dirty || m_renderer.GetTextureCache().HasPendingBackingPublish() ||
+		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 			std::memcpy(address, value, size);
 		}
 	};
@@ -1134,12 +1165,12 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
 	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
-	// barriers already order.
+	// barriers already order, unless AbSwitch GUEST_BARRIERS leaves that ordering to the guest.
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: break;
+		case 0x00000010: m_renderer.GetRenderExecutor().GuestFlush(); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
 		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:

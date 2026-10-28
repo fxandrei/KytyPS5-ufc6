@@ -32,6 +32,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -1248,6 +1249,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	auto&         scheduler         = m_context.GetCommandScheduler();
+	const auto    gpu_timer         = scheduler.BeginGpuShaderTimer();
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
@@ -1258,6 +1261,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
+	}
+	if (gpu_timer != UINT32_MAX) {
+		const auto& shaders = buffer.GetShaders();
+		scheduler.EndGpuMarker(gpu_timer, fmt::format("draw vs {:#x} ps {:#x}",
+		                                              shaders.GetVs().gs_regs.data_addr != 0
+		                                                  ? shaders.GetVs().gs_regs.data_addr
+		                                                  : shaders.GetVs().es_regs.data_addr,
+		                                              shaders.GetPs().ps_regs.data_addr));
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);

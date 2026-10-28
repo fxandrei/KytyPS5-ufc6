@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -7,7 +8,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -173,6 +176,19 @@ void CommandScheduler::EndRendering() {
 void CommandScheduler::Flush() {
 	SubmitInfo submit;
 	Flush(submit);
+}
+
+void CommandScheduler::RecordedWork() {
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH) || m_command.IsInvalid() ||
+	    ++m_recorded_since_submit % 16 != 0) {
+		return;
+	}
+	m_master.Refresh();
+	if (m_recorded_since_submit >= 256 || m_master.IsFree(CurrentTick() - 1)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EagerFlushes);
+		Flush();
+		m_eager_submits++;
+	}
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
@@ -345,10 +361,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
-void CommandScheduler::StartGpuTimer() {
-	m_gpu_timer_query = UINT32_MAX;
-	if (!Common::DebugCounters::Enabled()) {
-		return;
+// A free query pair, reset in the recording command buffer (outside rendering), or UINT32_MAX.
+uint32_t CommandScheduler::AllocateGpuTimer() {
+	if (!Common::DebugCounters::Enabled() || m_command.IsInvalid()) {
+		return UINT32_MAX;
 	}
 	if (!m_gpu_timer_pool) {
 		vk::QueryPoolCreateInfo info {};
@@ -357,44 +373,174 @@ void CommandScheduler::StartGpuTimer() {
 		if (m_graphics.device.createQueryPool(&info, nullptr, &m_gpu_timer_pool) !=
 		    vk::Result::eSuccess) {
 			m_gpu_timer_pool = nullptr;
-			return;
+			return UINT32_MAX;
 		}
 	}
-	if (m_gpu_timer_pending.size() * 2 >= GPU_TIMER_QUERIES) {
-		return; // Every pair is in flight.
+	// Pairs are reused in order; skip timing while every pair is in flight.
+	if ((m_gpu_timer_pending.size() + 1) * 2 >= GPU_TIMER_QUERIES) {
+		return UINT32_MAX;
 	}
 	const auto query = m_gpu_timer_next;
 	m_gpu_timer_next = (m_gpu_timer_next + 2) % GPU_TIMER_QUERIES;
-	const auto native = m_command.Handle();
-	native.resetQueryPool(m_gpu_timer_pool, query, 2);
-	native.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_gpu_timer_pool, query);
-	m_gpu_timer_query = query;
+	if (m_graphics.host_query_reset_enabled) {
+		m_graphics.device.resetQueryPool(m_gpu_timer_pool, query, 2);
+	} else {
+		m_command.Handle().resetQueryPool(m_gpu_timer_pool, query, 2);
+	}
+	return query;
+}
+
+uint32_t CommandScheduler::BeginGpuShaderTimer() {
+	static const bool enabled = std::getenv("KYTY_GPU_SHADERS") != nullptr;
+	return enabled ? BeginGpuMarker() : UINT32_MAX;
+}
+
+uint32_t CommandScheduler::BeginGpuMarker() {
+	static const bool enabled = std::getenv("KYTY_GPU_MARKERS") != nullptr;
+	// Without a host reset the queries would end rendering at every marker.
+	if (!enabled || !m_graphics.host_query_reset_enabled) {
+		return UINT32_MAX;
+	}
+	const auto query = AllocateGpuTimer();
+	if (query != UINT32_MAX) {
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+		                                  m_gpu_timer_pool, query);
+	}
+	return query;
+}
+
+void CommandScheduler::EndGpuMarker(uint32_t scope, std::string_view name) {
+	if (scope == UINT32_MAX || m_command.IsInvalid()) {
+		return;
+	}
+	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_timer_pool,
+	                                  scope + 1);
+	auto [it, inserted] = m_marker_ids.try_emplace(std::string(name),
+	                                               static_cast<uint32_t>(m_marker_names.size()));
+	if (inserted) {
+		m_marker_names.emplace_back(name);
+		m_marker_ns.push_back(0);
+		m_marker_counts.push_back(0);
+	}
+	m_gpu_timer_pending.push_back(
+	    {CurrentTick(), scope, Common::DebugCounters::Counter::Count, it->second});
+}
+
+void CommandScheduler::DumpGpuMarkers() {
+	static const char* path = std::getenv("KYTY_GPU_MARKERS");
+	const auto         now  = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+	if (path == nullptr || m_marker_names.empty() || now - m_marker_dump_ms < 5000) {
+		return;
+	}
+	m_marker_dump_ms = now;
+	std::vector<uint32_t> order(m_marker_names.size());
+	for (uint32_t i = 0; i < order.size(); i++) {
+		order[i] = i;
+	}
+	std::sort(order.begin(), order.end(),
+	          [this](uint32_t a, uint32_t b) { return m_marker_ns[a] > m_marker_ns[b]; });
+	std::FILE* file = std::fopen(path, "a");
+	if (file == nullptr) {
+		return;
+	}
+	const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                         std::chrono::system_clock::now().time_since_epoch())
+	                         .count();
+	std::fprintf(file, "# unix_ms %lld\n", static_cast<long long>(unix_ms));
+	for (size_t i = 0; i < order.size() && i < 300; i++) {
+		const auto id = order[i];
+		std::fprintf(file, "%s\t%llu\t%.3f\n", m_marker_names[id].c_str(),
+		             static_cast<unsigned long long>(m_marker_counts[id]),
+		             static_cast<double>(m_marker_ns[id]) / 1e6);
+	}
+	std::fclose(file);
+}
+
+void CommandScheduler::StartGpuTimer() {
+	m_gpu_timer_query = AllocateGpuTimer();
+	if (m_gpu_timer_query != UINT32_MAX) {
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe,
+		                                  m_gpu_timer_pool, m_gpu_timer_query);
+	}
 }
 
 void CommandScheduler::EndGpuTimer(uint64_t tick) {
 	if (m_gpu_timer_query != UINT32_MAX) {
-		m_gpu_timer_pending.emplace_back(tick, m_gpu_timer_query);
+		m_gpu_timer_pending.push_back(
+		    {tick, m_gpu_timer_query, Common::DebugCounters::Counter::GpuBusyNs});
 		m_gpu_timer_query = UINT32_MAX;
 	}
 }
 
+uint32_t CommandScheduler::BeginGpuScope() {
+	if (!Common::DebugCounters::Enabled() || m_command.IsInvalid()) {
+		return UINT32_MAX;
+	}
+	if (!m_graphics.host_query_reset_enabled) {
+		EndRendering();
+	}
+	const auto query = AllocateGpuTimer();
+	if (query != UINT32_MAX) {
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+		                                  m_gpu_timer_pool, query);
+	}
+	return query;
+}
+
+void CommandScheduler::EndGpuScope(uint32_t scope, Common::DebugCounters::Counter counter) {
+	if (scope == UINT32_MAX || m_command.IsInvalid()) {
+		return;
+	}
+	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_timer_pool,
+	                                  scope + 1);
+	m_gpu_timer_pending.push_back({CurrentTick(), scope, counter});
+}
+
 void CommandScheduler::ReadGpuTimers() {
 	const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
-	while (!m_gpu_timer_pending.empty() && m_master.IsFree(m_gpu_timer_pending.front().first)) {
-		const auto query = m_gpu_timer_pending.front().second;
+	while (!m_gpu_timer_pending.empty() && m_master.IsFree(m_gpu_timer_pending.front().tick)) {
+		const auto timer = m_gpu_timer_pending.front();
 		m_gpu_timer_pending.pop_front();
 		std::array<uint64_t, 2> stamps {};
-		if (m_graphics.device.getQueryPoolResults(m_gpu_timer_pool, query, 2, sizeof(stamps),
+		if (m_graphics.device.getQueryPoolResults(m_gpu_timer_pool, timer.query, 2, sizeof(stamps),
 		                                          stamps.data(), sizeof(uint64_t),
 		                                          vk::QueryResultFlagBits::e64) ==
 		        vk::Result::eSuccess &&
 		    stamps[1] >= stamps[0]) {
-			Common::DebugCounters::Add(
-			    Common::DebugCounters::Counter::GpuBusyNs,
-			    static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period));
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuTimedBuffers);
+			const auto ns =
+			    static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period);
+			if (timer.marker != UINT32_MAX) {
+				m_marker_ns[timer.marker] += ns;
+				m_marker_counts[timer.marker]++;
+				continue;
+			}
+			if (timer.counter == Common::DebugCounters::Counter::GpuBusyNs) {
+				// Command buffers of one queue can overlap at their edges: count the union, and
+				// the gaps in which the GPU had no command buffer at all.
+				const auto start = static_cast<uint64_t>(static_cast<double>(stamps[0]) * period);
+				const auto end   = static_cast<uint64_t>(static_cast<double>(stamps[1]) * period);
+				if (m_gpu_busy_end != 0 && start > m_gpu_busy_end) {
+					const auto gap = start - m_gpu_busy_end;
+					// Gaps longer than a second are pauses (loading, the menu idle), not bubbles.
+					if (gap < 1'000'000'000) {
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuIdleGapNs, gap);
+					}
+				}
+				const auto from = std::max(start, m_gpu_busy_end);
+				if (end > from) {
+					Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuBusyUnionNs,
+					                           end - from);
+				}
+				m_gpu_busy_end = std::max(m_gpu_busy_end, end);
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuTimedBuffers);
+			}
+			Common::DebugCounters::Add(timer.counter, ns);
 		}
 	}
+	DumpGpuMarkers();
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -446,6 +592,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	EndGpuTimer(tick);
+	m_recorded_since_submit = 0;
 
 	m_command.m_buffer = nullptr;
 	return tick;

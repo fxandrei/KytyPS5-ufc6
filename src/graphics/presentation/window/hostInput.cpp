@@ -9,13 +9,18 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -740,15 +745,69 @@ void HostInputDisconnectGamepad(int id) {
 	HostInputDisconnectGamepadTouchPad(id);
 }
 
+namespace {
+
+// KYTY_PAD_FILE=<path> lets a test harness press pad buttons without the window having keyboard
+// focus. The file holds "<sequence> <button> <milliseconds>"; each new sequence number holds that
+// button (Cross, Circle, Square, Triangle, Options, Up, Down, Left, Right, L1, R1) that long.
+std::jthread g_pad_file_thread;
+
+void PadFileThread(const std::stop_token& stop, const std::string& path) {
+	static constexpr std::array<std::pair<std::string_view, uint32_t>, 11> BUTTONS {{
+	    {"Cross", Controller::PAD_BUTTON_CROSS},
+	    {"Circle", Controller::PAD_BUTTON_CIRCLE},
+	    {"Square", Controller::PAD_BUTTON_SQUARE},
+	    {"Triangle", Controller::PAD_BUTTON_TRIANGLE},
+	    {"Options", Controller::PAD_BUTTON_OPTIONS},
+	    {"Up", Controller::PAD_BUTTON_UP},
+	    {"Down", Controller::PAD_BUTTON_DOWN},
+	    {"Left", Controller::PAD_BUTTON_LEFT},
+	    {"Right", Controller::PAD_BUTTON_RIGHT},
+	    {"L1", Controller::PAD_BUTTON_L1},
+	    {"R1", Controller::PAD_BUTTON_R1},
+	}};
+	unsigned long long last = 0;
+	while (!stop.stop_requested()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(30));
+		std::FILE* file = std::fopen(path.c_str(), "r");
+		if (file == nullptr) {
+			continue;
+		}
+		unsigned long long sequence = 0;
+		char               name[32] {};
+		unsigned           ms   = 0;
+		const int          read = std::fscanf(file, "%llu %31s %u", &sequence, name, &ms);
+		std::fclose(file);
+		if (read != 3 || sequence <= last) {
+			continue;
+		}
+		last           = sequence;
+		const auto hit = std::find_if(BUTTONS.begin(), BUTTONS.end(),
+		                              [&](const auto& button) { return button.first == name; });
+		if (hit == BUTTONS.end()) {
+			continue;
+		}
+		SetButton(hit->second, true);
+		std::this_thread::sleep_for(std::chrono::milliseconds(std::min(ms, 10000u)));
+		SetButton(hit->second, false);
+	}
+}
+
+} // namespace
+
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
 	}
+	if (const char* path = std::getenv("KYTY_PAD_FILE"); path != nullptr && *path != '\0') {
+		g_pad_file_thread = std::jthread(PadFileThread, std::string(path));
+	}
 }
 
 void HostInputShutdown() {
+	g_pad_file_thread = {};
 	g_pad_trigger_pressed.clear();
 	HostInputSetTouchPadMode(false);
 	int gamepad_touch_id = -1;

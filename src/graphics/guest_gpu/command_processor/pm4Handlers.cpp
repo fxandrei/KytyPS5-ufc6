@@ -21,6 +21,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -1243,6 +1244,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	cp.GuestFlush();
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
@@ -2035,6 +2037,7 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	if (pop_marker_log_count.fetch_add(1) < 64) {
 		LOGF("Pop marker\n");
 	}
+	cp.PopGpuMarker();
 
 	return dw_num + 1;
 }
@@ -2050,6 +2053,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	if (push_marker_log_count.fetch_add(1) < 128) {
 		LOGF("Push marker: %s\n", str);
 	}
+	cp.PushGpuMarker(std::string_view(str, strnlen(str, (static_cast<size_t>(dw_num) + 1u) * 4u)));
 
 	return dw_num + 1;
 }

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
@@ -12,8 +13,11 @@
 #include <deque>
 #include <mutex>
 #include <queue>
-#include <utility>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -45,6 +49,24 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+
+	// Diagnostics while the counters are on: GPU time of the commands recorded between the two
+	// calls, added to `counter` once their tick completes. Ends rendering first.
+	[[nodiscard]] uint32_t BeginGpuScope();
+	void                   EndGpuScope(uint32_t scope, Common::DebugCounters::Counter counter);
+	// With KYTY_GPU_MARKERS=<path>: GPU time of each guest debug marker (PUSH_MARKER to
+	// POP_MARKER, children included), appended to <path> every 5 seconds as running totals.
+	[[nodiscard]] uint32_t BeginGpuMarker();
+	void                   EndGpuMarker(uint32_t scope, std::string_view name);
+	// With KYTY_GPU_SHADERS (and KYTY_GPU_MARKERS for the output): the same per draw or dispatch,
+	// keyed by its shader addresses.
+	[[nodiscard]] uint32_t BeginGpuShaderTimer();
+
+	// After each recorded draw or dispatch; see AbSwitch EAGER_FLUSH.
+	void RecordedWork();
+	// The tick clock that image ages use (TextureCache, ImageHeap): eager submits do not count,
+	// so they do not make cached images look older than before.
+	[[nodiscard]] uint64_t AgeTick() const noexcept { return CurrentTick() - m_eager_submits; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -110,11 +132,29 @@ private:
 
 	// Diagnostics while the counters are on: GPU execution time of each command buffer, from
 	// timestamps at its start and end, read once its tick completes (Counter::GpuBusyNs).
-	static constexpr uint32_t                 GPU_TIMER_QUERIES = 2048;
-	vk::QueryPool                             m_gpu_timer_pool;
-	uint32_t                                  m_gpu_timer_next  = 0;
-	uint32_t                                  m_gpu_timer_query = UINT32_MAX;
-	std::deque<std::pair<uint64_t, uint32_t>> m_gpu_timer_pending; // tick, first query
+	struct GpuTimerQuery {
+		uint64_t                       tick;
+		uint32_t                       query; // The first of a pair.
+		Common::DebugCounters::Counter counter;
+		uint32_t                       marker = UINT32_MAX; // Index in m_marker_names.
+	};
+	[[nodiscard]] uint32_t AllocateGpuTimer();
+	void                   DumpGpuMarkers();
+
+	static constexpr uint32_t GPU_TIMER_QUERIES = 16384;
+	vk::QueryPool             m_gpu_timer_pool;
+	uint32_t                  m_gpu_timer_next  = 0;
+	uint32_t                  m_gpu_timer_query = UINT32_MAX;
+	std::deque<GpuTimerQuery> m_gpu_timer_pending;
+
+	std::unordered_map<std::string, uint32_t> m_marker_ids;
+	std::vector<std::string>                  m_marker_names;
+	std::vector<uint64_t>                     m_marker_ns;
+	std::vector<uint64_t>                     m_marker_counts;
+	uint64_t                                  m_marker_dump_ms = 0;
+	uint64_t                                  m_gpu_busy_end   = 0; // ns on the GPU clock
+	uint32_t                                  m_recorded_since_submit = 0;
+	uint64_t                                  m_eager_submits         = 0;
 };
 
 } // namespace Libs::Graphics

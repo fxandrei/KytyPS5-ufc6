@@ -47,6 +47,12 @@ enum class Counter {
 	TextureRefreshesCpu, // Bytes of images refreshed after guest CPU writes.
 	GpuBusyNs,           // GPU execution time of command buffers, from timestamps.
 	GpuTimedBuffers,
+	GpuBusyUnionNs, // GPU busy time without double-counting overlapping command buffers.
+	GpuIdleGapNs,   // GPU time between command buffers with nothing queued (under 1 s each).
+	TextureUploadGpuNs,        // GPU time of texture refreshes (detile and copy), from timestamps.
+	PartialImageWritesSkipped, // Image bytes not refreshed after a partial buffer write (bit 4).
+	GuestFlushBarriers,        // Barriers at guest synchronization points (bit 5).
+	EagerFlushes,              // Submits without a wait because the GPU ran dry (bit 6).
 	GpuFaults, // Guest writes to GPU-tracked memory.
 	ShadersCompiled,
 	ShaderCompileNs,

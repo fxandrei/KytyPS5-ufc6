@@ -8,6 +8,9 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -76,6 +79,8 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferWait();
+	// A guest synchronization point (RenderExecutor::GuestFlush).
+	void            GuestFlush();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -113,6 +118,10 @@ public:
 	// any read and waits for the GPU; when none of these bytes are GPU-written, A/B bit
 	// CP_READ_BACKING copies them from the backing store instead. Counts every read by state.
 	GuestRead ReadGuestMemory(uint64_t address, void* data, uint64_t size, GuestReadSite site);
+
+	// GPU timing per guest debug marker (CommandScheduler::BeginGpuMarker).
+	void PushGpuMarker(std::string_view name);
+	void PopGpuMarker();
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
@@ -162,6 +171,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+
+	std::vector<std::pair<uint32_t, std::string>> m_gpu_markers; // Timer scope, name.
 };
 
 } // namespace Libs::Graphics

@@ -665,7 +665,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;
 	graphics.occlusion_query_precise_enabled =
 	    graphics.occlusion_queries_enabled && supported_features2.features.occlusionQueryPrecise;
-	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
+	// Also lets the GPU timing diagnostics reset their timestamp queries without ending rendering.
+	graphics.host_query_reset_enabled     = supported_features12.hostQueryReset;
+	features12.hostQueryReset             = graphics.host_query_reset_enabled;
 	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
 	     graphics.occlusion_queries_enabled ? "true" : "false",

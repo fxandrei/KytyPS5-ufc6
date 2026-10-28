@@ -689,6 +689,7 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 bool BufferCache::WriteLabelInOrder(uint64_t vaddr, const void* value, uint64_t size) {
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
+	    m_texture_cache.HasPendingBackingPublish() ||
 	    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 		return false;
 	}

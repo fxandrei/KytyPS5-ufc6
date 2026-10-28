@@ -164,7 +164,8 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 	           "dargs_clean,dargs_dirty,cp_backing_reads,srt_faults,srt_backing,label_writes,"
 	           "label_clean,label_dirty,label_in_order,written_bindings,written_mb,"
 	           "dirty_reads_unchanged,dirty_reads_changed,tex_refresh_gpu_mb,tex_refresh_cpu_mb,"
-	           "gpu_busy_ms,gpu_timed_buffers,ab,"
+	           "gpu_busy_ms,gpu_timed_buffers,tex_upload_gpu_ms,partial_image_skipped_mb,"
+	           "gpu_busy_union_ms,gpu_idle_gap_ms,guest_flushes,eager_flushes,ab,"
 	           "thread1,"
 	           "thread1_pct,thread2,thread2_pct,"
 	           "thread3,thread3_pct\n",
@@ -224,7 +225,7 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		    "%.1f,%.3f,%llu,%.2f,%.1f,%.1f,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.0f,%.1f,%.1f,%.1f,"
 		    "%.1f,%.0f,%.1f,%.0f,%.1f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,"
 		    "%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.0f,%.0f,%.1f,%.1f,%.1f,"
-		    "%.0f,%u",
+		    "%.0f,%.1f,%.1f,%.1f,%.1f,%.0f,%.0f,%u",
 		    std::chrono::duration<double>(now - start).count(),
 		    std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
 		        .count(),
@@ -251,7 +252,10 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		    rate(Counter::WrittenBindingBytes) / MIB, rate(Counter::DirtyReadsUnchanged),
 		    rate(Counter::DirtyReadsChanged), rate(Counter::TextureRefreshesGpu) / MIB,
 		    rate(Counter::TextureRefreshesCpu) / MIB, rate(Counter::GpuBusyNs) / 1e6,
-		    rate(Counter::GpuTimedBuffers), ab);
+		    rate(Counter::GpuTimedBuffers), rate(Counter::TextureUploadGpuNs) / 1e6,
+		    rate(Counter::PartialImageWritesSkipped) / MIB, rate(Counter::GpuBusyUnionNs) / 1e6,
+		    rate(Counter::GpuIdleGapNs) / 1e6, rate(Counter::GuestFlushBarriers),
+		    rate(Counter::EagerFlushes), ab);
 		// The three busiest threads, in percent of one core.
 		for (size_t i = 0; i < 3; i++) {
 			if (i < host.busiest_threads.size()) {

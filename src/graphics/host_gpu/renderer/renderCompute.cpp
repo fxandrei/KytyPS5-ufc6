@@ -1,3 +1,4 @@
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -28,6 +29,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -379,7 +381,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	// Emulated LDS and GDS live in buffers every such dispatch shares, so those stay serialized.
+	const bool guest_ordered = Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS) &&
+	                           bindings.shared_memory.buffer == nullptr && !program.info.uses_gds;
+	if (has_storage_writes && !guest_ordered) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -446,6 +451,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	auto&      scheduler = m_context.GetCommandScheduler();
+	const auto gpu_timer = scheduler.BeginGpuShaderTimer();
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -467,11 +474,36 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
+	if (gpu_timer != UINT32_MAX) {
+		scheduler.EndGpuMarker(
+		    gpu_timer, fmt::format("cs {:#x} h{:016x} g{}x{}x{} t{}x{}x{} w{}{}{}",
+		                           cs_regs.cs_regs.data_addr, program.shader_hash,
+		                           thread_group_x, thread_group_y, thread_group_z,
+		                           input_info.threads_num[0], input_info.threads_num[1],
+		                           input_info.threads_num[2], input_info.wave_size,
+		                           input_info.lds_storage ? " lds-storage" : "",
+		                           program.info.uses_gds ? " gds" : ""));
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!guest_ordered) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
+}
+
+void RenderExecutor::GuestFlush() {
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS)) {
+		return;
+	}
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (!scheduler.Active()) {
+		return;
+	}
+	scheduler.EndRendering();
+	GuestFlushBarrier(scheduler.Current().Handle());
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFlushBarriers);
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -527,7 +559,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
+	const bool guest_ordered = Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS) &&
+	                           bindings.shared_memory.buffer == nullptr && !program.info.uses_gds;
+	if (has_storage_writes && !guest_ordered) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};
@@ -539,9 +573,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	auto&      scheduler = m_context.GetCommandScheduler();
+	const auto gpu_timer = scheduler.BeginGpuShaderTimer();
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (gpu_timer != UINT32_MAX) {
+		scheduler.EndGpuMarker(gpu_timer,
+		                       fmt::format("cs {:#x} indirect", cs_regs.cs_regs.data_addr));
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!guest_ordered) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 

@@ -159,6 +159,9 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
+	// A guest synchronization point under AbSwitch GUEST_BARRIERS: all earlier work finishes and
+	// its memory becomes visible before later work starts.
+	void GuestFlush();
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
