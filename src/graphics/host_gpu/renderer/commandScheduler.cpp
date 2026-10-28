@@ -4,11 +4,13 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -101,7 +103,10 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_graphics_checkpoints(graphics.checkpoints_enabled) {
+	m_master.SetStallHandler([this](uint64_t tick) { ReportStall(tick); });
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -179,8 +184,10 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::RecordedWork() {
+	const uint32_t interval =
+	    Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH_COARSE) ? 64 : 16;
 	if (!Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH) || m_command.IsInvalid() ||
-	    ++m_recorded_since_submit % 16 != 0) {
+	    ++m_recorded_since_submit % interval != 0) {
 		return;
 	}
 	m_master.Refresh();
@@ -415,6 +422,11 @@ void CommandScheduler::EndGpuMarker(uint32_t scope, std::string_view name) {
 	}
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_timer_pool,
 	                                  scope + 1);
+	m_gpu_timer_pending.push_back(
+	    {CurrentTick(), scope, Common::DebugCounters::Counter::Count, MarkerId(name)});
+}
+
+uint32_t CommandScheduler::MarkerId(std::string_view name) {
 	auto [it, inserted] = m_marker_ids.try_emplace(std::string(name),
 	                                               static_cast<uint32_t>(m_marker_names.size()));
 	if (inserted) {
@@ -422,8 +434,13 @@ void CommandScheduler::EndGpuMarker(uint32_t scope, std::string_view name) {
 		m_marker_ns.push_back(0);
 		m_marker_counts.push_back(0);
 	}
-	m_gpu_timer_pending.push_back(
-	    {CurrentTick(), scope, Common::DebugCounters::Counter::Count, it->second});
+	return it->second;
+}
+
+void CommandScheduler::SetGpuCheckpoint(std::string_view name) {
+	// The marker is the name's index plus one, so that no marker is null.
+	m_command.Handle().setCheckpointNV(
+	    reinterpret_cast<const void*>(static_cast<uintptr_t>(MarkerId(name)) + 1));
 }
 
 void CommandScheduler::DumpGpuMarkers() {
@@ -497,6 +514,61 @@ void CommandScheduler::EndGpuScope(uint32_t scope, Common::DebugCounters::Counte
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_timer_pool,
 	                                  scope + 1);
 	m_gpu_timer_pending.push_back({CurrentTick(), scope, counter});
+}
+
+// A wait of several seconds is a GPU hang or a deadlock. With KYTY_GPU_SHADERS the timer pairs
+// around each draw and dispatch show which one the GPU started and has not finished.
+void CommandScheduler::ReportStall(uint64_t tick) {
+	m_master.Refresh();
+	std::printf("GPU stall: still waiting for tick %" PRIu64 "; the GPU finished tick %" PRIu64
+	            ", recording tick %" PRIu64 "\n",
+	            tick, m_master.KnownGpuTick(), CurrentTick());
+	// The marker names and pending timers belong to the GPU thread, which records here.
+	if (!GuestGpu::IsGpuThread()) {
+		std::fflush(stdout);
+		return;
+	}
+	if (m_graphics_checkpoints) {
+		std::vector<vk::CheckpointDataNV> checkpoints;
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			checkpoints = m_graphics.queue.getCheckpointDataNV();
+		}
+		for (const auto& checkpoint: checkpoints) {
+			const auto id = reinterpret_cast<uintptr_t>(checkpoint.pCheckpointMarker);
+			std::printf(
+			    "GPU stall: checkpoint at %s: %s\n", vk::to_string(checkpoint.stage).c_str(),
+			    id != 0 && id <= m_marker_names.size() ? m_marker_names[id - 1].c_str() : "?");
+		}
+	}
+	if (!m_gpu_timer_pool) {
+		std::fflush(stdout);
+		return;
+	}
+	const char* last_done = nullptr;
+	int         reported  = 0;
+	for (const auto& timer: m_gpu_timer_pending) {
+		if (m_master.IsFree(timer.tick)) continue;
+		std::array<uint64_t, 4> results {}; // Value and availability of the start and end stamps.
+		(void)m_graphics.device.getQueryPoolResults(
+		    m_gpu_timer_pool, timer.query, 2, sizeof(results), results.data(), 2 * sizeof(uint64_t),
+		    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+		const bool  started = results[1] != 0;
+		const bool  ended   = results[3] != 0;
+		const char* name    = timer.marker != UINT32_MAX ? m_marker_names[timer.marker].c_str()
+		                      : timer.counter == Common::DebugCounters::Counter::GpuBusyNs
+		                          ? "command buffer"
+		                          : "scope";
+		if (started && ended) {
+			last_done = name;
+		} else if (started) {
+			std::printf("GPU stall: started, not finished: %s (tick %" PRIu64 ")\n", name,
+			            timer.tick);
+			if (++reported == 8) break;
+		}
+	}
+	std::printf("GPU stall: last finished timer: %s\n", last_done != nullptr ? last_done : "none");
+	std::fflush(stdout);
 }
 
 void CommandScheduler::ReadGpuTimers() {

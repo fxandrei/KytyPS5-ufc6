@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_
 
 #include "common/common.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
@@ -30,10 +31,18 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Called with the tick waited for when a Wait has lasted STALL_REPORT_NS (the wait then goes
+	// on) and when the device is lost.
+	void SetStallHandler(Common::UniqueFunction<void, uint64_t>&& handler) {
+		m_stall_handler = std::move(handler);
+	}
 
 private:
-	GraphicContext&       m_graphics;
-	vk::Semaphore         m_semaphore = nullptr;
+	static constexpr uint64_t STALL_REPORT_NS = 1'500'000'000; // Before a 2-s driver reset.
+
+	GraphicContext&                        m_graphics;
+	Common::UniqueFunction<void, uint64_t> m_stall_handler;
+	vk::Semaphore                          m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
 };

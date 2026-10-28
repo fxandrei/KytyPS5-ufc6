@@ -62,6 +62,15 @@ public:
 	// keyed by its shader addresses.
 	[[nodiscard]] uint32_t BeginGpuShaderTimer();
 
+	// With KYTY_GPU_CHECKPOINTS: marks the GPU position before a draw or dispatch, named by
+	// make_name() (only called when checkpoints are on), for the stall and lost-device report.
+	template <typename MakeName>
+	void GpuCheckpoint(MakeName&& make_name) {
+		if (m_graphics_checkpoints && !m_command.IsInvalid()) {
+			SetGpuCheckpoint(make_name());
+		}
+	}
+
 	// After each recorded draw or dispatch; see AbSwitch EAGER_FLUSH.
 	void RecordedWork();
 	// The tick clock that image ages use (TextureCache, ImageHeap): eager submits do not count,
@@ -111,6 +120,9 @@ private:
 	void StartGpuTimer();
 	void EndGpuTimer(uint64_t tick);
 	void ReadGpuTimers();
+	void                   ReportStall(uint64_t tick);
+	void                   SetGpuCheckpoint(std::string_view name);
+	[[nodiscard]] uint32_t MarkerId(std::string_view name);
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -155,6 +167,7 @@ private:
 	uint64_t                                  m_gpu_busy_end   = 0; // ns on the GPU clock
 	uint32_t                                  m_recorded_since_submit = 0;
 	uint64_t                                  m_eager_submits         = 0;
+	bool                                      m_graphics_checkpoints  = false;
 };
 
 } // namespace Libs::Graphics

@@ -60,7 +60,15 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		gpu_thread_timer.emplace(Common::DebugCounters::Counter::GpuThreadWaits,
 		                         Common::DebugCounters::Counter::GpuThreadWaitNs);
 	}
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	auto result = m_graphics.device.waitSemaphores(&wait_info,
+	                                               m_stall_handler ? STALL_REPORT_NS : UINT64_MAX);
+	if (result == vk::Result::eTimeout) {
+		m_stall_handler(tick);
+		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	}
+	if (result != vk::Result::eSuccess && m_stall_handler) {
+		m_stall_handler(tick); // A lost device may still report its last timers.
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

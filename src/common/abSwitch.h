@@ -13,8 +13,9 @@ namespace Common::AbSwitch {
 inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
-// SRT_READ_BACKING, LABEL_IN_ORDER and EAGER_FLUSH. KYTY_AB=0 turns them all off.
-inline constexpr uint32_t DEFAULT_MASK = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6);
+// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH and SKIP_DRAW_CHECKS. KYTY_AB=0 turns them all off.
+inline constexpr uint32_t DEFAULT_MASK =
+    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -55,6 +56,13 @@ inline constexpr uint32_t GUEST_BARRIERS = 5;
 // (checked every 16 recorded draws or dispatches) or after 256 of them, so recording and GPU
 // execution overlap instead of alternating at the sync points.
 inline constexpr uint32_t EAGER_FLUSH = 6;
+// CommitBindings skips its per-draw proof that the scalar reads behind a shader specialization do
+// not overlap image, attachment or shader-buffer writes. The proof only exits on a violation.
+inline constexpr uint32_t SKIP_DRAW_CHECKS = 7;
+// EAGER_FLUSH checks every 64 recorded draws or dispatches instead of 16: fewer and larger
+// submits when the GPU is waiting for the command processor (each submit costs the driver
+// about 13 us of CPU in the fight).
+inline constexpr uint32_t EAGER_FLUSH_COARSE = 8;
 
 } // namespace Common::AbSwitch
 

@@ -453,6 +453,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	auto&      scheduler = m_context.GetCommandScheduler();
 	const auto gpu_timer = scheduler.BeginGpuShaderTimer();
+	const auto label     = [&] {
+        return fmt::format("cs {:#x} h{:016x} g{}x{}x{} t{}x{}x{} w{}{}{}",
+		                       cs_regs.cs_regs.data_addr, program.shader_hash, thread_group_x,
+		                       thread_group_y, thread_group_z, input_info.threads_num[0],
+		                       input_info.threads_num[1], input_info.threads_num[2],
+		                       input_info.wave_size, input_info.lds_storage ? " lds-storage" : "",
+                           program.info.uses_gds ? " gds" : "");
+	};
+	scheduler.GpuCheckpoint(label);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -475,14 +484,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	if (gpu_timer != UINT32_MAX) {
-		scheduler.EndGpuMarker(
-		    gpu_timer, fmt::format("cs {:#x} h{:016x} g{}x{}x{} t{}x{}x{} w{}{}{}",
-		                           cs_regs.cs_regs.data_addr, program.shader_hash,
-		                           thread_group_x, thread_group_y, thread_group_z,
-		                           input_info.threads_num[0], input_info.threads_num[1],
-		                           input_info.threads_num[2], input_info.wave_size,
-		                           input_info.lds_storage ? " lds-storage" : "",
-		                           program.info.uses_gds ? " gds" : ""));
+		scheduler.EndGpuMarker(gpu_timer, label());
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
@@ -575,10 +577,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	auto&      scheduler = m_context.GetCommandScheduler();
 	const auto gpu_timer = scheduler.BeginGpuShaderTimer();
+	const auto label = [&] { return fmt::format("cs {:#x} indirect", cs_regs.cs_regs.data_addr); };
+	scheduler.GpuCheckpoint(label);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	if (gpu_timer != UINT32_MAX) {
-		scheduler.EndGpuMarker(gpu_timer,
-		                       fmt::format("cs {:#x} indirect", cs_regs.cs_regs.data_addr));
+		scheduler.EndGpuMarker(gpu_timer, label());
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (!guest_ordered) {

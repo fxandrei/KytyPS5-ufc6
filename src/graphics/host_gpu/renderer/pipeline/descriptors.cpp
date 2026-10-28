@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
+#include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -957,9 +958,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	const bool check_reads = !Common::AbSwitch::Enabled(Common::AbSwitch::SKIP_DRAW_CHECKS);
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
+		if (!check_reads || reads.empty()) continue;
 		for (const auto* writer: prepared_bindings) {
 			if (writer->runtime->module->info.has_address_writes) {
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");

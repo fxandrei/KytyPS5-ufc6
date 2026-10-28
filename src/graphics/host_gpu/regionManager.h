@@ -57,7 +57,9 @@ public:
 private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		// Cached: every page-tracking lock and unlock asks, and the call is not inlined.
+		static thread_local const uint32_t tid = GetCurrentThreadId();
+		return tid;
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		static thread_local const uint32_t tid =

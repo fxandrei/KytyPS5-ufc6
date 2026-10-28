@@ -1251,6 +1251,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	auto&         scheduler         = m_context.GetCommandScheduler();
 	const auto    gpu_timer         = scheduler.BeginGpuShaderTimer();
+	const auto    label             = [&] {
+        const auto& shaders = buffer.GetShaders();
+        return fmt::format("draw vs {:#x} ps {:#x}",
+                           shaders.GetVs().gs_regs.data_addr != 0
+		                                      ? shaders.GetVs().gs_regs.data_addr
+		                                      : shaders.GetVs().es_regs.data_addr,
+		                                  shaders.GetPs().ps_regs.data_addr);
+	};
+	scheduler.GpuCheckpoint(label);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
@@ -1263,12 +1272,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	if (gpu_timer != UINT32_MAX) {
-		const auto& shaders = buffer.GetShaders();
-		scheduler.EndGpuMarker(gpu_timer, fmt::format("draw vs {:#x} ps {:#x}",
-		                                              shaders.GetVs().gs_regs.data_addr != 0
-		                                                  ? shaders.GetVs().gs_regs.data_addr
-		                                                  : shaders.GetVs().es_regs.data_addr,
-		                                              shaders.GetPs().ps_regs.data_addr));
+		scheduler.EndGpuMarker(gpu_timer, label());
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
