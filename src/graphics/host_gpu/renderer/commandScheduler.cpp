@@ -184,6 +184,11 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	if (m_submit_thread.joinable()) {
+		DrainQueuedSubmits();
+		m_submit_thread.request_stop();
+		m_submit_thread.join();
+	}
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -667,6 +672,26 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	if (submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0 &&
+	    Common::AbSwitch::Enabled(Common::AbSwitch::QUEUED_SUBMIT)) {
+		{
+			std::lock_guard lock(m_submit_mutex);
+			tick = m_master.NextTick();
+			m_submit_queue.push_back(
+			    {buffer, tick, m_command.m_debug_op, m_command.m_debug_submit_id});
+			if (!m_submit_thread.joinable()) {
+				m_submit_thread =
+				    std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+			}
+		}
+		m_submit_changed.notify_all();
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+		EndGpuTimer(tick);
+		m_recorded_since_submit = 0;
+		m_command.m_buffer      = nullptr;
+		return tick;
+	}
+	DrainQueuedSubmits();
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -705,6 +730,53 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer = nullptr;
 	return tick;
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	for (;;) {
+		QueuedSubmit job;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			m_submit_changed.wait(lock, stop, [this] { return !m_submit_queue.empty(); });
+			if (m_submit_queue.empty()) {
+				return; // Stop requested.
+			}
+			job = m_submit_queue.front();
+			m_submit_queue.pop_front();
+			m_submit_busy = true;
+		}
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.signalSemaphoreValueCount = 1;
+		timeline_info.pSignalSemaphoreValues    = &job.tick;
+		const auto     semaphore                = m_master.Handle();
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext                = &timeline_info;
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &job.buffer;
+		submit_info.signalSemaphoreCount = 1;
+		submit_info.pSignalSemaphores    = &semaphore;
+		vk::Result result;
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			result = m_graphics.queue.submit(1, &submit_info, nullptr);
+		}
+		if (result != vk::Result::eSuccess) {
+			ReportStall(job.tick); // A lost device still reports its last checkpoints.
+			ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit, 0,
+			                  0, 0, 0, 0);
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_submit_busy = false;
+		}
+		m_submit_changed.notify_all();
+	}
+}
+
+void CommandScheduler::DrainQueuedSubmits() {
+	std::unique_lock lock(m_submit_mutex);
+	m_submit_changed.wait(lock, [this] { return m_submit_queue.empty() && !m_submit_busy; });
 }
 
 void CommandScheduler::BeginNext() {

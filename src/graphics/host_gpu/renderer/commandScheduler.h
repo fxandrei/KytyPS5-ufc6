@@ -129,6 +129,16 @@ private:
 	void                   SetGpuCheckpoint(std::string_view name);
 	[[nodiscard]] uint32_t MarkerId(std::string_view name);
 	void PriorityOperationsThread(std::stop_token stop);
+	// AbSwitch QUEUED_SUBMIT: m_submit_thread submits these in order.
+	struct QueuedSubmit {
+		vk::CommandBuffer buffer;
+		uint64_t          tick         = 0;
+		uint32_t          debug_op     = 0;
+		uint64_t          debug_submit = 0;
+	};
+	void SubmitThread(std::stop_token stop);
+	// Returns once every queued submit is in the queue, so a direct submit cannot overtake one.
+	void DrainQueuedSubmits();
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
@@ -143,6 +153,11 @@ private:
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
+	std::mutex                   m_submit_mutex;
+	std::condition_variable_any  m_submit_changed;
+	std::deque<QueuedSubmit>     m_submit_queue;
+	bool                         m_submit_busy = false;
+	std::jthread                 m_submit_thread; // Started by the first queued submit.
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;

@@ -13,9 +13,10 @@ namespace Common::AbSwitch {
 inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
-// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH and SKIP_DRAW_CHECKS. KYTY_AB=0 turns them all off.
+// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL and QUEUED_SUBMIT.
+// KYTY_AB=0 turns them all off.
 inline constexpr uint32_t DEFAULT_MASK =
-    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7);
+    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 9) | (1u << 10);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -67,6 +68,10 @@ inline constexpr uint32_t EAGER_FLUSH_COARSE = 8;
 // parameters: Frostbite recreates its transient render targets every frame, and creating and
 // freeing their dedicated memory costs the command processor about 3% in the fight.
 inline constexpr uint32_t IMAGE_POOL = 9;
+// Command buffers without semaphores are submitted by a scheduler thread, in order, instead of
+// by the command processor: vkQueueSubmit costs the driver about 13 us of CPU each, 5,000 times a
+// second in the fight.
+inline constexpr uint32_t QUEUED_SUBMIT = 10;
 
 } // namespace Common::AbSwitch
 
