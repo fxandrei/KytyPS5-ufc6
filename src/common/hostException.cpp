@@ -95,6 +95,10 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 
+	if (ScopedPassThrough::Depth() != 0) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
 	ExceptionInfo info {};
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
 	info.native_code       = exception_record->ExceptionCode;

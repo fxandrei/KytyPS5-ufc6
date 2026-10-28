@@ -1,7 +1,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
-#include "common/assert.h"
 #include "common/abSwitch.h"
+#include "common/assert.h"
+#include "common/corePlacement.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -424,7 +425,13 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	bool core_reserved = false;
 	for (;;) {
+		if (const bool reserve = Common::AbSwitch::Enabled(Common::AbSwitch::RESERVE_CORE);
+		    reserve != core_reserved) {
+			Common::CorePlacement::SetReserved(reserve);
+			core_reserved = reserve;
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;

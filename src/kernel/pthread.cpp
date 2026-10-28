@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/corePlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -3240,6 +3241,7 @@ static void* RunThread(void* arg) {
 		const std::wstring name(thread->name.begin(), thread->name.end());
 		SetThreadDescription(GetCurrentThread(), name.c_str());
 	}
+	Common::CorePlacement::KeepOffReservedCore();
 #endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64

@@ -39,6 +39,21 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// While one is alive on a thread, the installed handler does not see that thread's exceptions,
+// so the code's own __try/__except handles them (the stack sampler's unwinding of another thread).
+class ScopedPassThrough {
+public:
+	ScopedPassThrough() noexcept { ++Depth(); }
+	~ScopedPassThrough() { --Depth(); }
+	ScopedPassThrough(const ScopedPassThrough&)            = delete;
+	ScopedPassThrough& operator=(const ScopedPassThrough&) = delete;
+
+	[[nodiscard]] static int& Depth() noexcept {
+		static thread_local int depth = 0;
+		return depth;
+	}
+};
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif

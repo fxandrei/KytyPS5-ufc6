@@ -13,10 +13,10 @@ namespace Common::AbSwitch {
 inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
-// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL and QUEUED_SUBMIT.
-// KYTY_AB=0 turns them all off.
-inline constexpr uint32_t DEFAULT_MASK =
-    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 9) | (1u << 10);
+// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT and
+// DIRECT_READBACK. KYTY_AB=0 turns them all off.
+inline constexpr uint32_t DEFAULT_MASK = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) |
+                                         (1u << 7) | (1u << 9) | (1u << 10) | (1u << 11);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -72,6 +72,12 @@ inline constexpr uint32_t IMAGE_POOL = 9;
 // by the command processor: vkQueueSubmit costs the driver about 13 us of CPU each, 5,000 times a
 // second in the fight.
 inline constexpr uint32_t QUEUED_SUBMIT = 10;
+// A read of GPU-written guest memory copies it straight from the guest buffer, mapped through the
+// resizable BAR, once the commands that last wrote the buffer have completed, instead of
+// recording a copy, submitting and waiting for all the work recorded so far.
+inline constexpr uint32_t DIRECT_READBACK = 11;
+// A physical core is kept for the GPU command-processor thread (see common/corePlacement.h).
+inline constexpr uint32_t RESERVE_CORE = 12;
 
 } // namespace Common::AbSwitch
 

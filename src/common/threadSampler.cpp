@@ -3,6 +3,7 @@
 #include "common/threadSampler.h"
 
 #include "common/config.h"
+#include "common/hostException.h"
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -40,7 +41,7 @@ using Frames = std::array<uint64_t, MAX_FRAMES>;
 
 // Walks the suspended thread's stack with the image unwind tables. Only the innermost frame may
 // lack them (a leaf function). Nothing here allocates or locks, since the thread is suspended.
-int Unwind(CONTEXT context, Frames& frames) {
+int UnwindGuarded(CONTEXT context, Frames& frames) {
 	int count = 0;
 	__try {
 		while (count < MAX_FRAMES && context.Rip != 0) {
@@ -64,6 +65,13 @@ int Unwind(CONTEXT context, Frames& frames) {
 		// Keep the frames walked so far.
 	}
 	return count;
+}
+
+int Unwind(const CONTEXT& context, Frames& frames) {
+	// A bad unwind entry faults: let UnwindGuarded's __except take it, not the emulator's handler
+	// (a vectored handler, which runs first and treats an unknown fault as fatal).
+	const HostException::ScopedPassThrough pass_through;
+	return UnwindGuarded(context, frames);
 }
 
 bool SamplingEnabled(const char* control) {

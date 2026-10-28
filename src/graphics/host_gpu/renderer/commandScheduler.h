@@ -78,6 +78,9 @@ public:
 
 	// After each recorded draw or dispatch; see AbSwitch EAGER_FLUSH.
 	void RecordedWork();
+	// Every submitted command buffer then ends with a barrier that makes its writes visible to the
+	// host, for guest buffers read in place (AbSwitch DIRECT_READBACK).
+	void SetHostReadBarrier(bool enabled) noexcept { m_host_read_barrier = enabled; }
 	// The tick clock that image ages use (TextureCache, ImageHeap): eager submits do not count,
 	// so they do not make cached images look older than before.
 	[[nodiscard]] uint64_t AgeTick() const noexcept { return CurrentTick() - m_eager_submits; }
@@ -188,6 +191,7 @@ private:
 	uint32_t                                  m_recorded_since_submit = 0;
 	uint64_t                                  m_eager_submits         = 0;
 	bool                                      m_graphics_checkpoints  = false;
+	bool                                      m_host_read_barrier     = false;
 };
 
 } // namespace Libs::Graphics

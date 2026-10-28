@@ -661,6 +661,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_host_read_barrier) {
+		m_command.EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                   vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0,
+		                                   nullptr, 0, nullptr);
+	}
 	if (m_gpu_timer_query != UINT32_MAX) {
 		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
 		                                  m_gpu_timer_pool, m_gpu_timer_query + 1);

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -25,6 +26,7 @@ enum class MemoryUsage : uint8_t {
 	Upload,
 	Download,
 	Stream,
+	Guest, // Device-local and mapped: only where the device-local heap is host-visible (BAR).
 };
 
 inline constexpr vk::BufferUsageFlags ReadFlags =
@@ -53,6 +55,11 @@ public:
 		return address - m_cpu_address;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
+	// The last tick that recorded a GPU write into the buffer (written bindings, joined overlaps).
+	[[nodiscard]] uint64_t LastGpuWriteTick() const noexcept { return m_last_gpu_write_tick; }
+	void                   MarkGpuWrite(uint64_t tick) noexcept {
+        m_last_gpu_write_tick = std::max(m_last_gpu_write_tick, tick);
+	}
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
@@ -84,6 +91,7 @@ private:
 
 	GraphicContext*               m_graphics    = nullptr;
 	CommandScheduler*             m_scheduler   = nullptr;
+	uint64_t                      m_last_gpu_write_tick = 0;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
 	vk::DeviceAddress             m_device_address = 0;

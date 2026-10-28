@@ -150,6 +150,9 @@ private:
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
+	// Guest buffers are mapped through the resizable BAR when the device-local heap is host-visible
+	// (AbSwitch DIRECT_READBACK reads them in place).
+	MemoryUsage                                       m_guest_usage = MemoryUsage::DeviceLocal;
 	RangeSet                                          m_bda_sync;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -15,6 +16,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <smmintrin.h>
 #include <utility>
 #include <vector>
 
@@ -30,6 +33,31 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
+
+// Reads device memory mapped through the BAR, which is write-combined: plain loads are uncached
+// one at a time (about 30 MB/s), while streaming loads fetch a whole 64-byte line per request.
+// Hands the bytes to `sink` in pieces of at most 4 KiB, as (bytes, offset, size).
+template <typename Sink>
+void ReadWriteCombined(const uint8_t* source, uint64_t size, Sink&& sink) {
+	alignas(64) std::array<uint8_t, 4096 + 128> lines {};
+	uint64_t                                    done = 0;
+	while (done < size) {
+		const auto  piece = std::min<uint64_t>(size - done, 4096);
+		const auto* from  = source + done;
+		const auto  first = reinterpret_cast<uintptr_t>(from) & ~uintptr_t {63};
+		const auto  last  = (reinterpret_cast<uintptr_t>(from) + piece + 63) & ~uintptr_t {63};
+		auto*       to    = reinterpret_cast<__m128i*>(lines.data());
+		for (auto line = first; line < last; line += 64) {
+			const auto* in = reinterpret_cast<__m128i*>(line);
+			_mm_store_si128(to++, _mm_stream_load_si128(in));
+			_mm_store_si128(to++, _mm_stream_load_si128(in + 1));
+			_mm_store_si128(to++, _mm_stream_load_si128(in + 2));
+			_mm_store_si128(to++, _mm_stream_load_si128(in + 3));
+		}
+		sink(lines.data() + (reinterpret_cast<uintptr_t>(from) - first), done, piece);
+		done += piece;
+	}
+}
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -204,6 +232,28 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	if constexpr (!async) {
+		// The ticks up to the last writer carry the host-read barrier that Submit records, so the
+		// mapped bytes are the GPU's once that tick has completed; later work is not waited for.
+		const auto write_tick = buffer.LastGpuWriteTick();
+		if (!buffer.Mapped().empty() && write_tick != 0 &&
+		    Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_READBACK)) {
+			if (write_tick >= m_scheduler.CurrentTick()) {
+				m_scheduler.Flush(); // The writes are still being recorded.
+			}
+			m_scheduler.Wait(write_tick);
+			m_scheduler.WaitPriorityOperations(write_tick);
+			const auto* mapped = buffer.Mapped().data();
+			for (const auto& copy: copies) {
+				ReadWriteCombined(mapped + copy.srcOffset, copy.size,
+				                  [&](const uint8_t* bytes, uint64_t offset, uint64_t size) {
+					                  Libs::LibKernel::Memory::WriteBacking(
+					                      buffer_address + copy.srcOffset + offset, bytes, size);
+				                  });
+			}
+			return true;
+		}
+	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -284,6 +334,20 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_scheduler.BeginCommand();
 	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
 		buffer->Fill(0, buffer->Size(), 0);
+	}
+	// A host-visible type on a large device-local heap means a resizable BAR; a small (256 MiB) BAR
+	// heap could not hold the guest buffers.
+	const auto& memory = m_graphics.GetPhysicalDeviceMemoryProperties();
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		const auto flags = memory.memoryTypes[i].propertyFlags;
+		const auto heap  = memory.memoryHeaps[memory.memoryTypes[i].heapIndex];
+		if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+		    (flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+		    (flags & vk::MemoryPropertyFlagBits::eHostCoherent) && heap.size >= 4ull * 1024 * MiB) {
+			m_guest_usage = MemoryUsage::Guest;
+			m_scheduler.SetHostReadBarrier(true);
+			break;
+		}
 	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -426,6 +490,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	new_buffer.MarkGpuWrite(m_scheduler.CurrentTick());
 	DeleteBuffer(overlap_id);
 }
 
@@ -436,9 +501,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	const auto  id = m_slot_buffers.insert(m_graphics, m_scheduler, m_guest_usage, overlap.begin,
+	                                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	                                       overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -550,6 +615,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::WrittenBindingBytes, size);
 		TraceWrittenBinding(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		buffer.MarkGpuWrite(m_scheduler.CurrentTick());
 		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
