@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -197,6 +199,7 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	int                                 requested_flip_rate = 0; // Before KYTY_FLIP_RATE.
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -730,6 +733,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate   = 0;
+		config.requested_flip_rate = 0;
 		master             = config.master;
 		config.master      = nullptr;
 
@@ -1431,8 +1435,19 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
 
+	// Experiment: KYTY_FLIP_RATE=<0..2> replaces the rate the title asks for (0 = every vblank).
+	static const int forced_rate = [] {
+		const char* value = std::getenv("KYTY_FLIP_RATE");
+		return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : -1;
+	}();
 	Common::LockGuard lock(ctx->mutex);
-	ctx->flip_rate = rate;
+	const int         applied = (forced_rate >= 0 ? forced_rate : rate);
+	if (applied != ctx->flip_rate || rate != ctx->requested_flip_rate) {
+		std::printf("video out: title sets flip rate %d, applied %d\n", rate, applied);
+		std::fflush(stdout);
+	}
+	ctx->requested_flip_rate = rate;
+	ctx->flip_rate           = applied;
 
 	return OK;
 }
@@ -1515,6 +1530,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	std::printf("video out: set %d registers %d buffers of %" PRIu32 "x%" PRIu32 "\n", set_index,
+	            buffer_num, attribute->width, attribute->height);
+	std::fflush(stdout);
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
@@ -1888,10 +1906,23 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute = 0;
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
+	// Experiment: KYTY_OUTPUT_1080P=1 reports a 1080p display to every title. A title sizes its
+	// output, and the range of its dynamic resolution, from this status. UFC 6 then renders the
+	// menu with about a third less GPU work, but its fight flow hangs the GPU (2 of 2 runs).
+	static const bool force_1080p = [] {
+		const char* value = std::getenv("KYTY_OUTPUT_1080P");
+		return value != nullptr && value[0] == '1';
+	}();
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	const bool detected_1080p = (attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160;
+	status->resolution        = (force_1080p || detected_1080p ? 1u : 2u);
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		std::printf("video out: output status reports resolution %" PRIu32 "\n",
+		            status->resolution);
+		std::fflush(stdout);
+	}
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
