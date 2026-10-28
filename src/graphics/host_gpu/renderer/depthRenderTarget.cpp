@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <fmt/format.h>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -406,6 +407,11 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		                         range.layer_count};
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
+	}
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command,
+		                  fmt::format("depth copy 0x{:x} {}x{}", write_desc.info.data.address,
+		                              write_desc.info.extent.width, write_desc.info.extent.height));
 	}
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,

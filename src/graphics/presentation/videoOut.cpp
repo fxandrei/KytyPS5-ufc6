@@ -1906,17 +1906,19 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute = 0;
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
-	// Experiment: KYTY_OUTPUT_1080P=1 reports a 1080p display to every title. A title sizes its
-	// output, and the range of its dynamic resolution, from this status. UFC 6 then renders the
-	// menu with about a third less GPU work, but its fight flow hangs the GPU (2 of 2 runs).
-	static const bool force_1080p = [] {
+	// A title sizes its output, and the range of its dynamic resolution, from this status. A screen
+	// smaller than 4K reports 1080p, also to titles whose param.json does not enable resolution
+	// detection: UFC 6 then renders its main menu with about a third less GPU work.
+	// KYTY_OUTPUT_1080P=0 restores the console's rule (4K unless the title enables detection);
+	// KYTY_OUTPUT_1080P=1 reports 1080p whatever the screen size.
+	static const int output_1080p = [] {
 		const char* value = std::getenv("KYTY_OUTPUT_1080P");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
 	}();
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	const bool detected_1080p = (attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160;
-	status->resolution        = (force_1080p || detected_1080p ? 1u : 2u);
+	const bool detection    = output_1080p < 0 || (attribute3 & 4) != 0;
+	const bool small_screen = ctx->width < 3840 && ctx->height < 2160;
+	status->resolution      = (output_1080p == 1 || (detection && small_screen) ? 1u : 2u);
 	static std::atomic_bool logged {false};
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
 		std::printf("video out: output status reports resolution %" PRIu32 "\n",

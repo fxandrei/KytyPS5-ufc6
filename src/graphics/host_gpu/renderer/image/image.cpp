@@ -248,6 +248,16 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	command_buffer.pipelineBarrier2(dependency);
 }
 
+// A GPU checkpoint before an image operation (KYTY_GPU_CHECKPOINTS), for the stall report.
+static void ImageCheckpoint(vk::CommandBuffer command, const char* what, const ImageInfo& info) {
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command,
+		                  fmt::format("image {} 0x{:x} {}x{}x{} format {}", what, info.data.address,
+		                              info.extent.width, info.extent.height, info.extent.depth,
+		                              static_cast<uint32_t>(info.pixel_format)));
+	}
+}
+
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
@@ -273,6 +283,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	ImageCheckpoint(command, "upload", info);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
@@ -313,6 +324,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	ImageCheckpoint(command, "download", info);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
@@ -403,6 +415,7 @@ void Image::CopyImage(Image& source, bool stencil) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	ImageCheckpoint(command, "copy", info);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
 	                  copies.data());
@@ -454,6 +467,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		ImageCheckpoint(command, "resolve-copy", info);
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
 	} else {
@@ -464,6 +478,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		ImageCheckpoint(command, "resolve", info);
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
@@ -515,8 +530,13 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		// As in CopyImage: overlapping cache images can differ in size, and copying the source
+		// extent into a smaller destination writes out of bounds and loses the device. UFC 6 at a
+		// 1080p output resizes its depth targets with the dynamic resolution every few frames.
+		const auto width             = std::min(std::max(source.backing.extent.width >> level, 1u),
+		                                        std::max(backing.extent.width >> level, 1u));
+		const auto height            = std::min(std::max(source.backing.extent.height >> level, 1u),
+		                                        std::max(backing.extent.height >> level, 1u));
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;
@@ -554,6 +574,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
 				command.pipelineBarrier2(dependency);
+				ImageCheckpoint(command, "buffer-copy-out", source.info);
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
@@ -570,6 +591,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
 					command.pipelineBarrier2(dependency);
 				}
+				ImageCheckpoint(command, "buffer-copy-in", info);
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
 			}
@@ -606,6 +628,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
+	ImageCheckpoint(command, "copy", info);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 	Transit(vk::ImageLayout::eGeneral,

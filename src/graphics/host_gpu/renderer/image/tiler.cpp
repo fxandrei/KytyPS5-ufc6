@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -13,8 +15,6 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard4_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -24,6 +24,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -319,6 +320,11 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
 	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
 	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command,
+		                  fmt::format("tiler: slot {} texels {} groups {}x{}", tiling.pipeline_slot,
+		                              tiling.num_texels, groups_x, groups_y));
+	}
 	command.dispatch(groups_x, groups_y, 1);
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
@@ -544,6 +550,9 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.target_pitch = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
+			if (GpuCheckpointsEnabled()) {
+				MarkGpuCheckpoint(command, fmt::format("tiler: rows {} groups {}", rows, groups_x));
+			}
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
@@ -613,6 +622,9 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	push.to_host         = to_host;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command, fmt::format("tiler: color transform {} pixels", pixels));
+	}
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
@@ -675,6 +687,9 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	                  expand};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command, fmt::format("tiler: color clear check {} slices", slices));
+	}
 	command.dispatch(slices, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;

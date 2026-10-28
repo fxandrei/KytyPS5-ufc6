@@ -31,6 +31,11 @@
 #include <filesystem>
 #include <thread>
 
+#if defined(KYTY_PGO_GENERATE)
+// clang -fprofile-instr-generate runtime: writes the counters to LLVM_PROFILE_FILE.
+extern "C" int __llvm_profile_write_file(void); // NOLINT(readability-identifier-naming)
+#endif
+
 namespace Emulator {
 
 static void PrintSystemInfo() {
@@ -142,6 +147,10 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+#if defined(KYTY_PGO_GENERATE)
+	// quick_exit skips the profile runtime's atexit writer.
+	__llvm_profile_write_file();
+#endif
 	std::quick_exit(0);
 }
 

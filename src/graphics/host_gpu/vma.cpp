@@ -14,6 +14,7 @@
 #pragma clang diagnostic pop
 #endif
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -56,6 +57,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	ReleaseImagePool();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -150,18 +152,42 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+	// A pooled image has only these parameters; its contents are undefined, as for a new one.
+	const bool poolable = image_info.pNext == nullptr &&
+	                      image_info.tiling == vk::ImageTiling::eOptimal &&
+	                      image_info.initialLayout == vk::ImageLayout::eUndefined &&
+	                      image_info.sharingMode == vk::SharingMode::eExclusive;
+	if (poolable) {
+		std::scoped_lock lock(m_image_pool_mutex);
+		const auto       pooled = std::ranges::find_if(m_image_pool, [&](const PooledImage& p) {
+            return p.format == image_info.format && p.image_type == image_info.imageType &&
+                   p.extent == image_info.extent && p.layers == image_info.arrayLayers &&
+                   p.mip_levels == image_info.mipLevels &&
+                   p.samples == static_cast<uint32_t>(image_info.samples) &&
+                   p.usage == image_info.usage && p.flags == image_info.flags;
+        });
+		if (pooled != m_image_pool.end()) {
+			image.image      = pooled->image;
+			image.allocation = pooled->allocation;
+			m_image_pool_bytes -= pooled->bytes;
+			m_image_pool.erase(pooled);
+		}
 	}
+	if (image.image == nullptr) {
+		VmaAllocationCreateInfo alloc_info {};
+		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto       result       = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+            &native_image, &image.allocation, nullptr));
+		image.image                   = native_image;
+		if (result != vk::Result::eSuccess) {
+			LogMemoryBudget();
+			return false;
+		}
+	}
+	image.poolable = poolable;
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -181,9 +207,35 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	// The GPU no longer uses the image: callers free it once its last tick has completed.
+	if (image.poolable && Common::AbSwitch::Enabled(Common::AbSwitch::IMAGE_POOL)) {
+		VmaAllocationInfo allocation {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation);
+		std::scoped_lock lock(m_image_pool_mutex);
+		m_image_pool.push_back({image.format, image.image_type, image.extent, image.layers,
+		                        image.mip_levels, image.samples, image.usage, image.flags,
+		                        image.image, image.allocation, allocation.size});
+		m_image_pool_bytes += allocation.size;
+		while (m_image_pool_bytes > IMAGE_POOL_BYTES) {
+			const auto& oldest = m_image_pool.front();
+			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+			m_image_pool_bytes -= oldest.bytes;
+			m_image_pool.pop_front();
+		}
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
+}
+
+void GraphicContext::ReleaseImagePool() {
+	std::scoped_lock lock(m_image_pool_mutex);
+	for (const auto& pooled: m_image_pool) {
+		vmaDestroyImage(allocator, pooled.image, pooled.allocation);
+	}
+	m_image_pool.clear();
+	m_image_pool_bytes = 0;
 }
 
 } // namespace Libs::Graphics

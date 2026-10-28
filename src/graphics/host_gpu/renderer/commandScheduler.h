@@ -22,6 +22,11 @@
 
 namespace Libs::Graphics {
 
+// With KYTY_GPU_CHECKPOINTS: marks the GPU position in a command buffer of the queue before an
+// operation of the renderer's own (copies, tiling, blits), for the stall and lost-device report.
+[[nodiscard]] bool GpuCheckpointsEnabled() noexcept;
+void               MarkGpuCheckpoint(vk::CommandBuffer command, std::string_view name);
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -191,6 +192,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                            {destination_info.extent.width, destination_info.extent.height}};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command, fmt::format("blit {}x{}", destination_info.extent.width,
+		                                       destination_info.extent.height));
+	}
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.

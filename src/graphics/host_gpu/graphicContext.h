@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <deque>
 #include <map>
 #include <mutex>
 #include <span>
@@ -117,11 +118,32 @@ struct GraphicContext {
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	void                   ReleaseImagePool();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	// Images freed while AbSwitch IMAGE_POOL is on, for reuse by an identical CreateImage.
+	struct PooledImage {
+		vk::Format           format     = vk::Format::eUndefined;
+		vk::ImageType        image_type = vk::ImageType::e2D;
+		vk::Extent3D         extent     = {};
+		uint32_t             layers     = 0;
+		uint32_t             mip_levels = 0;
+		uint32_t             samples    = 0;
+		vk::ImageUsageFlags  usage      = {};
+		vk::ImageCreateFlags flags      = {};
+		vk::Image            image      = nullptr;
+		VmaAllocation        allocation = nullptr;
+		uint64_t             bytes      = 0;
+	};
+	static constexpr uint64_t IMAGE_POOL_BYTES = uint64_t {512} << 20u;
+
+	std::mutex              m_image_pool_mutex;
+	std::deque<PooledImage> m_image_pool; // Oldest first.
+	uint64_t                m_image_pool_bytes = 0;
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -153,6 +175,7 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	bool                          poolable = false; // Plain optimal image: DeleteImage may keep it.
 };
 
 

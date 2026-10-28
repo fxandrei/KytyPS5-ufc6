@@ -1253,13 +1253,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto    gpu_timer         = scheduler.BeginGpuShaderTimer();
 	const auto    label             = [&] {
         const auto& shaders = buffer.GetShaders();
-        return fmt::format("draw vs {:#x} ps {:#x}",
-                           shaders.GetVs().gs_regs.data_addr != 0
-		                                      ? shaders.GetVs().gs_regs.data_addr
-		                                      : shaders.GetVs().es_regs.data_addr,
-		                                  shaders.GetPs().ps_regs.data_addr);
+		const auto& vs      = shaders.GetVs();
+		return fmt::format("draw vs {:#x} ps {:#x}",
+		                   vs.gs_regs.data_addr != 0 ? vs.gs_regs.data_addr : vs.es_regs.data_addr,
+		                   shaders.GetPs().ps_regs.data_addr);
 	};
-	scheduler.GpuCheckpoint(label);
+	// The checkpoint also names the programs and the draw size, to find a draw that hangs the GPU.
+	scheduler.GpuCheckpoint([&] {
+		const auto* ps = state.ps_active ? state.ps_input_info.stage.module : nullptr;
+		return fmt::format("{} vs-h{:016x} ps-h{:016x} n{} i{}{}{} rt{}x{}", label(),
+		                   state.vertex_info[0].stage.module->info.shader_hash,
+		                   ps != nullptr ? ps->info.shader_hash : 0, draw.index_count,
+		                   draw.instance_count, args_buffer.first != nullptr ? " indirect" : "",
+		                   mesh_active ? " mesh" : "", rendering.width, rendering.height);
+	});
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {

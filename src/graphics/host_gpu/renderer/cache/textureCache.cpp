@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -1757,6 +1758,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
+	}
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command.Handle(),
+		                  fmt::format("clear image 0x{:x} {}x{}", image.info.data.address,
+		                              image.info.extent.width, image.info.extent.height));
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
 		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,

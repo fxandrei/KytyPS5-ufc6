@@ -9,11 +9,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <optional>
+#include <string>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -35,7 +39,38 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	std::fflush(stdout);
 }
 
+// Checkpoint names for every scheduler of the queue: a lost device can surface in another
+// scheduler's submit (the presenter's) than the one that recorded the checkpoint.
+struct CheckpointNames {
+	std::mutex                                mutex;
+	std::unordered_map<std::string, uint32_t> ids;
+	std::vector<std::string>                  names;
+};
+
+CheckpointNames& GetCheckpointNames() {
+	static CheckpointNames names;
+	return names;
+}
+
+std::atomic_bool g_checkpoints_enabled {false};
+
 } // namespace
+
+bool GpuCheckpointsEnabled() noexcept {
+	return g_checkpoints_enabled.load(std::memory_order_relaxed);
+}
+
+void MarkGpuCheckpoint(vk::CommandBuffer command, std::string_view name) {
+	auto&           checkpoints = GetCheckpointNames();
+	std::lock_guard lock(checkpoints.mutex);
+	auto [it, inserted] = checkpoints.ids.try_emplace(
+	    std::string(name), static_cast<uint32_t>(checkpoints.names.size()));
+	if (inserted) {
+		checkpoints.names.emplace_back(name);
+	}
+	// The marker is the name's index plus one, so that no marker is null.
+	command.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(it->second) + 1));
+}
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -106,6 +141,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
       m_graphics_checkpoints(graphics.checkpoints_enabled) {
 	m_master.SetStallHandler([this](uint64_t tick) { ReportStall(tick); });
+	if (graphics.checkpoints_enabled) {
+		g_checkpoints_enabled.store(true, std::memory_order_relaxed);
+	}
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -438,9 +476,7 @@ uint32_t CommandScheduler::MarkerId(std::string_view name) {
 }
 
 void CommandScheduler::SetGpuCheckpoint(std::string_view name) {
-	// The marker is the name's index plus one, so that no marker is null.
-	m_command.Handle().setCheckpointNV(
-	    reinterpret_cast<const void*>(static_cast<uintptr_t>(MarkerId(name)) + 1));
+	MarkGpuCheckpoint(m_command.Handle(), name);
 }
 
 void CommandScheduler::DumpGpuMarkers() {
@@ -519,29 +555,29 @@ void CommandScheduler::EndGpuScope(uint32_t scope, Common::DebugCounters::Counte
 // A wait of several seconds is a GPU hang or a deadlock. With KYTY_GPU_SHADERS the timer pairs
 // around each draw and dispatch show which one the GPU started and has not finished.
 void CommandScheduler::ReportStall(uint64_t tick) {
-	m_master.Refresh();
+	// Not Refresh(): it exits on a lost device, which is when this report matters most.
+	uint64_t finished = 0;
+	(void)m_graphics.device.getSemaphoreCounterValue(m_master.Handle(), &finished);
 	std::printf("GPU stall: still waiting for tick %" PRIu64 "; the GPU finished tick %" PRIu64
 	            ", recording tick %" PRIu64 "\n",
-	            tick, m_master.KnownGpuTick(), CurrentTick());
-	// The marker names and pending timers belong to the GPU thread, which records here.
-	if (!GuestGpu::IsGpuThread()) {
-		std::fflush(stdout);
-		return;
-	}
-	if (m_graphics_checkpoints) {
+	            tick, finished, CurrentTick());
+	if (m_graphics.checkpoints_enabled) {
 		std::vector<vk::CheckpointDataNV> checkpoints;
 		{
 			Common::LockGuard lock(m_graphics.queue_mutex);
 			checkpoints = m_graphics.queue.getCheckpointDataNV();
 		}
+		auto&           names = GetCheckpointNames();
+		std::lock_guard lock(names.mutex);
 		for (const auto& checkpoint: checkpoints) {
 			const auto id = reinterpret_cast<uintptr_t>(checkpoint.pCheckpointMarker);
-			std::printf(
-			    "GPU stall: checkpoint at %s: %s\n", vk::to_string(checkpoint.stage).c_str(),
-			    id != 0 && id <= m_marker_names.size() ? m_marker_names[id - 1].c_str() : "?");
+			std::printf("GPU stall: checkpoint at %s: %s\n",
+			            vk::to_string(checkpoint.stage).c_str(),
+			            id != 0 && id <= names.names.size() ? names.names[id - 1].c_str() : "?");
 		}
 	}
-	if (!m_gpu_timer_pool) {
+	// The pending timers belong to the GPU thread, which records here.
+	if (!m_gpu_timer_pool || !GuestGpu::IsGpuThread()) {
 		std::fflush(stdout);
 		return;
 	}
@@ -657,6 +693,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		ReportStall(tick); // A lost device still reports its last checkpoints.
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,

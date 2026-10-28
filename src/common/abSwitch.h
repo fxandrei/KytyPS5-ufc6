@@ -63,6 +63,10 @@ inline constexpr uint32_t SKIP_DRAW_CHECKS = 7;
 // submits when the GPU is waiting for the command processor (each submit costs the driver
 // about 13 us of CPU in the fight).
 inline constexpr uint32_t EAGER_FLUSH_COARSE = 8;
+// Images that DeleteImage frees are kept, up to 512 MiB, for a CreateImage with the same
+// parameters: Frostbite recreates its transient render targets every frame, and creating and
+// freeing their dedicated memory costs the command processor about 3% in the fight.
+inline constexpr uint32_t IMAGE_POOL = 9;
 
 } // namespace Common::AbSwitch
 

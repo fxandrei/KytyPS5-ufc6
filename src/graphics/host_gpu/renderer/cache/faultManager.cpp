@@ -123,6 +123,9 @@ void FaultManager::ProcessFaultBuffer() {
 	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
+	if (GpuCheckpointsEnabled()) {
+		MarkGpuCheckpoint(command, "fault buffer processing");
+	}
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
