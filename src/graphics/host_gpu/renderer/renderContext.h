@@ -63,6 +63,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// AbSwitch BDA_SYNC_PER_SUBMIT: the next PrepareBda synchronizes (a submission slice starts, or
+	// the command processor wrote guest memory).
+	void               RequestBdaSync() noexcept { m_bda_sync_requested = true; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -93,6 +96,7 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	bool                      m_bda_sync_requested    = true;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

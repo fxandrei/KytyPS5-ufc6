@@ -13,10 +13,11 @@ namespace Common::AbSwitch {
 inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
-// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT and
-// DIRECT_READBACK. KYTY_AB=0 turns them all off.
+// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT,
+// DIRECT_READBACK and BDA_SYNC_PER_SUBMIT. KYTY_AB=0 turns them all off.
 inline constexpr uint32_t DEFAULT_MASK = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) |
-                                         (1u << 7) | (1u << 9) | (1u << 10) | (1u << 11);
+                                         (1u << 7) | (1u << 9) | (1u << 10) | (1u << 11) |
+                                         (1u << 13);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -78,6 +79,10 @@ inline constexpr uint32_t QUEUED_SUBMIT = 10;
 inline constexpr uint32_t DIRECT_READBACK = 11;
 // A physical core is kept for the GPU command-processor thread (see common/corePlacement.h).
 inline constexpr uint32_t RESERVE_CORE = 12;
+// Guest memory that game threads write reaches the buffers that shaders address directly (BDA)
+// once per slice of a guest submission, and after each command-processor write, instead of before
+// every such draw or dispatch: the CPU writes what a submission reads before submitting it.
+inline constexpr uint32_t BDA_SYNC_PER_SUBMIT = 13;
 
 } // namespace Common::AbSwitch
 

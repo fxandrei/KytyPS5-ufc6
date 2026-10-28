@@ -295,6 +295,7 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
                                                      uint32_t, uint32_t);
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -306,6 +307,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
+	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
@@ -330,6 +332,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
+	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
 	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
@@ -351,6 +354,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
                                uint8_t block_engine) {
+	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
 	EXIT_NOT_IMPLEMENTED(engine > 1);
 	if (num_bytes == 0) {
 		return;
@@ -527,6 +531,9 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
+	// Game threads wrote what this slice reads before submitting it, or before the wait it resumes
+	// from was satisfied.
+	m_renderer.RequestBdaSync();
 
 	if (first_slice) {
 		submission.started = true;
@@ -1104,6 +1111,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
+	m_renderer.RequestBdaSync(); // A shader may read them, or the label, through their address.
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and

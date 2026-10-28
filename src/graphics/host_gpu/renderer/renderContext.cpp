@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -13,6 +14,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -170,13 +172,18 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_fault_process_pending = true;
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::BDA_SYNC_PER_SUBMIT) &&
+	    !std::exchange(m_bda_sync_requested, false)) {
+		return;
+	}
+	m_bda_sync_requested = false;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.TakeBdaSync().ForEach([this](uint64_t begin, uint64_t end) {
 		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
 		});
 	});
-	m_fault_process_pending = true;
 }
 
 void RenderContext::RunGarbageCollector() {
