@@ -233,7 +233,9 @@ void CommandScheduler::RecordedWork() {
 	    ++m_recorded_since_submit % interval != 0) {
 		return;
 	}
-	m_master.Refresh();
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::LAZY_GPU_POLL)) {
+		m_master.Refresh();
+	}
 	if (m_recorded_since_submit >= 256 || m_master.IsFree(CurrentTick() - 1)) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::EagerFlushes);
 		Flush();
@@ -279,7 +281,9 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::LAZY_GPU_POLL) || (++m_pop_calls & 63u) == 0) {
+		m_master.Refresh();
+	}
 	ReadGpuTimers();
 	for (;;) {
 		PendingOperation operation;

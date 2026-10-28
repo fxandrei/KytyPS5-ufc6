@@ -246,7 +246,9 @@ void CommandProcessor::GuestFlush() {
 void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
-	m_renderer.GetOcclusionQueries().Publish();
+	if (m_renderer.GetOcclusionQueries().Publish()) {
+		m_renderer.RequestBdaSync(); // A shader may read the counters through their address.
+	}
 }
 
 void CommandProcessor::BufferWait() {
@@ -295,7 +297,8 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
                                                      uint32_t, uint32_t);
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
-	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
+	// A shader may read the memory through its address.
+	m_renderer.RequestBdaSync(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -307,7 +310,8 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
-	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
+	// A shader may read the memory through its address.
+	m_renderer.RequestBdaSync(reinterpret_cast<uint64_t>(dst), uint64_t {dw_num} * sizeof(*dst));
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
@@ -332,7 +336,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
-	m_renderer.RequestBdaSync(); // A shader may read the memory through its address.
+	m_renderer.RequestBdaSync(dst_address, num_bytes); // A shader may read it by its address.
 	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
@@ -760,7 +764,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			m_renderer.GetOcclusionQueries().Publish();
+			if (m_renderer.GetOcclusionQueries().Publish()) {
+				m_renderer
+				    .RequestBdaSync(); // A shader may read the counters through their address.
+			}
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
@@ -1110,8 +1117,13 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
-	m_renderer.GetOcclusionQueries().Publish();
-	m_renderer.RequestBdaSync(); // A shader may read them, or the label, through their address.
+	// A shader may read them, or the label, through their address.
+	if (m_renderer.GetOcclusionQueries().Publish()) {
+		m_renderer.RequestBdaSync();
+	}
+	if (address != nullptr) {
+		m_renderer.RequestBdaSync(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
+	}
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
@@ -1149,6 +1161,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
+			m_renderer.RequestBdaSync();
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
@@ -1249,7 +1262,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
-	m_renderer.GetOcclusionQueries().Publish();
+	if (m_renderer.GetOcclusionQueries().Publish()) {
+		m_renderer.RequestBdaSync(); // A shader may read the counters through their address.
+	}
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);

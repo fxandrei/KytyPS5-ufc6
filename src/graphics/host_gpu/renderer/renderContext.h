@@ -66,6 +66,8 @@ public:
 	// AbSwitch BDA_SYNC_PER_SUBMIT: the next PrepareBda synchronizes (a submission slice starts, or
 	// the command processor wrote guest memory).
 	void               RequestBdaSync() noexcept { m_bda_sync_requested = true; }
+	// The command processor wrote [vaddr, vaddr + size): see AbSwitch BDA_SYNC_WRITE_RANGES.
+	void               RequestBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -97,6 +99,7 @@ private:
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
 	bool                      m_bda_sync_requested    = true;
+	RangeSet                  m_bda_written; // By the command processor (BDA_SYNC_WRITE_RANGES).
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -49,11 +49,13 @@ public:
 
 	// A PIXEL_PIPE_STAT_DUMP to address, after the draws recorded so far.
 	void Dump(uint64_t address);
-	// Waits for the GPU to run the dumps and writes their counters.
-	void Publish() {
-		if (!m_dumps.empty()) {
-			PublishDumps();
+	// Waits for the GPU to run the dumps and writes their counters; true if it wrote any.
+	bool Publish() {
+		if (m_dumps.empty()) {
+			return false;
 		}
+		PublishDumps();
+		return true;
 	}
 
 private:

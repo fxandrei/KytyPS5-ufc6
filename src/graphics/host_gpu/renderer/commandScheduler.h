@@ -192,6 +192,7 @@ private:
 	uint64_t                                  m_eager_submits         = 0;
 	bool                                      m_graphics_checkpoints  = false;
 	bool                                      m_host_read_barrier     = false;
+	uint32_t                                  m_pop_calls             = 0; // AbSwitch LAZY_GPU_POLL
 };
 
 } // namespace Libs::Graphics

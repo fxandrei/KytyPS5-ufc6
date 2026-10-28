@@ -14,10 +14,11 @@ inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
 // SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT,
-// DIRECT_READBACK and BDA_SYNC_PER_SUBMIT. KYTY_AB=0 turns them all off.
+// DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL and BDA_SYNC_WRITE_RANGES. KYTY_AB=0 turns
+// them all off.
 inline constexpr uint32_t DEFAULT_MASK = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) |
                                          (1u << 7) | (1u << 9) | (1u << 10) | (1u << 11) |
-                                         (1u << 13);
+                                         (1u << 13) | (1u << 14) | (1u << 15);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -83,6 +84,13 @@ inline constexpr uint32_t RESERVE_CORE = 12;
 // once per slice of a guest submission, and after each command-processor write, instead of before
 // every such draw or dispatch: the CPU writes what a submission reads before submitting it.
 inline constexpr uint32_t BDA_SYNC_PER_SUBMIT = 13;
+// The timeline semaphore that tells which GPU work has completed is read (a driver call) on every
+// 64th draw or dispatch instead of on each, and not again by the eager-flush check.
+inline constexpr uint32_t LAZY_GPU_POLL = 14;
+// With BDA_SYNC_PER_SUBMIT, a command-processor write synchronizes only the bytes it wrote (an
+// end-of-pipe label, about 450 per frame in the fight), not everything game threads wrote since
+// the slice began.
+inline constexpr uint32_t BDA_SYNC_WRITE_RANGES = 15;
 
 } // namespace Common::AbSwitch
 
