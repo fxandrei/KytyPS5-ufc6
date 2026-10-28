@@ -102,7 +102,13 @@ struct DynamicState {
 	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
-	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+	void Invalidate() {
+		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+		bound_graphics_pipeline = nullptr;
+	}
+
+	/// The graphics pipeline that the command buffer has bound (AbSwitch PIPELINE_BIND_DEDUPE).
+	vk::Pipeline bound_graphics_pipeline = nullptr;
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

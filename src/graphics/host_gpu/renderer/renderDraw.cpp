@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -32,13 +33,13 @@
 #include "libs/errno.h"
 
 #include <algorithm>
-#include <fmt/format.h>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1243,7 +1244,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	auto& bound = m_context.GetCommandScheduler().GetDynamicState().bound_graphics_pipeline;
+	if (bound != pipeline.pipeline ||
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::PIPELINE_BIND_DEDUPE)) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		bound = pipeline.pipeline;
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
