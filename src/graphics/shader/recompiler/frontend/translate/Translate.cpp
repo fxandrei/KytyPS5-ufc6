@@ -1390,11 +1390,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
 			// Vulkan adds an indirect record's bases to the indices; the hardware passes them
-			// only in the user SGPRs the packet patches.
+			// only in the user SGPRs the packet patches. SH_NOP leaves those SGPRs unchanged;
+			// it does not make the record's bases zero.
 			const auto& offsets = options.input_info.vertex->indirect_offsets;
 			const auto  index   = [&](uint8_t slot, IR::StageInputKind kind,
 			                          IR::StageInputKind base_kind) {
-				if (offsets == ShaderIndirectOffsets {}) {
+				if (!options.input_info.vertex->indirect_draw) {
 					return builtin(kind);
 				}
 				const auto base = builtin(base_kind);

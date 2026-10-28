@@ -1938,7 +1938,7 @@ void TestVertexBufferGrouping() {
   Check(input.fetch_attrib_reg == 2, "a draw reread the vertex metadata of a mapped shader");
   ShaderMapUserData(regs.es_regs.data_addr, mapped);
   (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
-  Check(!input.fetch_embedded, "remapping a shader kept its previous vertex metadata");
+  Check(!input.has_dynamic_vertex_fetch, "remapping a shader kept its previous vertex metadata");
 }
 
 void TestNggVertexEntryState() {
@@ -11575,7 +11575,7 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
                              reinterpret_cast<uint64_t>(attributes.data())};
   std::memcpy(user_data.data() + 12, tables, sizeof(tables));
   ShaderVertexInputInfo input{};
-  input.fetch_embedded = true;
+  input.has_dynamic_vertex_fetch = true;
   input.fetch_buffer_reg = 12;
   input.fetch_attrib_reg = 14;
   input.resources_num = 1;

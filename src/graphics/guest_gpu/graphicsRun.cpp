@@ -880,9 +880,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
-	// The GPU reads the records if the shaders allow; the VS prolog loads the patched SGPRs from
-	// Vulkan's bases. With no SGPR patched, Vulkan applies the offsets, which matches while they
-	// are zero.
+	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
+	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
 	if (IndirectDrawOffsets(registers, records.offsets) && (!indexed || m_index_buffer_size != 0) &&
 	    (indexed ? executor.DrawIndex(m_submit_id, CurrentBuffer(),

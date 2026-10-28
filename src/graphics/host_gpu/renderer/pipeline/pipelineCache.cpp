@@ -689,6 +689,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (!tess_active && !mesh_active) {
 		vertex_info[0].indirect_offsets = state.indirect_offsets;
+		vertex_info[0].indirect_draw    = state.indirect_draw;
 	}
 	if (object_primitive_id) {
 		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
