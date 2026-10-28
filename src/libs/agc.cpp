@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/timeProbe.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -4145,6 +4146,7 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(Submit, 0);
 
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
 
@@ -4161,6 +4163,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(Submit, count);
 
 	AgcTrace("\t count = %" PRIu32 "\n", count);
 
@@ -4222,6 +4225,7 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(Submit, 0x100);
 
 	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
 	     "\t packet        = 0x%016" PRIx64 "\n",
@@ -4247,6 +4251,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
                                                      const uint32_t*  sizes_in_dwords,
                                                      uint32_t         count) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(Submit, 0x200 | count);
 
 	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
 	     "\t count         = %" PRIu32 "\n",

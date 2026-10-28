@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timeProbe.h"
 #include "common/timer.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -439,6 +440,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		LOGF("\tEqueue wait timedout: %s\n", owner->GetName().c_str());
 		return KERNEL_ERROR_ETIMEDOUT;
 	}
+	KYTY_TIME_PROBE(WaitEqueue, (static_cast<uint64_t>(static_cast<uint16_t>(ev[0].filter)) << 32u) |
+	                                static_cast<uint32_t>(ev[0].ident));
 
 	LOGF("\tEqueue wait received %u events: ident = 0x%016" PRIx64
 	     ", filter = %d, flags = 0x%04" PRIx16 ", fflags = 0x%08" PRIx32 ", data = 0x%016" PRIx64

@@ -10,6 +10,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timeProbe.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -1016,6 +1017,9 @@ void PthreadInitSelfForMainThread() {
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
 	g_pthread_self->p               = pthread_self();
 	g_pthread_self->name            = "MainThread";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadDescription(GetCurrentThread(), L"MainThread");
+#endif
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
 	g_pthread_self->free            = false;
@@ -3698,6 +3702,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
 	// Called constantly by Python frame/timer code.
+	KYTY_TIME_PROBE(ClockGettime, clock_id);
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3729,6 +3734,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	// PRINT_NAME();
+	KYTY_TIME_PROBE(Gettimeofday, 0);
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3849,10 +3855,12 @@ uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	KYTY_TIME_PROBE(ReadTsc, 0);
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	KYTY_TIME_PROBE(ProcessTime, 0);
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -3864,6 +3872,7 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	KYTY_TIME_PROBE(ProcessTimeCounter, 0);
 	return KernelGetElapsedTsc();
 }
 
@@ -3882,6 +3891,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	KYTY_TIME_PROBE(Usleep, microseconds);
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3907,6 +3917,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
+	KYTY_TIME_PROBE(Nanosleep, nanos / 1000);
 
 	SleepNanoWithSignalPoll(nanos);
 

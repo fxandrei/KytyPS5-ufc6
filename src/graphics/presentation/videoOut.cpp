@@ -10,6 +10,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timeProbe.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1747,6 +1748,7 @@ bool VideoOutDriver::IsSafeForRendering(int handle, int index) {
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(FlipStatus, handle);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1776,6 +1778,7 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 
 KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(IsFlipPending, handle);
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1794,6 +1797,7 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) {
 	PRINT_NAME();
+	KYTY_TIME_PROBE(VblankStatus, handle);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1885,6 +1889,7 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	while (ctx->opened && ctx->vblank_status.count == count) {
 		ctx->vblank_cond.Wait(&ctx->mutex);
 	}
+	KYTY_TIME_PROBE(WaitVblank, handle);
 
 	return OK;
 }
