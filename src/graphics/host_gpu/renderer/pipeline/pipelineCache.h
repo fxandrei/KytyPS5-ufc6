@@ -144,6 +144,28 @@ struct DrawRenderState {
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
 	}
+
+	// Readies a reused state for the next draw (AbSwitch EXACT_DRAW_STATE) instead of
+	// value-initializing ~17 KB per draw. Only what a draw reads before writing is reset:
+	// GetGraphicsPrograms resets vertex_info[0] (all three stages with tessellation) and, when a
+	// pixel shader runs, ps_input_info; ResolveRenderColorTarget assigns every slot below
+	// color_count whole (color_info[0] is cleared for the debug dumps, which read it when no
+	// target resolves); mrt_mask is OR-accumulated; DrawAuto never sets primitive_restart_enable.
+	void Reset(ShaderIndirectOffsets offsets, bool indirect) {
+		color_info[0]            = {};
+		depth_info               = {};
+		color_count              = 0;
+		mrt_mask                 = 0;
+		topology                 = vk::PrimitiveTopology::ePointList;
+		primitive_restart_enable = false;
+		ps_active                = false;
+		for (auto& stage: vertex_info) {
+			stage.stage = {};
+		}
+		ps_input_info    = {};
+		indirect_offsets = offsets;
+		indirect_draw    = indirect;
+	}
 };
 
 // Writes the shader store on its own thread, running jobs in the order they were posted.

@@ -1046,6 +1046,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
+		// Its stream copy can wait for the GPU, which submits and begins the next command buffer.
+		vk_buffer = buffer.Handle();
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();

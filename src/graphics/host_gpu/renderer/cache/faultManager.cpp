@@ -119,6 +119,7 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
 	command.pipelineBarrier2(dependency);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	m_scheduler.GetDynamicState().bound_compute_pipeline = nullptr;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;

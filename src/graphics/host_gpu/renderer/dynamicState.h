@@ -105,10 +105,14 @@ struct DynamicState {
 	void Invalidate() {
 		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
 		bound_graphics_pipeline = nullptr;
+		bound_compute_pipeline  = nullptr;
 	}
 
 	/// The graphics pipeline that the command buffer has bound (AbSwitch PIPELINE_BIND_DEDUPE).
 	vk::Pipeline bound_graphics_pipeline = nullptr;
+	/// The compute pipeline that guest dispatches bound (AbSwitch COMPUTE_BIND_DEDUPE). Code that
+	/// binds another compute pipeline into the scheduler's command buffer resets it.
+	vk::Pipeline bound_compute_pipeline = nullptr;
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

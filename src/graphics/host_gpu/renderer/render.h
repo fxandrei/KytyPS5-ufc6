@@ -192,6 +192,11 @@ private:
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	// Binds a guest dispatch's pipeline unless the command buffer already has it bound.
+	void BindComputePipeline(CommandBuffer& buffer, vk::Pipeline pipeline);
+	// The state a draw fills: m_draw_state reset, or a fresh one in `local`.
+	[[nodiscard]] DrawRenderState& BeginDrawState(std::optional<DrawRenderState>& local,
+	                                              const DrawIndirectArgs&         indirect);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
@@ -236,6 +241,8 @@ private:
 	};
 
 	RenderContext&                        m_context;
+	// The draw state DrawIndex and DrawAuto reuse (AbSwitch EXACT_DRAW_STATE); draws do not nest.
+	DrawRenderState                       m_draw_state;
 	std::array<ColorTargetMemo, 8>        m_color_target_memo;
 	DepthTargetMemo                       m_depth_target_memo;
 	GraphicsBindings                     m_graphics_bindings;

@@ -245,6 +245,15 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+void RenderExecutor::BindComputePipeline(CommandBuffer& buffer, vk::Pipeline pipeline) {
+	// The tracker belongs to the scheduler's current command buffer: bind into that one.
+	auto& bound = m_context.GetCommandScheduler().GetDynamicState().bound_compute_pipeline;
+	if (bound != pipeline || !Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_BIND_DEDUPE)) {
+		buffer.Handle().bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+		bound = pipeline;
+	}
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -268,6 +277,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	Common::LockGuard lock(m_context.GetMutex());
+	Common::AbSwitch::DelayProbe();
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -368,9 +378,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	// After CommitBindings, which can begin the next command buffer.
+	auto vk_buffer          = buffer.Handle();
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -450,7 +461,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	BindComputePipeline(buffer, pipeline.pipeline);
 	auto&      scheduler = m_context.GetCommandScheduler();
 	const auto gpu_timer = scheduler.BeginGpuShaderTimer();
 	const auto label     = [&] {
@@ -517,6 +528,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
+	Common::AbSwitch::DelayProbe();
 	vk::DispatchIndirectCommand args {};
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
@@ -574,7 +586,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	BindComputePipeline(buffer, pipeline.pipeline);
 	auto&      scheduler = m_context.GetCommandScheduler();
 	const auto gpu_timer = scheduler.BeginGpuShaderTimer();
 	const auto label = [&] { return fmt::format("cs {:#x} indirect", cs_regs.cs_regs.data_addr); };

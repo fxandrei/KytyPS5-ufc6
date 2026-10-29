@@ -877,6 +877,18 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+DrawRenderState& RenderExecutor::BeginDrawState(std::optional<DrawRenderState>& local,
+                                                const DrawIndirectArgs&         indirect) {
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::EXACT_DRAW_STATE)) {
+		m_draw_state.Reset(indirect.offsets, indirect.address != 0);
+		return m_draw_state;
+	}
+	auto& fresh            = local.emplace();
+	fresh.indirect_offsets = indirect.offsets;
+	fresh.indirect_draw    = indirect.address != 0;
+	return fresh;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -1177,19 +1189,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 
-	// Resource preparation above may synchronously finish and restart the scheduler. From this
-	// point onward, every operation targets the current command buffer and cannot touch guest
-	// memory.
-	auto vk_buffer = buffer.Handle();
+	// Resource preparation above may synchronously finish and restart the scheduler, and so may
+	// CommitBindings (the image heap's stream copy). After it, every operation targets the current
+	// command buffer and cannot touch guest memory.
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
-	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	auto vk_buffer = buffer.Handle();
 	if (!mesh_active) {
+		CommitVertexBuffers(vk_buffer, vertex_bindings);
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
@@ -1354,6 +1364,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
+	Common::AbSwitch::DelayProbe();
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
@@ -1390,8 +1401,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	hw_check(buffer);
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	std::optional<DrawRenderState> local_state;
+	DrawRenderState&               state = BeginDrawState(local_state, args.indirect);
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1461,6 +1472,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	Common::AbSwitch::DelayProbe();
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}
@@ -1496,8 +1508,8 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	std::optional<DrawRenderState> local_state;
+	DrawRenderState&               state = BeginDrawState(local_state, args.indirect);
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;

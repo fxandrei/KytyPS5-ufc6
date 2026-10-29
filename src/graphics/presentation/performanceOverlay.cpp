@@ -175,7 +175,7 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 	    "thread3,thread3_pct\n",
 	    file);
 	const char*              ab_file = std::getenv("KYTY_AB_FILE");
-	uint32_t                 ab      = Common::AbSwitch::Mask();
+	uint64_t                 ab      = Common::AbSwitch::Mask();
 	Common::HostStatsSampler sampler;
 	(void)sampler.Sample(); // CPU usage needs a previous sample.
 	std::array<uint64_t, COUNTER_COUNT> last {};
@@ -229,7 +229,7 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		    "%.1f,%.3f,%llu,%.2f,%.1f,%.1f,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.0f,%.1f,%.1f,%.1f,"
 		    "%.1f,%.0f,%.1f,%.0f,%.1f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.0f,%.0f,%.0f,%.0f,"
 		    "%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.0f,%.0f,%.1f,%.1f,%.1f,"
-		    "%.0f,%.1f,%.1f,%.1f,%.1f,%.0f,%.0f,%u",
+		    "%.0f,%.1f,%.1f,%.1f,%.1f,%.0f,%.0f,%llu",
 		    std::chrono::duration<double>(now - start).count(),
 		    std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
 		        .count(),
@@ -259,7 +259,7 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		    rate(Counter::GpuTimedBuffers), rate(Counter::TextureUploadGpuNs) / 1e6,
 		    rate(Counter::PartialImageWritesSkipped) / MIB, rate(Counter::GpuBusyUnionNs) / 1e6,
 		    rate(Counter::GpuIdleGapNs) / 1e6, rate(Counter::GuestFlushBarriers),
-		    rate(Counter::EagerFlushes), ab);
+		    rate(Counter::EagerFlushes), static_cast<unsigned long long>(ab));
 		const auto depth = g_depth_target_max.exchange(0, std::memory_order_relaxed);
 		std::fprintf(file, ",%u,%u", depth >> 16u, depth & 0xffffu);
 		// The three busiest threads, in percent of one core.
@@ -277,9 +277,9 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		// The variant applies from the next row on, so every row measures a single variant.
 		if (ab_file != nullptr) {
 			if (std::FILE* control = std::fopen(ab_file, "r"); control != nullptr) {
-				unsigned long mask = 0;
-				if (std::fscanf(control, "%lu", &mask) == 1) {
-					Common::AbSwitch::g_mask.store(static_cast<uint32_t>(mask),
+				unsigned long long mask = 0;
+				if (std::fscanf(control, "%llu", &mask) == 1) {
+					Common::AbSwitch::g_mask.store(mask & ~Common::AbSwitch::UNSET,
 					                               std::memory_order_relaxed);
 				}
 				std::fclose(control);

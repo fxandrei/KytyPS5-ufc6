@@ -2,42 +2,56 @@
 #define KYTY_COMMON_AB_SWITCH_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 
-// Switches for A/B performance experiments, one bit each. KYTY_AB=<mask> sets them at startup.
-// With KYTY_PERF_CSV, the file named by KYTY_AB_FILE is re-read once per second, so a test
-// harness can alternate variants inside one run and compare them on the same scene.
+// Switches for A/B performance experiments, one bit each (bits 0-62). KYTY_AB=<mask> sets them at
+// startup. With KYTY_PERF_CSV, the file named by KYTY_AB_FILE is re-read once per second, so a
+// test harness can alternate variants inside one run and compare them on the same scene.
 namespace Common::AbSwitch {
 
-inline std::atomic<uint32_t> g_mask {0};
+// Bit 63 marks a mask not read yet. The mask is constant-initialized, so Mask() costs one load:
+// a function-local static there cost 0.5% of the command processor (a thread-local epoch check
+// on every call).
+inline constexpr uint64_t    UNSET = uint64_t {1} << 63u;
+inline std::atomic<uint64_t> g_mask {UNSET};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
 // SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, EAGER_FLUSH_COARSE, IMAGE_POOL,
 // QUEUED_SUBMIT, DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
 // PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
-// DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO and
-// TEXTURE_INFO_MEMO. KYTY_AB=0 turns them all off.
-inline constexpr uint32_t DEFAULT_MASK =
-    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) |
-    (1u << 10) | (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17) |
-    (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 27) |
-    (1u << 28);
+// DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO, TEXTURE_INFO_MEMO,
+// EXACT_DRAW_STATE and COMPUTE_BIND_DEDUPE. KYTY_AB=0 turns them all off.
+[[nodiscard]] constexpr uint64_t Bit(uint32_t bit) noexcept {
+	return uint64_t {1} << bit;
+}
+inline constexpr uint64_t DEFAULT_MASK =
+    Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit(6) | Bit(7) | Bit(8) | Bit(9) | Bit(10) | Bit(11) |
+    Bit(13) | Bit(14) | Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) | Bit(22) |
+    Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) | Bit(32);
 
-[[nodiscard]] inline uint32_t Mask() noexcept {
-	static const bool initialized = [] {
-		const char* value = std::getenv("KYTY_AB");
-		g_mask.store(value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
-		                              : DEFAULT_MASK,
-		             std::memory_order_relaxed);
-		return true;
-	}();
-	(void)initialized;
-	return g_mask.load(std::memory_order_relaxed);
+// The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
+[[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
+	const char* value = std::getenv("KYTY_AB");
+	uint64_t    mask  = value != nullptr ? std::strtoull(value, nullptr, 0) & ~UNSET : DEFAULT_MASK;
+	uint64_t    unset = UNSET;
+	if (!g_mask.compare_exchange_strong(unset, mask, std::memory_order_relaxed)) {
+		mask = unset;
+	}
+	return mask;
+}
+
+[[nodiscard]] inline uint64_t Mask() noexcept {
+	const auto mask = g_mask.load(std::memory_order_relaxed);
+	if (mask != UNSET) [[likely]] {
+		return mask;
+	}
+	return ReadInitialMask();
 }
 
 [[nodiscard]] inline bool Enabled(uint32_t bit) noexcept {
-	return (Mask() & (1u << bit)) != 0;
+	return (Mask() & (uint64_t {1} << bit)) != 0;
 }
 
 // Bits in use.
@@ -134,6 +148,27 @@ inline constexpr uint32_t LRU_TOUCH_MEMO = 27;
 // A texture binding reuses the image layout (ImageInfo, after UpdateSize) it decoded the last
 // time it saw the same descriptor with the same resource flags (RenderExecutor::ResolveTexture).
 inline constexpr uint32_t TEXTURE_INFO_MEMO = 28;
+// Diagnostic: every draw and dispatch spins 0.6 us more on the command processor (DelayProbe), to
+// measure how much frame time a microsecond of command-processor work costs.
+inline constexpr uint32_t CP_DELAY_PROBE = 29;
+
+// DrawIndex and DrawAuto reuse one draw state and reset only what a draw reads before writing,
+// instead of value-initializing ~17 KB per draw (DrawRenderState::Reset; 2.1% of the command
+// processor in memset).
+inline constexpr uint32_t EXACT_DRAW_STATE = 31;
+// A guest dispatch does not bind the compute pipeline that the command buffer already has bound
+// (RenderExecutor::BindComputePipeline). The tiler and the fault manager reset the tracker.
+inline constexpr uint32_t COMPUTE_BIND_DEDUPE = 32;
+
+// The CP_DELAY_PROBE spin.
+inline void DelayProbe() noexcept {
+	if (!Enabled(CP_DELAY_PROBE)) {
+		return;
+	}
+	const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(600);
+	while (std::chrono::steady_clock::now() < end) {
+	}
+}
 
 } // namespace Common::AbSwitch
 

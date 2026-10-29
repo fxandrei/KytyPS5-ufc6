@@ -315,6 +315,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(tiling.pipeline_slot));
+	m_scheduler.GetDynamicState().bound_compute_pipeline = nullptr;
 	const uint64_t groups   = (uint64_t {tiling.num_texels} + 63u) / 64u;
 	const uint32_t groups_y = static_cast<uint32_t>(
 	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
@@ -495,6 +496,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+	m_scheduler.GetDynamicState().bound_compute_pipeline = nullptr;
 	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto descriptor_alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const auto rows_for = [&](Result buffer, uint64_t relative, uint64_t stride, uint64_t active,
@@ -612,6 +614,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_transform);
+	m_scheduler.GetDynamicState().bound_compute_pipeline = nullptr;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	Conversion push {};
@@ -681,6 +684,7 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_clear);
+	m_scheduler.GetDynamicState().bound_compute_pipeline = nullptr;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	const Check push {source.base, static_cast<uint32_t>(metadata.size / 4 / slices), keys,
