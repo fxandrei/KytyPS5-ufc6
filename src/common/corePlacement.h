@@ -15,6 +15,9 @@ void SetReserved(bool reserved);
 // Called when a guest thread starts: it stays off the reserved core while one is reserved.
 void KeepOffReservedCore();
 
+// The calling thread runs above normal priority (AbSwitch GPU_THREAD_PRIORITY), or back at normal.
+void SetCurrentThreadAboveNormal(bool above_normal);
+
 } // namespace Common::CorePlacement
 
 #endif /* KYTY_COMMON_CORE_PLACEMENT_H_ */

@@ -60,6 +60,9 @@ public:
 	void                   MarkGpuWrite(uint64_t tick) noexcept {
         m_last_gpu_write_tick = std::max(m_last_gpu_write_tick, tick);
 	}
+	// Set once a read of GPU-written bytes had to wait for the GPU (AbSwitch EARLY_FLUSH_WRITERS).
+	[[nodiscard]] bool WaitedForReadback() const noexcept { return m_waited_for_readback; }
+	void               MarkWaitedForReadback() noexcept { m_waited_for_readback = true; }
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
@@ -92,6 +95,7 @@ private:
 	GraphicContext*               m_graphics    = nullptr;
 	CommandScheduler*             m_scheduler   = nullptr;
 	uint64_t                      m_last_gpu_write_tick = 0;
+	bool                          m_waited_for_readback = false;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
 	vk::DeviceAddress             m_device_address = 0;

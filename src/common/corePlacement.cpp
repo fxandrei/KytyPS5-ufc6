@@ -103,10 +103,16 @@ void KeepOffReservedCore() {
 	}
 }
 
+void SetCurrentThreadAboveNormal(bool above_normal) {
+	SetThreadPriority(GetCurrentThread(),
+	                  above_normal ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_NORMAL);
+}
+
 #else
 
 void SetReserved(bool /*reserved*/) {}
 void KeepOffReservedCore() {}
+void SetCurrentThreadAboveNormal(bool /*above_normal*/) {}
 
 #endif
 

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
+#include "common/abSwitch.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/uniqueFunction.h"
@@ -12,7 +13,9 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+
 #include <queue>
+
 #include <string>
 #include <string_view>
 #include <thread>
@@ -82,6 +85,11 @@ public:
 
 	// After each recorded draw or dispatch; see AbSwitch EAGER_FLUSH.
 	void RecordedWork();
+	// The draw or dispatch being recorded writes bytes that the command processor has had to wait
+	// for before: RecordedWork submits it right away (AbSwitch EARLY_FLUSH_WRITERS).
+	void RequestFlushAfterRecord() noexcept {
+		m_flush_after_record = Common::AbSwitch::Enabled(Common::AbSwitch::EARLY_FLUSH_WRITERS);
+	}
 	// Every submitted command buffer then ends with a barrier that makes its writes visible to the
 	// host, for guest buffers read in place (AbSwitch DIRECT_READBACK).
 	void SetHostReadBarrier(bool enabled) noexcept { m_host_read_barrier = enabled; }
@@ -197,6 +205,7 @@ private:
 	bool                                      m_graphics_checkpoints  = false;
 	bool                                      m_host_read_barrier     = false;
 	bool                                      m_direct_submit         = false; // FlushUrgent
+	bool                                      m_flush_after_record    = false;
 	uint32_t                                  m_pop_calls             = 0; // AbSwitch LAZY_GPU_POLL
 };
 

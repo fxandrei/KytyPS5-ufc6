@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -83,6 +84,17 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		// A read-only binding of pages the CPU has not written since their last upload has nothing
+		// to upload: look without the region locks (AbSwitch UPLOAD_PRECHECK). A CPU write marks
+		// its page before the guest submits the commands that read it, so the command processor
+		// sees the mark; a write after the look waits for the next synchronization, as it would
+		// with the locks.
+		if (!is_written && Common::AbSwitch::Enabled(Common::AbSwitch::UPLOAD_PRECHECK) &&
+		    IsUploaded(vaddr, size)) {
+			upload_func();
+			s_upload_owner = previous_upload_owner;
+			return;
+		}
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
@@ -106,6 +118,26 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+
+	// No CPU-modified page in the range, and every region tracked (a new region starts dirty).
+	bool IsUploaded(uint64_t vaddr, uint64_t size) const noexcept {
+		ValidateRange(vaddr, size);
+		uint64_t remaining = size;
+		uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+		uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+		while (remaining != 0) {
+			const auto  bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr ||
+			    manager->template IsModified<DirtySource::Cpu>(offset, bytes)) {
+				return false;
+			}
+			remaining -= bytes;
+			offset = 0;
+			index++;
+		}
+		return true;
+	}
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

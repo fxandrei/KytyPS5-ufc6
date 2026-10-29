@@ -434,11 +434,17 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 
 	bool core_reserved = false;
+	bool boosted       = false;
 	for (;;) {
 		if (const bool reserve = Common::AbSwitch::Enabled(Common::AbSwitch::RESERVE_CORE);
 		    reserve != core_reserved) {
 			Common::CorePlacement::SetReserved(reserve);
 			core_reserved = reserve;
+		}
+		if (const bool boost = Common::AbSwitch::Enabled(Common::AbSwitch::GPU_THREAD_PRIORITY);
+		    boost != boosted && !core_reserved) {
+			Common::CorePlacement::SetCurrentThreadAboveNormal(boost);
+			boosted = boost;
 		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;

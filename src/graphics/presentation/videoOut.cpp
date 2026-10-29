@@ -1920,10 +1920,18 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		const char* value = std::getenv("KYTY_OUTPUT_1080P");
 		return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
 	}();
+	// KYTY_OUTPUT_RESOLUTION=<value> reports that value instead, to probe other output modes.
+	static const int forced_resolution = [] {
+		const char* value = std::getenv("KYTY_OUTPUT_RESOLUTION");
+		return value != nullptr ? std::atoi(value) : -1;
+	}();
 	ctx->mutex.Lock();
 	const bool detection    = output_1080p < 0 || (attribute3 & 4) != 0;
 	const bool small_screen = ctx->width < 3840 && ctx->height < 2160;
 	status->resolution      = (output_1080p == 1 || (detection && small_screen) ? 1u : 2u);
+	if (forced_resolution >= 0) {
+		status->resolution = static_cast<uint32_t>(forced_resolution);
+	}
 	static std::atomic_bool logged {false};
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
 		std::printf("video out: output status reports resolution %" PRIu32 "\n",

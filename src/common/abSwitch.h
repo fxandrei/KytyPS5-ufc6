@@ -113,6 +113,17 @@ inline constexpr uint32_t SPIN_GPU_WAIT = 21;
 // A flush that the command processor waits for next (a readback of GPU-written bytes) is
 // submitted on its own thread instead of through the submission thread.
 inline constexpr uint32_t DIRECT_URGENT_SUBMIT = 22;
+// A draw or dispatch that writes into a buffer whose readback once had to wait for the GPU is
+// submitted as soon as it is recorded (CommandScheduler::RequestFlushAfterRecord).
+inline constexpr uint32_t EARLY_FLUSH_WRITERS = 23;
+// A read-only buffer binding first checks, without the region locks, whether the CPU modified
+// any of its pages (MemoryTracker::ForEachUploadRange): most bindings have nothing to upload.
+inline constexpr uint32_t UPLOAD_PRECHECK = 24;
+// The command-processor thread runs above normal priority (without RESERVE_CORE's pinning).
+inline constexpr uint32_t GPU_THREAD_PRIORITY = 25;
+// A readback whose writer is still being recorded copies through cached host memory (the copy
+// rides the flush it needs anyway) instead of reading the resizable BAR afterwards.
+inline constexpr uint32_t READBACK_COPY_WHEN_FLUSHING = 26;
 
 } // namespace Common::AbSwitch
 

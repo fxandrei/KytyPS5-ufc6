@@ -236,10 +236,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		// The ticks up to the last writer carry the host-read barrier that Submit records, so the
 		// mapped bytes are the GPU's once that tick has completed; later work is not waited for.
 		const auto write_tick = buffer.LastGpuWriteTick();
-		if (!buffer.Mapped().empty() && write_tick != 0 &&
+		// While the writes are still being recorded, the work has to be submitted anyway: a copy
+		// to cached host memory recorded behind it is then cheaper than reading the resizable
+		// BAR over PCIe afterwards (AbSwitch READBACK_COPY_WHEN_FLUSHING).
+		const bool copy_instead =
+		    write_tick >= m_scheduler.CurrentTick() &&
+		    Common::AbSwitch::Enabled(Common::AbSwitch::READBACK_COPY_WHEN_FLUSHING);
+		if (!buffer.Mapped().empty() && write_tick != 0 && !copy_instead &&
 		    Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_READBACK)) {
 			if (write_tick >= m_scheduler.CurrentTick()) {
 				m_scheduler.FlushUrgent(); // The writes are still being recorded.
+			}
+			if (!m_scheduler.IsFree(write_tick)) {
+				buffer.MarkWaitedForReadback();
 			}
 			m_scheduler.Wait(write_tick);
 			m_scheduler.WaitPriorityOperations(write_tick);
@@ -308,6 +317,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
+		if (Common::AbSwitch::Enabled(Common::AbSwitch::READBACK_COPY_WHEN_FLUSHING)) {
+			m_scheduler.FlushUrgent(); // Waited for next: submit on this thread.
+		}
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
@@ -617,6 +629,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer.MarkGpuWrite(m_scheduler.CurrentTick());
 		ForgetColorMetadataChecks(vaddr, size);
+		if (buffer.WaitedForReadback()) {
+			// Submit this work as soon as it is recorded: a later read of what it writes will
+			// then find it done or running instead of waiting for it from submission.
+			m_scheduler.RequestFlushAfterRecord();
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -235,8 +236,19 @@ void CommandScheduler::FlushUrgent() {
 void CommandScheduler::RecordedWork() {
 	const uint32_t interval =
 	    Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH_COARSE) ? 64 : 16;
-	if (!Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH) || m_command.IsInvalid() ||
-	    ++m_recorded_since_submit % interval != 0) {
+	const bool early = std::exchange(m_flush_after_record, false);
+	if (m_command.IsInvalid()) {
+		return;
+	}
+	++m_recorded_since_submit;
+	if (early && m_recorded_since_submit >= 8) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EagerFlushes);
+		Flush();
+		m_eager_submits++;
+		return;
+	}
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH) ||
+	    m_recorded_since_submit % interval != 0) {
 		return;
 	}
 	if (!Common::AbSwitch::Enabled(Common::AbSwitch::LAZY_GPU_POLL)) {
