@@ -1476,8 +1476,10 @@ Graph BuildGraph(const Decoder::Program& program) {
 		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
-				                             inst.pc, inst.branch_target));
+				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x} "
+				                             "(decoded code ends at 0x{:08x}, {} code words)",
+				                             inst.pc, inst.branch_target, end_pc,
+				                             program.code.size()));
 			}
 			labels.push_back(inst.branch_target);
 			if (next_pc <= end_pc) {
@@ -1507,7 +1509,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 				labels.push_back(next_pc);
 			}
 		} else if (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SWAPPC_B64) {
-			labels.push_back(next_pc);
+			// Decoding skips padding between an S_ENDPGM and code a branch targets past it.
+			labels.push_back(i + 1u < program.instructions.size() ? program.instructions[i + 1u].pc
+			                                                      : next_pc);
 		}
 	}
 

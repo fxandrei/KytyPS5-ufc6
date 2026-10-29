@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -398,6 +399,20 @@ public:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
+			}
+		}
+		if (!m_dropped_stores.empty()) {
+			std::printf("Warning: shader 0x%016llx: %u buffer stores through GPU-built descriptors "
+			            "dropped (AbSwitch DROP_SELECTED_STORES), first at pc 0x%08x\n",
+			            static_cast<unsigned long long>(m_program.shader_hash),
+			            static_cast<unsigned>(m_dropped_stores.size()),
+			            m_dropped_stores.front()->Flags<MemoryFlags>().pc);
+			for (auto* store: m_dropped_stores)
+				store->Invalidate();
+			for (auto* block: m_program.blocks) {
+				std::erase_if(block->Instructions(), [this](const Inst& inst) {
+					return std::ranges::find(m_dropped_stores, &inst) != m_dropped_stores.end();
+				});
 			}
 		}
 		LinkImageAliases();
@@ -4218,6 +4233,11 @@ private:
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
 				    !memory.SupportsIndirectBufferLoad(op)) {
+					if (buffer == BufferAccess::Write &&
+					    Common::AbSwitch::Enabled(Common::AbSwitch::DROP_SELECTED_STORES)) {
+						m_dropped_stores.push_back(&inst);
+						return;
+					}
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
@@ -4358,6 +4378,8 @@ private:
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
+	// Stores through GPU-built descriptors that AbSwitch DROP_SELECTED_STORES removes.
+	std::vector<Inst*>                         m_dropped_stores;
 	bool                                       m_shader_writes = false;
 };
 

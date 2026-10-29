@@ -10,9 +10,19 @@
 #include <algorithm>
 #include <bit>
 #include <fmt/format.h>
+#include <xxhash.h>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
+
+// The program DecodeProgram is decoding, named by its shader-map hash in decode failures.
+thread_local std::span<const uint32_t> g_decoding_code;
+
+unsigned long long DecodingShaderHash() {
+	return g_decoding_code.empty() ? 0ull
+	                               : static_cast<unsigned long long>(XXH3_64bits(
+	                                     g_decoding_code.data(), g_decoding_code.size_bytes()));
+}
 
 bool HasLiteral(const Instruction& inst) {
 	return inst.src0.kind == OperandKind::LiteralConstant ||
@@ -257,7 +267,9 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x (shader 0x%016llx)", code,
+			     pc, DecodingShaderHash());
 	}
 }
 
@@ -277,7 +289,9 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x (shader 0x%016llx)",
+			     code, pc, DecodingShaderHash());
 	}
 }
 
@@ -371,7 +385,8 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
-			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x (shader 0x%016llx)", pc,
+			     code[word_index], DecodingShaderHash());
 	}
 }
 
@@ -401,7 +416,22 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.code = code;
 	program.has_swap_pc = false;
 
+	struct DecodingScope {
+		explicit DecodingScope(std::span<const uint32_t> words) { g_decoding_code = words; }
+		~DecodingScope() { g_decoding_code = {}; }
+		DecodingScope(const DecodingScope&)            = delete;
+		DecodingScope& operator=(const DecodingScope&) = delete;
+	} scope {code};
+	// Words that end the code: padding (zero, S_CODE_END, S_NOP 0) or the "sl00" signature of the
+	// data the shader compiler appends after it.
+	const auto is_code_end = [&](uint32_t word_index) {
+		const auto word = code[word_index];
+		return word == 0u || word == 0xbf9f0000u || word == 0xbf800000u || word == 0x30306c73u;
+	};
+
 	std::vector<bool> branch_targets;
+	// The furthest word a direct branch decoded so far targets.
+	uint32_t last_target = 0;
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
@@ -415,15 +445,31 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
 			}
-			branch_targets[target_index] = true;
+			if (target_index < code.size()) {
+				branch_targets[target_index] = true;
+				last_target                  = std::max<uint32_t>(last_target, target_index);
+			}
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
+			if (word_index >= code.size() || last_target <= word_index) {
+				return;
+			}
+			// An earlier branch targets code past this S_ENDPGM and the padding after it (UFC 6's
+			// PS5 Pro compute shaders): skip the padding and go on decoding at that target.
+			while (!branch_targets[word_index]) {
+				word_index++;
+			}
+		} else if (inst.opcode == Opcode::S_BRANCH && last_target < word_index &&
+		           (word_index >= code.size() || is_code_end(word_index))) {
+			// The code ends with a jump back (a loop after the last S_ENDPGM, as in UFC 6's PS5 Pro
+			// compute shaders): nothing branches further, and padding or data follow.
 			return;
 		}
 	}
 
-	EXIT("shader decode reached the code boundary before S_ENDPGM");
+	EXIT("shader decode reached the code boundary before S_ENDPGM (shader 0x%016llx)",
+	     DecodingShaderHash());
 }
 
 std::string OperandToString(const Operand& operand) {

@@ -12,10 +12,12 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <map>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -195,6 +197,21 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// Registered images per start address (AbSwitch IMAGE_START_INDEX): FindImageFromRange and
+	// InvalidateMemoryFromGPU only care about images that start at the bound address. A bit per
+	// hashed start bucket answers most lookups, which miss, without touching the map.
+	static constexpr uint32_t     START_BUCKET_BITS = 16;
+	[[nodiscard]] static uint32_t StartBucket(uint64_t address) {
+		return static_cast<uint32_t>(((address >> 8u) * 0x9E3779B97F4A7C15ull) >>
+		                             (64u - START_BUCKET_BITS));
+	}
+	[[nodiscard]] bool MayStartAt(uint64_t address) const {
+		const auto bucket = StartBucket(address);
+		return ((m_start_bucket_bits[bucket / 64u] >> (bucket % 64u)) & 1u) != 0;
+	}
+	std::unordered_map<uint64_t, uint32_t> m_image_starts;
+	std::vector<uint32_t> m_start_bucket_counts = std::vector<uint32_t>(1u << START_BUCKET_BITS);
+	std::array<uint64_t, (1u << START_BUCKET_BITS) / 64u> m_start_bucket_bits {};
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

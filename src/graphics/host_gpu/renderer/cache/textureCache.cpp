@@ -244,6 +244,11 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	++m_image_starts[image.info.data.address];
+	const auto bucket = StartBucket(image.info.data.address);
+	if (m_start_bucket_counts[bucket]++ == 0) {
+		m_start_bucket_bits[bucket / 64u] |= uint64_t {1} << (bucket % 64u);
+	}
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
@@ -268,6 +273,17 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	const auto start = m_image_starts.find(image.info.data.address);
+	if (start == m_image_starts.end()) {
+		EXIT("TextureCache: image missing from start index\n");
+	}
+	if (--start->second == 0) {
+		m_image_starts.erase(start);
+	}
+	const auto bucket = StartBucket(image.info.data.address);
+	if (--m_start_bucket_counts[bucket] == 0) {
+		m_start_bucket_bits[bucket / 64u] &= ~(uint64_t {1} << (bucket % 64u));
+	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1502,8 +1518,13 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		return {};
 	}
 	std::scoped_lock lock {m_lock};
-	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	// Only images that start at `address` qualify, and they all cover its first byte.
+	const bool start_index = Common::AbSwitch::Enabled(Common::AbSwitch::IMAGE_START_INDEX);
+	if (start_index && (!MayStartAt(address) || !m_image_starts.contains(address))) {
+		return {};
+	}
+	ImageIds matches;
+	for (const auto id: FindImagesInRegion(address, start_index ? 1 : size, false)) {
 		const auto* owner = &m_slot_images[id];
 		if (owner->info.data.address != address) {
 			continue;
@@ -2020,8 +2041,13 @@ uint32_t TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) 
 		return 0;
 	}
 	std::scoped_lock lock {m_lock};
-	uint32_t         marked = 0;
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	// Only images that start at `address` are marked, and they all cover its first page.
+	const bool start_index = Common::AbSwitch::Enabled(Common::AbSwitch::IMAGE_START_INDEX);
+	if (start_index && (!MayStartAt(address) || !m_image_starts.contains(address))) {
+		return 0;
+	}
+	uint32_t marked = 0;
+	for (const auto id: FindImagesInRegion(address, start_index ? 1 : size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
 			continue;
