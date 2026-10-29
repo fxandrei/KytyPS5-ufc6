@@ -246,6 +246,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -329,9 +330,16 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	if (!image.registered) {
+		return;
 	}
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::LRU_TOUCH_MEMO)) {
+		if (image.lru_tick >= m_gc_tick) {
+			return;
+		}
+		image.lru_tick = m_gc_tick;
+	}
+	m_lru_cache.Touch(image.lru_id, m_gc_tick);
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {

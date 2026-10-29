@@ -15,12 +15,13 @@ inline std::atomic<uint32_t> g_mask {0};
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
 // SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT,
 // DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
-// PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT and
-// DIRECT_URGENT_SUBMIT. KYTY_AB=0 turns them all off.
+// PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
+// DIRECT_URGENT_SUBMIT, UPLOAD_PRECHECK, LRU_TOUCH_MEMO and TEXTURE_INFO_MEMO. KYTY_AB=0 turns
+// them all off.
 inline constexpr uint32_t DEFAULT_MASK =
     (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 9) | (1u << 10) |
     (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17) | (1u << 19) |
-    (1u << 20) | (1u << 21) | (1u << 22);
+    (1u << 20) | (1u << 21) | (1u << 22) | (1u << 24) | (1u << 27) | (1u << 28);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -117,13 +118,20 @@ inline constexpr uint32_t DIRECT_URGENT_SUBMIT = 22;
 // submitted as soon as it is recorded (CommandScheduler::RequestFlushAfterRecord).
 inline constexpr uint32_t EARLY_FLUSH_WRITERS = 23;
 // A read-only buffer binding first checks, without the region locks, whether the CPU modified
-// any of its pages (MemoryTracker::ForEachUploadRange): most bindings have nothing to upload.
+// any of its pages (MemoryTracker::ForEachUploadRange, and BufferCache::ObtainBuffer before its
+// small-range stream copy): most bindings have nothing to upload.
 inline constexpr uint32_t UPLOAD_PRECHECK = 24;
 // The command-processor thread runs above normal priority (without RESERVE_CORE's pinning).
 inline constexpr uint32_t GPU_THREAD_PRIORITY = 25;
 // A readback whose writer is still being recorded copies through cached host memory (the copy
 // rides the flush it needs anyway) instead of reading the resizable BAR afterwards.
 inline constexpr uint32_t READBACK_COPY_WHEN_FLUSHING = 26;
+// A buffer or image remembers the tick of its LRU entry, so touching it again in the same frame
+// does not look the entry up (an allocation of its own in the LRU's deque) only to find it current.
+inline constexpr uint32_t LRU_TOUCH_MEMO = 27;
+// A texture binding reuses the image layout (ImageInfo, after UpdateSize) it decoded the last
+// time it saw the same descriptor with the same resource flags (RenderExecutor::ResolveTexture).
+inline constexpr uint32_t TEXTURE_INFO_MEMO = 28;
 
 } // namespace Common::AbSwitch
 

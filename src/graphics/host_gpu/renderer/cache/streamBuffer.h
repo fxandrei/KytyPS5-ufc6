@@ -82,6 +82,8 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The tick of this buffer's LRU entry, so a repeated touch skips the LRU lookup.
+	uint64_t lru_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

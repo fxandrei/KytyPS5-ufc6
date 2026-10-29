@@ -160,6 +160,8 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// The tick of this image's LRU entry, so a repeated touch skips the LRU lookup.
+	uint64_t lru_tick = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

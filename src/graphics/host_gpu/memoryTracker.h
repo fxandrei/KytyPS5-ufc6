@@ -115,12 +115,9 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
-private:
-	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
-	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
-
 	// No CPU-modified page in the range, and every region tracked (a new region starts dirty).
-	bool IsUploaded(uint64_t vaddr, uint64_t size) const noexcept {
+	// Looks without the region locks.
+	[[nodiscard]] bool IsUploaded(uint64_t vaddr, uint64_t size) const noexcept {
 		ValidateRange(vaddr, size);
 		uint64_t remaining = size;
 		uint64_t index     = vaddr / TRACKER_REGION_SIZE;
@@ -138,6 +135,10 @@ private:
 		}
 		return true;
 	}
+
+private:
+	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

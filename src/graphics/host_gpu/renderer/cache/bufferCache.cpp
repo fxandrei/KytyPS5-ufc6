@@ -171,7 +171,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id   = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_tick = m_gc_tick;
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -193,10 +194,17 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
-void BufferCache::TouchBuffer(const Buffer& buffer) {
-	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+void BufferCache::TouchBuffer(Buffer& buffer) {
+	if (buffer.is_deleted) {
+		return;
 	}
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::LRU_TOUCH_MEMO)) {
+		if (buffer.lru_tick >= m_gc_tick) {
+			return;
+		}
+		buffer.lru_tick = m_gc_tick;
+	}
+	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
@@ -601,6 +609,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
+	    !(Common::AbSwitch::Enabled(Common::AbSwitch::UPLOAD_PRECHECK) &&
+	      m_memory_tracker.IsUploaded(vaddr, size)) &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(

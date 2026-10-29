@@ -37,8 +37,10 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <set>
 #include <span>
 #include <utility>
@@ -487,6 +489,33 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+namespace {
+
+// The image layout a texture descriptor decoded to (AbSwitch TEXTURE_INFO_MEMO): UpdateSize lays
+// out every mip level, and the same descriptors are bound draw after draw.
+struct TextureInfoMemoEntry {
+	uint32_t  fields[8] = {};
+	uint32_t  flags     = 0;
+	uint32_t  view_base = 0;
+	bool      valid     = false;
+	ImageInfo info;
+};
+
+TextureInfoMemoEntry& TextureInfoMemoSlot(const ShaderTextureResource& descriptor, uint32_t flags) {
+	static constexpr size_t                              SLOTS = 512;
+	thread_local std::unique_ptr<TextureInfoMemoEntry[]> slots;
+	if (slots == nullptr) {
+		slots = std::make_unique<TextureInfoMemoEntry[]>(SLOTS);
+	}
+	uint64_t hash = flags;
+	for (const auto field: descriptor.fields) {
+		hash = (hash ^ field) * 0x9E3779B97F4A7C15ull;
+	}
+	return slots[(hash >> 40u) & (SLOTS - 1)];
+}
+
+} // namespace
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -543,9 +572,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
-	const auto format         = ShaderRecompiler::IR::ReadsDepthBits(resource)
-	                                ? Prospero::BufferFormat::k16UNorm
-	                                : descriptor.Format();
+	const bool reads_depth    = ShaderRecompiler::IR::ReadsDepthBits(resource);
+	const auto format = reads_depth ? Prospero::BufferFormat::k16UNorm : descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
@@ -581,30 +609,50 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
-	desc.info.data         = {address, 0};
-	desc.info.pixel_format = pixel_format;
-	desc.info.guest_format = format;
-	desc.info.type         = TextureBaseType(type);
-	desc.info.extent       = {width, height, volume ? depth : 1u};
-	desc.info.resources    = {levels, image_layers};
-	desc.info.bytes_per_block =
-	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
-	desc.info.samples   = samples;
-	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
-		desc.info.metadata.kind = ImageMetadataKind::Dcc;
-	}
-	if (levels > physical_levels) {
-		if (!ResolveTextureMipView(desc.info, physical_levels,
-		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
-		                           view_base)) {
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
-		}
+	// Everything below that decides desc.info besides the descriptor's own bits.
+	const uint32_t memo_flags = (resource.r128 ? 1u : 0u) | (reads_depth ? 2u : 0u) |
+	                            (resource.depth_compare ? 4u : 0u) | (storage ? 8u : 0u) |
+	                            (single_storage_mip ? 16u : 0u);
+	TextureInfoMemoEntry* memo = Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_INFO_MEMO)
+	                                 ? &TextureInfoMemoSlot(descriptor, memo_flags)
+	                                 : nullptr;
+	if (memo != nullptr && memo->valid && memo->flags == memo_flags &&
+	    std::memcmp(memo->fields, descriptor.fields, sizeof(memo->fields)) == 0) {
+		desc.info = memo->info;
+		view_base = memo->view_base;
 	} else {
-		desc.info.UpdateSize();
+		desc.info.data         = {address, 0};
+		desc.info.pixel_format = pixel_format;
+		desc.info.guest_format = format;
+		desc.info.type         = TextureBaseType(type);
+		desc.info.extent       = {width, height, volume ? depth : 1u};
+		desc.info.resources    = {levels, image_layers};
+		desc.info.bytes_per_block =
+		    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
+		desc.info.samples   = samples;
+		desc.info.tile_mode = tile;
+		if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+			desc.info.metadata.kind = ImageMetadataKind::Dcc;
+		}
+		if (levels > physical_levels) {
+			if (!ResolveTextureMipView(desc.info, physical_levels,
+			                           !resource.r128 && descriptor.MetaCompress(), view_levels,
+			                           view_base)) {
+				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
+				     "extent=%ux%ux%u tile=%u\n",
+				     base_level, last_level, max_mip, width, height, depth,
+				     static_cast<uint32_t>(tile));
+			}
+		} else {
+			desc.info.UpdateSize();
+		}
+		if (memo != nullptr) {
+			std::memcpy(memo->fields, descriptor.fields, sizeof(memo->fields));
+			memo->flags     = memo_flags;
+			memo->view_base = view_base;
+			memo->info      = desc.info;
+			memo->valid     = true;
+		}
 	}
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
