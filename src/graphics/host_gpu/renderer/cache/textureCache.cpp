@@ -1964,6 +1964,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	// Read the tick after DownloadImage, whose staging copy can submit.
+	buffer.MarkGpuWrite(m_scheduler.CurrentTick());
+	RecordGpuWrite(image.info.data.address, copy_size);
 	return true;
 }
 

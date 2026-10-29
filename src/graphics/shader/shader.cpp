@@ -1,5 +1,6 @@
 #include "graphics/shader/shader.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -17,6 +18,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <memory>
@@ -52,6 +55,8 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Bumped under g_shader_map_mutex by every map change; validates the lookup caches.
+static std::atomic<uint64_t> g_shader_map_generation {1};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -72,14 +77,40 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
+	// Every stage of every draw and dispatch looks its shader up, and the map changes only when
+	// the game maps shaders: a per-thread direct-mapped cache, valid while the map's generation is
+	// unchanged, skips the mutex and the hash probe (AbSwitch SHADER_MAP_CACHE).
+	struct CacheSlot {
+		uint64_t       addr       = 0;
+		uint64_t       generation = 0;
+		ShaderMapEntry entry {};
+	};
+	static constexpr size_t CACHE_SLOTS = 512;
+	CacheSlot*              slot        = nullptr;
+	const auto              generation  = g_shader_map_generation.load(std::memory_order_acquire);
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::SHADER_MAP_CACHE)) {
+		thread_local std::unique_ptr<std::array<CacheSlot, CACHE_SLOTS>> cache;
+		if (cache == nullptr) {
+			cache = std::make_unique<std::array<CacheSlot, CACHE_SLOTS>>();
+		}
+		slot = &(*cache)[((addr >> 8u) * 0x9E3779B97F4A7C15ull) >> 55u];
+		if (slot->addr == addr && slot->generation == generation) {
+			return slot->entry;
+		}
+	}
+
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		if (slot != nullptr) {
+			*slot = {addr, generation, iter->second};
+		}
 		return iter->second;
 	}
 

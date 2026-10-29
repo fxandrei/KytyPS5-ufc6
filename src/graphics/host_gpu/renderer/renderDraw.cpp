@@ -1164,6 +1164,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	auto&      buffer_cache = m_context.GetBufferCache();
+	auto       merges       = buffer_cache.MergeCount();
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
@@ -1188,6 +1190,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	// A buffer obtained after the shader bindings (vertex, index, arguments, target refreshes) can
+	// merge away and delete a buffer they already name: bind them all again until none merges.
+	for (uint32_t pass = 0; pass < 4 && buffer_cache.MergeCount() != merges; pass++) {
+		merges = buffer_cache.MergeCount();
+		for (auto* stage: stages) {
+			RebindBuffers(*stage);
+		}
+		if (!mesh_active) {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer(buffer, index_source);
+		}
+		if (emit.indirect.address != 0) {
+			const auto size =
+			    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+			    (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+			                      : sizeof(vk::DrawIndirectCommand));
+			args_buffer = buffer_cache.ObtainBuffer(emit.indirect.address, size, false);
+		}
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler, and so may
 	// CommitBindings (the image heap's stream copy). After it, every operation targets the current
@@ -1297,6 +1318,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (gpu_timer != UINT32_MAX) {
 		scheduler.EndGpuMarker(gpu_timer, label());
 	}
+	m_context.GetBufferCache().RetagGpuWrites();
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);

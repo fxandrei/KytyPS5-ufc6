@@ -494,6 +494,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
+	m_context.GetBufferCache().RetagGpuWrites();
 	if (gpu_timer != UINT32_MAX) {
 		scheduler.EndGpuMarker(gpu_timer, label());
 	}
@@ -592,6 +593,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto label = [&] { return fmt::format("cs {:#x} indirect", cs_regs.cs_regs.data_addr); };
 	scheduler.GpuCheckpoint(label);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	m_context.GetBufferCache().RetagGpuWrites();
 	if (gpu_timer != UINT32_MAX) {
 		scheduler.EndGpuMarker(gpu_timer, label());
 	}

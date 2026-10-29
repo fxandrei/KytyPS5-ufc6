@@ -22,14 +22,15 @@ inline std::atomic<uint64_t> g_mask {UNSET};
 // QUEUED_SUBMIT, DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
 // PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
 // DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO, TEXTURE_INFO_MEMO,
-// EXACT_DRAW_STATE and COMPUTE_BIND_DEDUPE. KYTY_AB=0 turns them all off.
+// EXACT_DRAW_STATE, COMPUTE_BIND_DEDUPE, RANGE_WRITE_TICKS and SHADER_MAP_CACHE. KYTY_AB=0 turns
+// them all off.
 [[nodiscard]] constexpr uint64_t Bit(uint32_t bit) noexcept {
 	return uint64_t {1} << bit;
 }
 inline constexpr uint64_t DEFAULT_MASK =
     Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit(6) | Bit(7) | Bit(8) | Bit(9) | Bit(10) | Bit(11) |
     Bit(13) | Bit(14) | Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) | Bit(22) |
-    Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) | Bit(32);
+    Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) | Bit(32) | Bit(33) | Bit(34);
 
 // The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
 [[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
@@ -159,6 +160,13 @@ inline constexpr uint32_t EXACT_DRAW_STATE = 31;
 // A guest dispatch does not bind the compute pipeline that the command buffer already has bound
 // (RenderExecutor::BindComputePipeline). The tiler and the fault manager reset the tracker.
 inline constexpr uint32_t COMPUTE_BIND_DEDUPE = 32;
+// A readback of GPU-written bytes waits for the newest write in flight that covers those bytes
+// (BufferCache::ReadbackWriteTick), not for the newest write anywhere in the cached buffer, which
+// merges overlapping guest buffers into ranges of hundreds of MiB.
+inline constexpr uint32_t RANGE_WRITE_TICKS = 33;
+// Shader map lookups (ShaderGetMappedData, per stage of every draw and dispatch) go through a
+// per-thread cache validated by the map's generation instead of a mutex and a hash probe.
+inline constexpr uint32_t SHADER_MAP_CACHE = 34;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {

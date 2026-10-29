@@ -194,6 +194,56 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
+void BufferCache::RecordGpuWrite(uint64_t vaddr, uint64_t size) {
+	auto& slot           = m_gpu_writes[m_next_gpu_write];
+	m_evicted_write_tick = std::max(m_evicted_write_tick, slot.tick);
+	slot                 = {vaddr, vaddr + size, m_scheduler.CurrentTick()};
+	m_next_gpu_write     = (m_next_gpu_write + 1) % GPU_WRITE_RING;
+	if (m_next_gpu_write == m_first_unretagged) {
+		// More than a ring of writes without a draw: the oldest unretagged one was just evicted.
+		m_first_unretagged = m_next_gpu_write;
+	}
+}
+
+void BufferCache::RetagGpuWrites() {
+	const auto tick = m_scheduler.CurrentTick();
+	for (auto slot = m_first_unretagged; slot != m_next_gpu_write;
+	     slot      = (slot + 1) % GPU_WRITE_RING) {
+		m_gpu_writes[slot].tick = std::max(m_gpu_writes[slot].tick, tick);
+	}
+	m_first_unretagged = m_next_gpu_write;
+}
+
+uint64_t BufferCache::ReadbackWriteTick(const Buffer& buffer, uint64_t buffer_address,
+                                        std::span<const vk::BufferCopy> copies) {
+	const auto buffer_tick = buffer.LastGpuWriteTick();
+	if (buffer_tick == 0 || !Common::AbSwitch::Enabled(Common::AbSwitch::RANGE_WRITE_TICKS)) {
+		return buffer_tick;
+	}
+	const auto known = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	uint64_t   tick  = m_evicted_write_tick > known ? m_evicted_write_tick : 0;
+	// Newest first, down to the first write the GPU has completed: all older ones are done too.
+	for (size_t i = 0; i < GPU_WRITE_RING; i++) {
+		const auto& write =
+		    m_gpu_writes[(m_next_gpu_write + GPU_WRITE_RING - 1 - i) % GPU_WRITE_RING];
+		if (write.tick <= known) {
+			break;
+		}
+		for (const auto& copy: copies) {
+			const auto begin = buffer_address + copy.srcOffset;
+			if (write.begin < begin + copy.size && begin < write.end) {
+				tick = std::max(tick, write.tick);
+				break;
+			}
+		}
+	}
+	if (tick != 0) {
+		return tick;
+	}
+	// No write in flight covers the bytes: they are the GPU's as of the last completed tick.
+	return known != 0 ? known : buffer_tick;
+}
+
 void BufferCache::TouchBuffer(Buffer& buffer) {
 	if (buffer.is_deleted) {
 		return;
@@ -243,7 +293,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (!async) {
 		// The ticks up to the last writer carry the host-read barrier that Submit records, so the
 		// mapped bytes are the GPU's once that tick has completed; later work is not waited for.
-		const auto write_tick = buffer.LastGpuWriteTick();
+		const auto write_tick = ReadbackWriteTick(buffer, buffer_address, copies);
 		// While the writes are still being recorded, the work has to be submitted anyway: a copy
 		// to cached host memory recorded behind it is then cheaper than reading the resizable
 		// BAR over PCIe afterwards (AbSwitch READBACK_COPY_WHEN_FLUSHING).
@@ -511,6 +561,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	new_buffer.MarkGpuWrite(m_scheduler.CurrentTick());
+	RecordGpuWrite(overlap.CpuAddress(), overlap.Size());
+	m_merge_count++;
 	DeleteBuffer(overlap_id);
 }
 
@@ -638,6 +690,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		TraceWrittenBinding(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer.MarkGpuWrite(m_scheduler.CurrentTick());
+		RecordGpuWrite(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 		if (buffer.WaitedForReadback()) {
 			// Submit this work as soon as it is recorded: a later read of what it writes will

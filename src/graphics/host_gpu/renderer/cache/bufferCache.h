@@ -97,6 +97,12 @@ public:
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	// Every GPU write recorded since the last call now carries the current tick: a draw's or
+	// dispatch's written bindings are marked during its preparation, and a flush there moves the
+	// command into a later command buffer. Called right after each draw or dispatch is recorded.
+	void RetagGpuWrites();
+	// Bumped whenever JoinOverlap merges a buffer away (and deletes it).
+	[[nodiscard]] uint64_t MergeCount() const { return m_merge_count; }
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
 
@@ -118,6 +124,11 @@ private:
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(Buffer& buffer);
+	// A GPU write into [vaddr, vaddr + size) at the current tick (AbSwitch RANGE_WRITE_TICKS).
+	void RecordGpuWrite(uint64_t vaddr, uint64_t size);
+	// The tick a readback of `copies` must wait for: the newest write in flight that covers them.
+	[[nodiscard]] uint64_t      ReadbackWriteTick(const Buffer& buffer, uint64_t buffer_address,
+	                                              std::span<const vk::BufferCopy> copies);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
@@ -163,6 +174,23 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// The latest GPU writes by guest range, oldest overwritten: a readback waits only for writes
+	// that cover its bytes, not for the newest write anywhere in a merged buffer. Ticks never
+	// decrease from oldest to newest: entries are recorded at the current tick, and RetagGpuWrites
+	// raises every entry since the previous call to the same tick.
+	struct GpuWrite {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	static constexpr size_t GPU_WRITE_RING   = 2048;
+	std::vector<GpuWrite>   m_gpu_writes     = std::vector<GpuWrite>(GPU_WRITE_RING);
+	size_t                  m_next_gpu_write = 0;
+	// The newest tick of a write that left the ring.
+	uint64_t m_evicted_write_tick = 0;
+	// The first entry not re-tagged yet.
+	size_t   m_first_unretagged = 0;
+	uint64_t m_merge_count      = 0;
 };
 
 } // namespace Libs::Graphics
