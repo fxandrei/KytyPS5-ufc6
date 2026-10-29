@@ -13,15 +13,16 @@ namespace Common::AbSwitch {
 inline std::atomic<uint32_t> g_mask {0};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
-// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT,
-// DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
+// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, EAGER_FLUSH_COARSE, IMAGE_POOL,
+// QUEUED_SUBMIT, DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
 // PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
-// DIRECT_URGENT_SUBMIT, UPLOAD_PRECHECK, LRU_TOUCH_MEMO and TEXTURE_INFO_MEMO. KYTY_AB=0 turns
-// them all off.
+// DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO and
+// TEXTURE_INFO_MEMO. KYTY_AB=0 turns them all off.
 inline constexpr uint32_t DEFAULT_MASK =
-    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 9) | (1u << 10) |
-    (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17) | (1u << 19) |
-    (1u << 20) | (1u << 21) | (1u << 22) | (1u << 24) | (1u << 27) | (1u << 28);
+    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) |
+    (1u << 10) | (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17) |
+    (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 27) |
+    (1u << 28);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -67,7 +68,8 @@ inline constexpr uint32_t EAGER_FLUSH = 6;
 inline constexpr uint32_t SKIP_DRAW_CHECKS = 7;
 // EAGER_FLUSH checks every 64 recorded draws or dispatches instead of 16: fewer and larger
 // submits when the GPU is waiting for the command processor (each submit costs the driver
-// about 13 us of CPU in the fight).
+// about 13 us of CPU in the fight). Together with EARLY_FLUSH_WRITERS, which spends those submits
+// on the writers that readbacks wait for, the fight ran ~3-5% faster.
 inline constexpr uint32_t EAGER_FLUSH_COARSE = 8;
 // Images that DeleteImage frees are kept, up to 512 MiB, for a CreateImage with the same
 // parameters: Frostbite recreates its transient render targets every frame, and creating and
