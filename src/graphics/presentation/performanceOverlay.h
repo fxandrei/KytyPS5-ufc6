@@ -12,6 +12,10 @@ struct GraphicContext;
 // Called for each main-bus guest flip, with the guest's video-out size.
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept;
 
+// Called with each depth target a draw uses: the perf CSV reports the largest wide one per second
+// (the scene depth buffer, which dynamic-resolution titles resize).
+void PerformanceOverlayRecordDepthTarget(uint32_t width, uint32_t height) noexcept;
+
 [[nodiscard]] bool PerformanceOverlayEnabled() noexcept;
 void               TogglePerformanceOverlay() noexcept;
 // Switches between the compact and the detailed panel, showing the panel if it was hidden.

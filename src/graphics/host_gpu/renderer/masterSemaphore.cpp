@@ -1,10 +1,13 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <chrono>
+#include <immintrin.h>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -62,6 +65,21 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (GuestGpu::IsGpuThread()) {
 		gpu_thread_timer.emplace(Common::DebugCounters::Counter::GpuThreadWaits,
 		                         Common::DebugCounters::Counter::GpuThreadWaitNs);
+		// The command processor mostly waits here for a few hundred microseconds of GPU work
+		// that reads back what a shader just wrote; polling the timeline avoids the wake-up
+		// latency of a blocking wait (AbSwitch SPIN_GPU_WAIT, up to 2 ms).
+		if (Common::AbSwitch::Enabled(Common::AbSwitch::SPIN_GPU_WAIT)) {
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+			do {
+				for (int i = 0; i < 16; i++) {
+					_mm_pause();
+				}
+				Refresh();
+				if (IsFree(tick)) {
+					return;
+				}
+			} while (std::chrono::steady_clock::now() < deadline);
+		}
 	}
 	auto result = m_graphics.device.waitSemaphores(&wait_info,
 	                                               m_stall_handler ? STALL_REPORT_NS : UINT64_MAX);

@@ -10,6 +10,20 @@ namespace Libs::Graphics {
 
 enum class PageFaultAccess { Read, Write, Execute, Unknown };
 
+// Where generated code finds whether a page faults on reads (it has an access watcher): the byte
+// at regions[address >> region_shift] + pages_offset + ((address >> page_shift) & page_mask),
+// tested with access_mask, when the region pointer is not null and the index is in range.
+// Code reads `regions` when it runs: it is null until a PageManager exists.
+struct PageAccessLookup {
+	const void* volatile regions = nullptr;
+	uint64_t region_count        = 0;
+	uint32_t region_shift        = 0;
+	uint32_t page_shift          = 0;
+	uint32_t page_mask           = 0;
+	uint32_t pages_offset        = 0;
+	uint8_t  access_mask         = 0;
+};
+
 class PageManager final {
 public:
 	PageManager();
@@ -17,6 +31,9 @@ public:
 	~PageManager();
 
 	KYTY_CLASS_NO_COPY(PageManager);
+
+	// The page table layout, with the regions of the live PageManager.
+	[[nodiscard]] static PageAccessLookup* AccessLookup() noexcept;
 
 	[[nodiscard]] uint64_t GetPageSize() const;
 

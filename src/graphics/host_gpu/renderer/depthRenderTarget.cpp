@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/performanceOverlay.h"
 
 #include <algorithm>
 #include <array>
@@ -188,6 +189,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (width > 16384 || height > 16384) {
 		DepthFatal("invalid depth extent");
 	}
+	PerformanceOverlayRecordDepthTarget(width, height);
 	const auto* policy = FindDepthFormatPolicy(z.z_info.format);
 	if (policy == nullptr) {
 		DepthFatal("unsupported depth/stencil format pair");

@@ -1,10 +1,12 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include "common/abSwitch.h"
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-
-#include <xbyak/xbyak.h>
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <bit>
@@ -12,6 +14,7 @@
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -167,10 +170,92 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 
-// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+// Set by WalkSrt from AbSwitch SRT_LOAD_CHECK; generated code tests it.
+uint8_t g_srt_load_check = 0;
+
+// A guest load from a page that faults on reads, without the fault: the same completion as the
+// fault path of Loader's exception handler (clean bytes from the backing store, else the GPU's
+// bytes), and zero where that path skips the load.
+uint32_t SrtWalkerReadGuestDword(uint64_t address) noexcept {
+	using Counter  = Common::DebugCounters::Counter;
+	namespace Mem  = Libs::LibKernel::Memory;
+	uint32_t value = 0;
+	Common::DebugCounters::Add(Counter::SrtWalkerFaults);
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::SRT_READ_BACKING) &&
+	    Mem::TryReadGpuCleanBytes(address, &value, sizeof(value))) {
+		Common::DebugCounters::Add(Counter::SrtReadsFromBacking);
+		return value;
+	}
+	Mem::TraceGpuDirtyRead("srt", address);
+	uint32_t   before      = 0;
+	const bool have_before = Mem::TryReadBacking(address, &before, sizeof(before));
+	if (!Mem::HandleGpuFault(PageFaultAccess::Read, address) ||
+	    !Mem::TryReadBacking(address, &value, sizeof(value))) {
+		return 0;
+	}
+	Common::DebugCounters::Add(Counter::GpuFaults);
+	if (have_before) {
+		Common::DebugCounters::Add(value == before ? Counter::DirtyReadsUnchanged
+		                                           : Counter::DirtyReadsChanged);
+	}
+	return value;
+}
+
+// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read. With
+// AbSwitch SRT_LOAD_CHECK, the load first looks the page up in the PageManager's table: a page
+// that faults on reads (GPU-written) is read by SrtWalkerReadGuestDword instead, which saves the
+// exception round trip (about 3.5 us, some 400 times a frame in UFC 6's fights). The walker keeps
+// rdi, rsi, rdx and r8 live and r10 for the capture; rcx, r11 and rax are scratch here.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+	constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
 	code.lea(code.r10, code.ptr[address]);
+	// The walkers of a loaded shader cache compile before the PageManager exists: read its
+	// regions when the walker runs.
+	const auto*  lookup = PageManager::AccessLookup();
+	Xbyak::Label load, slow, done;
+	code.mov(code.rcx, reinterpret_cast<uint64_t>(&g_srt_load_check));
+	code.cmp(code.byte[code.rcx], 0);
+	code.je(load, Near);
+	code.mov(code.r11, reinterpret_cast<uint64_t>(&lookup->regions));
+	code.mov(code.r11, code.qword[code.r11]);
+	code.test(code.r11, code.r11);
+	code.jz(load, Near);
+	code.mov(code.rcx, code.r10);
+	code.shr(code.rcx, static_cast<int>(lookup->region_shift));
+	code.cmp(code.rcx, static_cast<uint32_t>(lookup->region_count));
+	code.jae(load, Near);
+	code.mov(code.r11, code.qword[code.r11 + code.rcx * 8]);
+	code.test(code.r11, code.r11);
+	code.jz(load, Near);
+	code.mov(code.rcx, code.r10);
+	code.shr(code.rcx, static_cast<int>(lookup->page_shift));
+	code.and_(code.ecx, lookup->page_mask);
+	code.test(code.byte[code.r11 + code.rcx + lookup->pages_offset], lookup->access_mask);
+	code.jnz(slow, Near);
+	code.L(load);
 	code.mov(code.eax, code.dword[code.r10]);
+	code.jmp(done, Near);
+	code.L(slow);
+	// The walker's stack depth varies (values are thunks it calls): align for the Windows x64 call.
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.and_(code.rsp, -16);
+	code.push(code.rdx);
+	code.push(code.r8);
+	code.push(code.r10);
+	code.push(code.r10);
+	code.sub(code.rsp, 32);
+	code.mov(code.rcx, code.r10);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&SrtWalkerReadGuestDword));
+	code.call(code.rax);
+	code.add(code.rsp, 32);
+	code.pop(code.r10);
+	code.pop(code.r10);
+	code.pop(code.r8);
+	code.pop(code.rdx);
+	code.mov(code.rsp, code.rbp);
+	code.pop(code.rbp);
+	code.L(done);
 }
 
 class RuntimeValidator {
@@ -1371,6 +1456,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
+	g_srt_load_check = Common::AbSwitch::Enabled(Common::AbSwitch::SRT_LOAD_CHECK) ? 1 : 0;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;

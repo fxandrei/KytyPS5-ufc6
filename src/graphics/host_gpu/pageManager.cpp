@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -286,9 +288,33 @@ struct PageManager::Impl {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
+PageAccessLookup* PageManager::AccessLookup() noexcept {
+	static PageAccessLookup lookup = [] {
+		PageAccessLookup result;
+		Impl::PageState  watched {};
+		watched.AddDelta<1, true>(0);
+		std::memcpy(&result.access_mask, &watched, sizeof(result.access_mask));
+		const auto region   = std::make_unique<Impl::Region>();
+		result.region_count = REGION_COUNT;
+		result.region_shift = static_cast<uint32_t>(std::countr_zero(REGION_SIZE));
+		result.page_shift   = static_cast<uint32_t>(std::countr_zero(PAGE_SIZE));
+		result.page_mask    = static_cast<uint32_t>(REGION_PAGES - 1);
+		result.pages_offset =
+		    static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(region->pages.data()) -
+		                          reinterpret_cast<const uint8_t*>(region.get()));
+		return result;
+	}();
+	static_assert(sizeof(std::atomic<Impl::Region*>) == sizeof(Impl::Region*));
+	return &lookup;
+}
 
-PageManager::~PageManager() = default;
+PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {
+	AccessLookup()->regions = m_impl->regions.get();
+}
+
+PageManager::~PageManager() {
+	AccessLookup()->regions = nullptr;
+}
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;

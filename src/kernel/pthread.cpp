@@ -1,5 +1,6 @@
 #include "kernel/pthread.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/corePlacement.h"
@@ -3700,9 +3701,34 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 	return KERNEL_ERROR_EINVAL;
 }
 
+// A guest thread that reads the clock in a tight loop (UFC 6's audio watchdog spins on
+// clock_gettime, about 7 million calls a second) keeps a whole core busy, often the sibling of
+// the GPU thread's core. With AbSwitch SPIN_YIELD, a thread that made 4096 reads within 2 ms
+// sleeps 1 ms.
+static void YieldTightClockLoop() {
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::SPIN_YIELD)) {
+		return;
+	}
+	thread_local uint32_t calls        = 0;
+	thread_local uint64_t window_start = 0;
+	if (++calls < 4096) {
+		return;
+	}
+	calls             = 0;
+	const auto now    = KernelReadTscNative();
+	const auto window = KernelGetTscFrequencyNative() / 500; // 2 ms
+	const bool tight  = now - window_start < window;
+	window_start      = now;
+	if (tight) {
+		SleepMicroWithSignalPoll(1000);
+		window_start = KernelReadTscNative();
+	}
+}
+
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
 	// Called constantly by Python frame/timer code.
 	KYTY_TIME_PROBE(ClockGettime, clock_id);
+	YieldTightClockLoop();
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;

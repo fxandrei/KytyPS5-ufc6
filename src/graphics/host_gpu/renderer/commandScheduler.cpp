@@ -226,6 +226,12 @@ void CommandScheduler::Flush() {
 	Flush(submit);
 }
 
+void CommandScheduler::FlushUrgent() {
+	m_direct_submit = Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_URGENT_SUBMIT);
+	Flush();
+	m_direct_submit = false;
+}
+
 void CommandScheduler::RecordedWork() {
 	const uint32_t interval =
 	    Common::AbSwitch::Enabled(Common::AbSwitch::EAGER_FLUSH_COARSE) ? 64 : 16;
@@ -685,7 +691,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
-	if (submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0 &&
+	if (submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0 && !m_direct_submit &&
 	    Common::AbSwitch::Enabled(Common::AbSwitch::QUEUED_SUBMIT)) {
 		{
 			std::lock_guard lock(m_submit_mutex);

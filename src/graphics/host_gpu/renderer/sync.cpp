@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/sync.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -9,6 +10,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -38,7 +41,7 @@ bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t&
 	return true;
 }
 
-uint64_t ReadReferenceClock() {
+static uint64_t ReadHostReferenceClock() {
 	const auto host_frequency = LibKernel::KernelGetTscFrequency();
 	const auto host_ticks     = LibKernel::KernelReadTsc();
 	uint64_t   value          = 0;
@@ -49,8 +52,39 @@ uint64_t ReadReferenceClock() {
 	return value;
 }
 
+// The reference clock at the last guest flip the command processor reached (0: none yet).
+static std::atomic<uint64_t> g_frame_anchor {0};
+
+// Guest GPU timestamps (end-of-pipe and copied reference clocks) are taken when the command
+// processor reaches them, so the timestamps of a frame span its command-processor time, which a
+// dynamic-resolution title takes for GPU time and answers by lowering its resolution. With
+// AbSwitch GPU_TIME_COMPRESS, the clock runs KYTY_GPU_TIME_SCALE (default 0.25) times as fast
+// from each guest flip on and catches up at the next one: it stays monotonic and within a frame
+// of the real clock.
+uint64_t ReadReferenceClock() {
+	const auto value = ReadHostReferenceClock();
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::GPU_TIME_COMPRESS)) {
+		return value;
+	}
+	static const double scale = [] {
+		const char*  text   = std::getenv("KYTY_GPU_TIME_SCALE");
+		const double parsed = text != nullptr ? std::strtod(text, nullptr) : 0.25;
+		return parsed > 0.0 && parsed <= 1.0 ? parsed : 0.25;
+	}();
+	const auto anchor = g_frame_anchor.load(std::memory_order_relaxed);
+	if (anchor == 0 || value <= anchor) {
+		return value;
+	}
+	return anchor + static_cast<uint64_t>(static_cast<double>(value - anchor) * scale);
+}
+
+static void MarkGuestFrameBoundary() {
+	g_frame_anchor.store(ReadHostReferenceClock(), std::memory_order_relaxed);
+}
+
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+	MarkGuestFrameBoundary();
 	for (;;) {
 		uint64_t   request_id = 0;
 		auto&      video_out  = buffer.GetContext().GetVideoOut();

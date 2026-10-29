@@ -239,7 +239,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		if (!buffer.Mapped().empty() && write_tick != 0 &&
 		    Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_READBACK)) {
 			if (write_tick >= m_scheduler.CurrentTick()) {
-				m_scheduler.Flush(); // The writes are still being recorded.
+				m_scheduler.FlushUrgent(); // The writes are still being recorded.
 			}
 			m_scheduler.Wait(write_tick);
 			m_scheduler.WaitPriorityOperations(write_tick);

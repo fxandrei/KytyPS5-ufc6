@@ -15,10 +15,12 @@ inline std::atomic<uint32_t> g_mask {0};
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
 // SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, IMAGE_POOL, QUEUED_SUBMIT,
 // DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
-// PIPELINE_BIND_DEDUPE and TARGET_LOOKUP_MEMO. KYTY_AB=0 turns them all off.
+// PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT and
+// DIRECT_URGENT_SUBMIT. KYTY_AB=0 turns them all off.
 inline constexpr uint32_t DEFAULT_MASK =
     (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 9) | (1u << 10) |
-    (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17);
+    (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 17) | (1u << 19) |
+    (1u << 20) | (1u << 21) | (1u << 22);
 
 [[nodiscard]] inline uint32_t Mask() noexcept {
 	static const bool initialized = [] {
@@ -96,6 +98,21 @@ inline constexpr uint32_t PIPELINE_BIND_DEDUPE = 16;
 // A render-target slot whose registers have not changed (HW::Context stamps) reuses its last
 // resolved descriptor and image while the texture cache's image set is the same.
 inline constexpr uint32_t TARGET_LOOKUP_MEMO = 17;
+// Experiment: guest GPU timestamps run slower within each frame (Sync::ReadReferenceClock), so
+// dynamic resolution stops reading command-processor time as GPU time.
+inline constexpr uint32_t GPU_TIME_COMPRESS = 18;
+// A guest thread that reads the clock in a tight loop sleeps 1 ms after every 4096 reads made
+// within 2 ms (kernel/pthread.cpp, KernelClockGettime): UFC 6's audio watchdog spins a core.
+inline constexpr uint32_t SPIN_YIELD = 19;
+// The resource-table walker looks a page up before each guest load and reads GPU-written pages
+// through a call instead of taking a page fault (SrtWalker.cpp, LoadGuest).
+inline constexpr uint32_t SRT_LOAD_CHECK = 20;
+// The command-processor thread polls the GPU timeline for up to 2 ms before a blocking wait
+// (MasterSemaphore::Wait): its waits are mostly short readbacks.
+inline constexpr uint32_t SPIN_GPU_WAIT = 21;
+// A flush that the command processor waits for next (a readback of GPU-written bytes) is
+// submitted on its own thread instead of through the submission thread.
+inline constexpr uint32_t DIRECT_URGENT_SUBMIT = 22;
 
 } // namespace Common::AbSwitch
 

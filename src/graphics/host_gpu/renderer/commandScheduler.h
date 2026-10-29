@@ -38,6 +38,10 @@ public:
 	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Flush for a caller that waits for this work next: with AbSwitch DIRECT_URGENT_SUBMIT the
+	// command buffer is submitted on this thread, after the queued ones, so the submission
+	// thread's wake-up does not add to the wait.
+	void           FlushUrgent();
 	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
@@ -192,6 +196,7 @@ private:
 	uint64_t                                  m_eager_submits         = 0;
 	bool                                      m_graphics_checkpoints  = false;
 	bool                                      m_host_read_barrier     = false;
+	bool                                      m_direct_submit         = false; // FlushUrgent
 	uint32_t                                  m_pop_calls             = 0; // AbSwitch LAZY_GPU_POLL
 };
 

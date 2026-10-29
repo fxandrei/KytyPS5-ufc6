@@ -155,21 +155,25 @@ void EnsureSampler() {
 // panel, so it turns the panel on.
 std::jthread g_perf_csv;
 
+// The largest wide depth target since the last CSV row, as width << 16 | height.
+std::atomic<uint32_t> g_depth_target_max {0};
+
 void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
-	std::fputs("t_s,unix_s,flips,fps,frame_p50_ms,frame_p99_ms,frame_max_ms,draws,dispatches,"
-	           "indirect_draws,submits,gpu_waits,gpu_wait_ms,gpu_faults,tex_up_mb,tex_down_mb,"
-	           "buf_up_mb,buf_down_mb,shaders,shader_ms,pipelines,pipeline_ms,cmask_readback_ms,"
-	           "late_vblanks,cpu_pct,gpu_thread_waits,gpu_thread_wait_ms,unmap_waits,unmap_wait_ms,"
-	           "unmap_waits_unregistered,flip_waits,shreg_reads,shreg_clean,shreg_dirty,dargs_reads,"
-	           "dargs_clean,dargs_dirty,cp_backing_reads,srt_faults,srt_backing,label_writes,"
-	           "label_clean,label_dirty,label_in_order,written_bindings,written_mb,"
-	           "dirty_reads_unchanged,dirty_reads_changed,tex_refresh_gpu_mb,tex_refresh_cpu_mb,"
-	           "gpu_busy_ms,gpu_timed_buffers,tex_upload_gpu_ms,partial_image_skipped_mb,"
-	           "gpu_busy_union_ms,gpu_idle_gap_ms,guest_flushes,eager_flushes,ab,"
-	           "thread1,"
-	           "thread1_pct,thread2,thread2_pct,"
-	           "thread3,thread3_pct\n",
-	           file);
+	std::fputs(
+	    "t_s,unix_s,flips,fps,frame_p50_ms,frame_p99_ms,frame_max_ms,draws,dispatches,"
+	    "indirect_draws,submits,gpu_waits,gpu_wait_ms,gpu_faults,tex_up_mb,tex_down_mb,"
+	    "buf_up_mb,buf_down_mb,shaders,shader_ms,pipelines,pipeline_ms,cmask_readback_ms,"
+	    "late_vblanks,cpu_pct,gpu_thread_waits,gpu_thread_wait_ms,unmap_waits,unmap_wait_ms,"
+	    "unmap_waits_unregistered,flip_waits,shreg_reads,shreg_clean,shreg_dirty,dargs_reads,"
+	    "dargs_clean,dargs_dirty,cp_backing_reads,srt_faults,srt_backing,label_writes,"
+	    "label_clean,label_dirty,label_in_order,written_bindings,written_mb,"
+	    "dirty_reads_unchanged,dirty_reads_changed,tex_refresh_gpu_mb,tex_refresh_cpu_mb,"
+	    "gpu_busy_ms,gpu_timed_buffers,tex_upload_gpu_ms,partial_image_skipped_mb,"
+	    "gpu_busy_union_ms,gpu_idle_gap_ms,guest_flushes,eager_flushes,ab,depth_w,depth_h,"
+	    "thread1,"
+	    "thread1_pct,thread2,thread2_pct,"
+	    "thread3,thread3_pct\n",
+	    file);
 	const char*              ab_file = std::getenv("KYTY_AB_FILE");
 	uint32_t                 ab      = Common::AbSwitch::Mask();
 	Common::HostStatsSampler sampler;
@@ -256,6 +260,8 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		    rate(Counter::PartialImageWritesSkipped) / MIB, rate(Counter::GpuBusyUnionNs) / 1e6,
 		    rate(Counter::GpuIdleGapNs) / 1e6, rate(Counter::GuestFlushBarriers),
 		    rate(Counter::EagerFlushes), ab);
+		const auto depth = g_depth_target_max.exchange(0, std::memory_order_relaxed);
+		std::fprintf(file, ",%u,%u", depth >> 16u, depth & 0xffffu);
 		// The three busiest threads, in percent of one core.
 		for (size_t i = 0; i < 3; i++) {
 			if (i < host.busiest_threads.size()) {
@@ -748,6 +754,18 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 }
 
 } // namespace
+
+void PerformanceOverlayRecordDepthTarget(uint32_t width, uint32_t height) noexcept {
+	// Shadow maps and other square or narrow targets are not the scene's resolution.
+	if (height == 0 || width * 10 < height * 15 || width * 10 > height * 20) {
+		return;
+	}
+	const uint32_t packed   = (width << 16u) | (height & 0xffffu);
+	uint32_t       previous = g_depth_target_max.load(std::memory_order_relaxed);
+	while ((previous >> 16u) < width &&
+	       !g_depth_target_max.compare_exchange_weak(previous, packed, std::memory_order_relaxed)) {
+	}
+}
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
 	EnsurePerfCsv();
