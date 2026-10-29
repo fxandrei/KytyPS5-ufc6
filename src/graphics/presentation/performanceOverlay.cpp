@@ -756,6 +756,10 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordDepthTarget(uint32_t width, uint32_t height) noexcept {
+	// Only the perf CSV reads it, and the counters run only with the overlay or the CSV.
+	if (!Common::DebugCounters::Enabled()) {
+		return;
+	}
 	// Shadow maps and other square or narrow targets are not the scene's resolution.
 	if (height == 0 || width * 10 < height * 15 || width * 10 > height * 20) {
 		return;

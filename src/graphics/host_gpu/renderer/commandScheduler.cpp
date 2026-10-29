@@ -508,11 +508,14 @@ void CommandScheduler::SetGpuCheckpoint(std::string_view name) {
 
 void CommandScheduler::DumpGpuMarkers() {
 	static const char* path = std::getenv("KYTY_GPU_MARKERS");
-	const auto         now  = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-	if (path == nullptr || m_marker_names.empty() || now - m_marker_dump_ms < 5000) {
+	// Runs after every draw: read the clock only when markers are being collected.
+	if (path == nullptr || m_marker_names.empty()) {
+		return;
+	}
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (now - m_marker_dump_ms < 5000) {
 		return;
 	}
 	m_marker_dump_ms = now;
