@@ -35,9 +35,10 @@ namespace Libs::Graphics {
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
-		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == CurrentThread());
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 			_mm_pause();
 #elif defined(_M_ARM64)
@@ -46,11 +47,15 @@ public:
 			asm volatile("yield");
 #endif
 		}
-		m_owner.store(thread, std::memory_order_relaxed);
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+		m_owner.store(CurrentThread(), std::memory_order_relaxed);
+#endif
 	}
 	void unlock() noexcept {
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
+#endif
 		m_lock.clear(std::memory_order_release);
 	}
 
@@ -97,19 +102,19 @@ public:
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		return GetBits<source>().FirstRangeFrom(start).first < end;
+		return GetBits<source>().AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -130,7 +135,7 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
-		if (bits.FirstRangeFrom(start).first >= end) {
+		if (!bits.AnyInRange(start, end)) {
 			return;
 		}
 		RegionBits mask(bits, start, end);

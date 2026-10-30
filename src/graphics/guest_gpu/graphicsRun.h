@@ -45,6 +45,11 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// Cheap test for the packet loop: ProcessCommands costs a TLS read and a call even when the
+	// queue is empty, which is almost always the case per packet.
+	[[nodiscard]] bool HasPendingCommands() const noexcept {
+		return m_pending_commands.load(std::memory_order_acquire) != 0;
+	}
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

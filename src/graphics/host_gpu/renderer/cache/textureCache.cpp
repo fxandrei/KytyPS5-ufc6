@@ -324,6 +324,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			            owner.info.data.address == surface;
 		}
 		if (!retained) {
+			ForgetMetaMemo();
 			std::erase_if(m_surface_metas, [&](const auto& metadata) {
 				return metadata.second.depth_address == surface;
 			});
@@ -1163,6 +1164,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
+		ForgetMetaMemo(range.address);
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || view.level_count != 1) {
 			return;
@@ -1651,15 +1653,25 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		const auto address = desc.info.metadata.range.address;
+		auto*      metadata = FindMeta(address);
+		const bool fresh    = metadata == nullptr;
+		if (fresh) {
+			metadata            = &m_surface_metas[address];
+			m_meta_memo_address = address;
+			m_meta_memo         = metadata;
+		}
 		// Key by the native image base; a layered binding may start at a later slice. Clear state
 		// kept for another surface does not carry over when this HTile changes surfaces.
-		if (inserted || metadata->second.depth_address != image.info.data.address) {
-			metadata->second.clear_mask.reset();
-			if (image.info.htile_initial_clear) {
-				metadata->second.clear_mask.set();
+		if (fresh || metadata->depth_address != image.info.data.address) {
+			// A fresh node's bitset is already zero.
+			if (!fresh) {
+				metadata->clear_mask.reset();
 			}
-			metadata->second.depth_address = image.info.data.address;
+			if (image.info.htile_initial_clear) {
+				metadata->clear_mask.set();
+			}
+			metadata->depth_address = image.info.data.address;
 		}
 	}
 	RefreshImage(id);
@@ -2109,36 +2121,35 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	return found != m_surface_metas.end();
+	return FindMeta(address) != nullptr;
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
+	const auto       metadata = FindMeta(address);
+	if (metadata == nullptr || slice >= metadata->clear_mask.size()) {
 		return false;
 	}
-	return found->second.clear_mask.test(slice);
+	return metadata->clear_mask.test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end()) {
+	const auto       metadata = FindMeta(address);
+	if (metadata == nullptr) {
 		return false;
 	}
-	found->second.clear_mask.set();
+	metadata->clear_mask.set();
 	return true;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
+	const auto       metadata = FindMeta(address);
+	if (metadata == nullptr || slice >= metadata->clear_mask.size()) {
 		return false;
 	}
-	found->second.clear_mask.set(slice, is_clear);
+	metadata->clear_mask.set(slice, is_clear);
 	return true;
 }
 
@@ -2152,6 +2163,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	ForgetMetaMemo();
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {

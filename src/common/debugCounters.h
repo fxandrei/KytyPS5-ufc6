@@ -86,6 +86,8 @@ enum class Counter {
 	RecordStreamDrains,      // Drains (a caller waited for the consumer).
 	RecordStreamDirectCalls, // Calls that drained and ran on the caller: a missing hook.
 	RecordStreamSleeps,      // Times the consumer slept.
+	// The draw chain (AbSwitch DRAW_CHAIN).
+	DrawChainTaken, // Draws that took the previous draw's render targets.
 	Count
 };
 
@@ -95,6 +97,10 @@ namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
+// A submission's counters, accumulated on the submitting thread and added with one atomic per
+// counter (BatchScope, used around the command processor's packet loop).
+inline thread_local uint64_t g_batch[static_cast<int>(Counter::Count)] {};
+inline thread_local uint32_t g_batch_depth = 0;
 } // namespace Detail
 
 [[nodiscard]] inline bool Enabled() noexcept {
@@ -109,8 +115,44 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	if (!Enabled()) {
 		return;
 	}
-	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
+	const auto index = static_cast<uint32_t>(counter);
+	if (Detail::g_batch_depth != 0) {
+		Detail::g_batch[index] += value;
+		return;
+	}
+	Detail::g_counters[index].fetch_add(value, std::memory_order_relaxed);
 }
+
+// Adds the calling thread's pending counters. Counters read from another thread see a batch only
+// after the submitting thread flushes it; rate samples compare whole seconds, so this is invisible.
+inline void FlushBatched() noexcept {
+	auto& batch = Detail::g_batch;
+	for (uint32_t i = 0; i < static_cast<uint32_t>(Counter::Count); i++) {
+		const auto value = batch[i];
+		if (value != 0) {
+			batch[i] = 0;
+			Detail::g_counters[i].fetch_add(value, std::memory_order_relaxed);
+		}
+	}
+}
+
+// Accumulates every Add() on this thread until the outermost scope ends (the command processor
+// wraps its packet loop: a draw adds several counters, each was an atomic RMW on a shared line).
+class BatchScope final {
+public:
+	BatchScope() noexcept {
+		if (Enabled()) {
+			Detail::g_batch_depth++;
+		}
+	}
+	~BatchScope() {
+		if (Detail::g_batch_depth != 0 && --Detail::g_batch_depth == 0) {
+			FlushBatched();
+		}
+	}
+	BatchScope(const BatchScope&)            = delete;
+	BatchScope& operator=(const BatchScope&) = delete;
+};
 
 class ScopedTimer final {
 public:
@@ -147,7 +189,9 @@ private:
 };
 
 [[nodiscard]] inline uint64_t Get(Counter counter) noexcept {
-	return Detail::g_counters[static_cast<int>(counter)].load(std::memory_order_relaxed);
+	const auto index = static_cast<uint32_t>(counter);
+	const auto value = Detail::g_counters[index].load(std::memory_order_relaxed);
+	return Detail::g_batch_depth != 0 ? value + Detail::g_batch[index] : value;
 }
 
 [[nodiscard]] inline uint64_t Get(Peak peak) noexcept {

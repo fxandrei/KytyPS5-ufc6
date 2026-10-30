@@ -38,6 +38,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -889,6 +890,150 @@ DrawRenderState& RenderExecutor::BeginDrawState(std::optional<DrawRenderState>& 
 	return fresh;
 }
 
+uint64_t g_target_state_serial = 0;
+
+// Consecutive draws mostly go to the same render targets: a pass sets them once and then draws
+// hundreds of meshes, changing only shader registers between them. Each draw resolved the targets
+// from the registers and acquired them again. A draw keeps the whole result (the targets'
+// descriptions, their attachments and the rendering state) and the next one takes it when all of
+// this holds (AbSwitch DRAW_CHAIN; Bruno Cardenas Torres 28073f9ed):
+//  - no command since could have changed the registers the targets resolve from
+//    (g_target_state_serial), and the draw writes the same slots at the same slice offset;
+//  - the rendering instance the kept draw began is still open on the same command buffer: no
+//    barrier, copy or clear was recorded in between, which each end it;
+//  - no image was registered or unregistered since (the texture cache's structure generation),
+//    and every kept target is still registered and needs no rebind;
+//  - the kept draw cleared nothing and read none of its targets, and neither does this one
+//    (TargetMemoBound, once its textures are bound: such a draw acquires its targets itself).
+// KYTY_VERIFY_TARGET_MEMO=1 acquires again for every taken draw and exits on a difference.
+struct TargetMemo {
+	bool                 valid = false;
+	const void*          owner = nullptr;
+	const CommandBuffer* buffer = nullptr;
+	uint64_t             rendering_serial     = 0;
+	uint64_t             state_serial         = 0;
+	uint64_t             structure_generation = 0;
+	uint32_t             mrt_mask             = 0;
+	uint32_t             slice_offset         = 0;
+	bool                 ps_active            = false;
+	uint32_t             color_count          = 0;
+	std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors;
+	std::array<vk::ImageLayout, RENDER_COLOR_ATTACHMENTS_MAX> color_layouts {};
+	RenderDepthInfo      depth;
+	vk::ImageLayout      depth_layout = vk::ImageLayout::eUndefined;
+	RenderState          rendering;
+};
+static TargetMemo g_target_memo;
+
+static bool VerifyTargetMemo() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_TARGET_MEMO") != nullptr;
+	return enabled;
+}
+
+bool RenderExecutor::TakeTargetMemo(CommandBuffer& buffer, DrawRenderState& state) {
+	const auto& memo = g_target_memo;
+	if (!memo.valid || memo.owner != this || memo.buffer != &buffer ||
+	    memo.state_serial != g_target_state_serial || !buffer.IsRendering() ||
+	    memo.rendering_serial != buffer.RenderingSerial() || memo.mrt_mask != state.mrt_mask ||
+	    memo.slice_offset != state.slice_offset || memo.ps_active != state.ps_active ||
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::DRAW_CHAIN)) {
+		return false;
+	}
+	auto& cache = m_context.GetTextureCache();
+	if (memo.structure_generation != cache.StructureGeneration()) {
+		return false;
+	}
+	for (uint32_t i = 0; i < memo.color_count; i++) {
+		if (!memo.colors[i].image_id) {
+			return false;
+		}
+		const auto& image = cache.m_slot_images[memo.colors[i].image_id];
+		if (!image.registered || image.binding.needs_rebind) {
+			return false;
+		}
+	}
+	if (memo.depth.image_id) {
+		const auto& image = cache.m_slot_images[memo.depth.image_id];
+		if (!image.registered || image.binding.needs_rebind) {
+			return false;
+		}
+	}
+	// As resolving and acquiring leave the targets for the rest of the draw.
+	for (uint32_t i = 0; i < memo.color_count; i++) {
+		state.color_info[i]     = memo.colors[i];
+		auto& image             = cache.GetImage(memo.colors[i].image_id);
+		image.binding.is_target = true;
+		image.binding.attachment_layout = memo.color_layouts[i];
+		image.binding.attachment_access =
+		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+		BindRenderTarget(memo.colors[i].image_id);
+	}
+	state.color_count = memo.color_count;
+	if (memo.depth.image_id) {
+		state.depth_info                = memo.depth;
+		auto& image                     = cache.GetImage(memo.depth.image_id);
+		image.binding.is_target         = true;
+		image.binding.attachment_layout = memo.depth_layout;
+		image.binding.attachment_access =
+		    vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		BindRenderTarget(memo.depth.image_id);
+	}
+	state.target_memo = true;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawChainTaken);
+	return true;
+}
+
+// Whether the draw that took the memo binds one of its targets as a texture or storage image.
+bool RenderExecutor::TargetMemoBound(const DrawRenderState& state) const {
+	auto& cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (cache.GetImage(state.color_info[i].image_id).binding.is_bound) {
+			return true;
+		}
+	}
+	return state.depth_info.image_id &&
+	       cache.GetImage(state.depth_info.image_id).binding.is_bound;
+}
+
+void RenderExecutor::KeepTargetMemo(CommandBuffer& buffer, const DrawRenderState& state,
+                                    const RenderState&   rendering,
+                                    vk::ImageAspectFlags feedback_aspects) {
+	auto& memo  = g_target_memo;
+	memo.valid  = false;
+	const auto& depth = state.depth_info;
+	if (feedback_aspects || !buffer.IsRendering() || TargetMemoBound(state) ||
+	    (state.color_count == 0 && !depth.image_id) || depth.depth_clear_enable ||
+	    depth.stencil_clear_enable || rendering.depth_stencil_attachment.depth_clear ||
+	    rendering.depth_stencil_attachment.stencil_clear) {
+		return;
+	}
+	auto& cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& attachment = rendering.color_attachments[state.color_info[i].target_slot];
+		if (attachment.is_clear) {
+			return;
+		}
+		memo.colors[i]        = state.color_info[i];
+		memo.color_layouts[i] = attachment.image_layout;
+	}
+	memo.color_count = state.color_count;
+	memo.depth       = depth;
+	if (depth.image_id) {
+		memo.depth_layout = cache.GetImage(depth.image_id).binding.attachment_layout;
+	}
+	memo.rendering            = rendering;
+	memo.owner                = this;
+	memo.buffer               = &buffer;
+	memo.rendering_serial     = buffer.RenderingSerial();
+	memo.state_serial         = g_target_state_serial;
+	memo.structure_generation = cache.StructureGeneration();
+	memo.mrt_mask             = state.mrt_mask;
+	memo.slice_offset         = state.slice_offset;
+	memo.ps_active            = state.ps_active;
+	memo.valid                = true;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -901,6 +1046,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
+	}
+	state.slice_offset = render_target_slice_offset;
+	if (TakeTargetMemo(buffer, state)) {
+		return true;
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
@@ -1187,9 +1336,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	const bool target_memo_taken = state.target_memo && !TargetMemoBound(state);
+	auto       rendering         = target_memo_taken ? g_target_memo.rendering : RenderState {};
+	if (!target_memo_taken) {
+		rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+		                                 state.depth_info, feedback_aspects, stages);
+	} else if (VerifyTargetMemo()) [[unlikely]] {
+		vk::ImageAspectFlags check_aspects;
+		const auto           check = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+		                                                  state.depth_info, check_aspects, stages);
+		if (!(check == rendering) || check_aspects) {
+			EXIT("target memo: the kept rendering state differs from the one acquired now\n");
+		}
+	}
 	// A buffer obtained after the shader bindings (vertex, index, arguments, target refreshes) can
 	// merge away and delete a buffer they already name: bind them all again until none merges.
 	for (uint32_t pass = 0; pass < 4 && buffer_cache.MergeCount() != merges; pass++) {
@@ -1275,6 +1434,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	if (!target_memo_taken) {
+		KeepTargetMemo(buffer, state, rendering, feedback_aspects);
+	}
 	auto& bound = m_context.GetCommandScheduler().GetDynamicState().bound_graphics_pipeline;
 	if (bound != pipeline.pipeline ||
 	    !Common::AbSwitch::Enabled(Common::AbSwitch::PIPELINE_BIND_DEDUPE)) {

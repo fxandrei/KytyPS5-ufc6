@@ -207,6 +207,8 @@ void CommandProcessor::Reset() {
 	m_predicate_skip                   = false;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	// The registers the draw chain's targets resolve from are reset (AbSwitch DRAW_CHAIN).
+	g_target_state_serial++;
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -618,6 +620,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	// Every counter a packet or draw adds lands here first.
+	const Common::DebugCounters::BatchScope counter_batch;
 	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
@@ -636,8 +640,10 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	// Two config reads per packet only to decide whether to log it.
+	const bool debug_dump = GraphicsRunDebugDumpEnabled();
 	while (!execution.m_buffer_stack.empty()) {
-		if (g_gpu_state != nullptr) {
+		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
@@ -662,7 +668,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
-		if (GraphicsRunDebugDumpEnabled()) {
+		if (debug_dump) [[unlikely]] {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
@@ -684,6 +690,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+
+		// The draw chain (AbSwitch DRAW_CHAIN) keeps a draw's render targets for the next draw
+		// while the registers they resolve from cannot change: these packets leave those
+		// registers alone (draws, shader register writes and index state).
+		if (!g_target_state_exempt[opcode]) {
+			g_target_state_serial++;
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;

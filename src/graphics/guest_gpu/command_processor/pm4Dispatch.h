@@ -29,6 +29,9 @@ extern hw_sh_indirect_func_t                               g_hw_sh_indirect_func
 extern const std::array<hw_uc_parser_func_t, Pm4::UC_NUM>  g_hw_uc_func;
 extern hw_uc_indirect_func_t                               g_hw_uc_indirect_func[Pm4::UC_NUM];
 extern const std::array<cp_op_parser_func_t, 256>          g_cp_op_func;
+// Whether a packet leaves the registers a draw resolves its render targets from alone
+// (AbSwitch DRAW_CHAIN, see CommandProcessor::ProcessPm4).
+extern const std::array<bool, 256>                         g_target_state_exempt;
 extern const std::array<cp_op_parser_func_t, Pm4::R_NUM>   g_cp_op_custom_func;
 
 void GraphicsInitJmpTables();

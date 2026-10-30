@@ -1089,10 +1089,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:
+						// Every source was checked by RebindBuffers/FindBuffers already.
 						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
-						for (const auto& view: descriptors.buffers) {
-							EXIT_IF(view.buffer == nullptr);
-						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;
 					case BindingKind::BdaPagetable:

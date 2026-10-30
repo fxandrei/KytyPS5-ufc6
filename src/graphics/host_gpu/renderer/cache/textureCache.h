@@ -215,6 +215,26 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// The last metadata entry looked up: consecutive binds usually name the same HTile/CMASK
+	// surface, and a tree walk plus a 1 KiB node per bind showed in the profile. Nodes are stable;
+	// every erase drops the memo (ForgetMetaMemo), and it is only used with m_lock held.
+	uint64_t      m_meta_memo_address = 0;
+	MetaDataInfo* m_meta_memo         = nullptr;
+	[[nodiscard]] MetaDataInfo* FindMeta(uint64_t address) {
+		if (m_meta_memo != nullptr && m_meta_memo_address == address) {
+			return m_meta_memo;
+		}
+		const auto found    = m_surface_metas.find(address);
+		m_meta_memo_address = address;
+		m_meta_memo         = found == m_surface_metas.end() ? nullptr : &found->second;
+		return m_meta_memo;
+	}
+	void ForgetMetaMemo(uint64_t address) {
+		if (m_meta_memo_address == address) {
+			m_meta_memo = nullptr;
+		}
+	}
+	void ForgetMetaMemo() { m_meta_memo = nullptr; }
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

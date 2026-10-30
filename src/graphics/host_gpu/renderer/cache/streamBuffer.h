@@ -54,7 +54,10 @@ public:
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
-	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
+	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
+		return address >= m_cpu_address && size <= Size() &&
+		       address - m_cpu_address <= Size() - size;
+	}
 	// The last tick that recorded a GPU write into the buffer (written bindings, joined overlaps).
 	[[nodiscard]] uint64_t LastGpuWriteTick() const noexcept { return m_last_gpu_write_tick; }
 	void                   MarkGpuWrite(uint64_t tick) noexcept {

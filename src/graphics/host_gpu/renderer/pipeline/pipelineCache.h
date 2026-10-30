@@ -140,6 +140,10 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// The slice offset the targets resolved with, and whether this draw took the previous draw's
+	// targets (AbSwitch DRAW_CHAIN; see TargetMemo in renderDraw.cpp).
+	uint32_t slice_offset = 0;
+	bool     target_memo  = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -165,6 +169,8 @@ struct DrawRenderState {
 		ps_input_info    = {};
 		indirect_offsets = offsets;
 		indirect_draw    = indirect;
+		slice_offset     = 0;
+		target_memo      = false;
 	}
 };
 

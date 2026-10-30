@@ -217,6 +217,25 @@ constexpr auto MakeOpcodeDispatchTable() {
 	return g_cp_op_func;
 }
 
+// Packets that leave the registers a draw resolves its render targets from as they are (draws,
+// shader register writes and index state): the draw chain (AbSwitch DRAW_CHAIN) bumps
+// g_target_state_serial for every other packet, so this is a byte test in the packet loop.
+constexpr auto MakeTargetStateExemptTable() {
+	std::array<bool, 256> table {};
+	for (const uint32_t opcode: {uint32_t {Pm4::IT_SET_SH_REG},
+	                             uint32_t {Pm4::IT_SET_SH_REG_INDIRECT},
+	                             uint32_t {Pm4::IT_DRAW_INDEX_OFFSET_2},
+	                             uint32_t {Pm4::IT_DRAW_INDEX_AUTO},
+	                             uint32_t {Pm4::IT_DRAW_INDEX_2},
+	                             uint32_t {Pm4::IT_INDEX_BUFFER_SIZE},
+	                             uint32_t {Pm4::IT_INDEX_BASE},
+	                             uint32_t {Pm4::IT_INDEX_TYPE},
+	                             uint32_t {Pm4::IT_NUM_INSTANCES}}) {
+		table[opcode] = true;
+	}
+	return table;
+}
+
 constexpr auto MakeCustomOpcodeDispatchTable() {
 	std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func {};
 
@@ -240,6 +259,7 @@ constinit const std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func =
 constinit const std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func =
     MakeUconfigDispatchTable();
 constinit const std::array<cp_op_parser_func_t, 256> g_cp_op_func = MakeOpcodeDispatchTable();
+constinit const std::array<bool, 256> g_target_state_exempt = MakeTargetStateExemptTable();
 constinit const std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func =
     MakeCustomOpcodeDispatchTable();
 

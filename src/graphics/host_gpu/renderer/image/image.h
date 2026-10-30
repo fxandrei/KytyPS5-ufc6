@@ -147,6 +147,9 @@ public:
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
+	// Index of the last view FindView returned: a draw binds the same texture with the same view
+	// description draw after draw, and the linear scan is over every view of the image.
+	size_t last_view_index = SIZE_MAX;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;

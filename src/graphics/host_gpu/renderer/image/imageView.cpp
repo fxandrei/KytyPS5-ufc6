@@ -322,8 +322,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	if (last_view_index < views.size() && views[last_view_index].info == normalized) {
+		return views[last_view_index].view;
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
+			last_view_index = static_cast<size_t>(&cached - views.data());
 			return cached.view;
 		}
 	}
@@ -396,6 +400,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	    static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 	    normalized.level_count, normalized.base_layer, normalized.layer_count);
 	views.push_back({normalized, view});
+	last_view_index = views.size() - 1;
 	return view;
 }
 

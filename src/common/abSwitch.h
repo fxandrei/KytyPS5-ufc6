@@ -31,7 +31,7 @@ inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit
                                          Bit(8) | Bit(9) | Bit(10) | Bit(11) | Bit(13) | Bit(14) |
                                          Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) |
                                          Bit(22) | Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) |
-                                         Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37);
+                                         Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37) | Bit(45);
 
 // The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
 [[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
@@ -203,6 +203,11 @@ inline constexpr uint32_t BUFFER_IDLE_GC = 41;
 // private UFC 6 build does this). Reads of GPU-written memory still wait on their write ticks,
 // so the guest cannot observe stale bytes; only the wake-up itself moves earlier.
 inline constexpr uint32_t EOP_IRQ_AT_CP = 42;
+// A draw keeps its resolved render targets (descriptions, attachments and the rendering state)
+// for the next draw while no command that could change them ran and the same rendering instance
+// is open; that draw then skips resolving registers and acquiring the targets again (Bruno
+// Cardenas Torres 28073f9ed; the same design is in the private UFC 6 build, KYTY_DRAW_CHAIN).
+inline constexpr uint32_t DRAW_CHAIN = 45;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {

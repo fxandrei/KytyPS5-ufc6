@@ -39,7 +39,9 @@ constexpr uint64_t MiB           = 1024 * 1024;
 // Hands the bytes to `sink` in pieces of at most 4 KiB, as (bytes, offset, size).
 template <typename Sink>
 void ReadWriteCombined(const uint8_t* source, uint64_t size, Sink&& sink) {
-	alignas(64) std::array<uint8_t, 4096 + 128> lines {};
+	// Written by the line loop below before sink() sees it; zero-filling 4 KiB per call cost about
+	// a third of this function.
+	alignas(64) std::array<uint8_t, 4096 + 128> lines;
 	uint64_t                                    done = 0;
 	while (done < size) {
 		const auto  piece = std::min<uint64_t>(size - done, 4096);

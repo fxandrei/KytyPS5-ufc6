@@ -30,6 +30,12 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+// Changes with every command that can change what a draw's render targets resolve to: every
+// command but draws, shader register writes and index state (see CommandProcessor::ProcessPm4).
+// The draw chain (AbSwitch DRAW_CHAIN) keeps a draw's targets for the next draw while this and
+// the rendering instance stay the same.
+extern uint64_t g_target_state_serial;
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
@@ -112,6 +118,9 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	// Whether a rendering instance is open, and a number that changes whenever one begins or ends.
+	[[nodiscard]] bool     IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] uint64_t RenderingSerial() const noexcept { return m_rendering_serial; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -142,8 +151,9 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
+	mutable bool        m_rendering        = false;
+	mutable uint64_t    m_rendering_serial = 0;
+	HW::Context*        m_registers        = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
 
@@ -214,6 +224,12 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+	// The targets of the previous draw, for a draw that changes none of what they depend on (see
+	// TargetMemo in renderDraw.cpp, AbSwitch DRAW_CHAIN).
+	[[nodiscard]] bool TakeTargetMemo(CommandBuffer& buffer, DrawRenderState& state);
+	[[nodiscard]] bool TargetMemoBound(const DrawRenderState& state) const;
+	void KeepTargetMemo(CommandBuffer& buffer, const DrawRenderState& state,
+	                    const RenderState& rendering, vk::ImageAspectFlags feedback_aspects);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
