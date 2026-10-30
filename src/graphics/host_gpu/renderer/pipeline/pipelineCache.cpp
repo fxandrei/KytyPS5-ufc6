@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -28,6 +29,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -884,6 +886,57 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 	auto&             ctx = command.GetRegisters();
 
+	// The previous draw's pipeline for a draw with its targets: the key is half a kilobyte to
+	// clear, fill, hash and probe, and consecutive draws mostly use the same pipeline (Bruno
+	// Cardenas Torres 9153daf18). KYTY_VERIFY_PIPELINE_KEEP=1 builds the key anyway and exits if
+	// the kept pipeline is not the one the key finds.
+	static const bool keep_verify = std::getenv("KYTY_VERIFY_PIPELINE_KEEP") != nullptr;
+	Pipeline*         kept        = nullptr;
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::DRAW_CHAIN_PIPELINE) && state.target_memo &&
+	    m_last_graphics_inputs.valid && m_last_graphics_pipeline != nullptr &&
+	    m_last_graphics_inputs.state_serial == g_target_state_serial &&
+	    m_last_graphics_inputs.topology == state.topology &&
+	    m_last_graphics_inputs.primitive_restart == state.primitive_restart_enable &&
+	    m_last_graphics_inputs.pixel_active == ps_active && m_last_graphics_inputs.mesh == mesh &&
+	    m_last_graphics_inputs.patch_points ==
+	        (tessellation ? static_cast<uint32_t>(vs_input_info.tess.input_control_points) : 0u) &&
+	    (!ps_active || (m_last_graphics_inputs.alpha_source == ps_input_info.alpha_blend_source &&
+	                    m_last_graphics_inputs.sample_shading == ps_input_info.ps_sample_shading))) {
+		const auto&             last = m_last_graphics_key;
+		std::array<uint64_t, 4> ids {};
+		for (uint32_t i = 0; i < stages.size(); i++) {
+			ids[i] = stages[i] != nullptr ? stages[i]->id : 0;
+		}
+		bool same = last.stage_ids == ids;
+		if (same && !mesh) {
+			const auto& input = last.vertex_input;
+			same              = input.binding_count == vs_input_info.buffers_num &&
+			       input.attribute_count == vs_input_info.resources_num;
+			for (int i = 0; i < vs_input_info.buffers_num && same; i++) {
+				const auto& buffer = vs_input_info.buffers[i];
+				same               = input.bindings[i].stride == buffer.stride &&
+				       input.bindings[i].instance == (buffer.fetch_index != 0);
+			}
+			for (int i = 0; i < vs_input_info.resources_num && same; i++) {
+				const auto binding = vs_input_info.resources_dst[i].buffer_index;
+				same = binding >= 0 && binding < vs_input_info.buffers_num &&
+				       input.attributes[i].binding == static_cast<uint8_t>(binding) &&
+				       input.attributes[i].offset ==
+				           static_cast<uint32_t>(vs_input_info.resources[i].Base48() -
+				                                 vs_input_info.buffers[binding].addr);
+			}
+		} else if (same) {
+			same = last.vertex_input.binding_count == 0 && last.vertex_input.attribute_count == 0;
+		}
+		if (same) {
+			if (!keep_verify) [[likely]] {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawChainPipeKept);
+				return *m_last_graphics_pipeline;
+			}
+			kept = m_last_graphics_pipeline;
+		}
+	}
+
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
 	GraphicsPipelineKey key {};
@@ -1042,6 +1095,24 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
+	if (kept != nullptr && kept != &pipeline) [[unlikely]] {
+		EXIT("pipeline keep: the kept pipeline is not the one its key finds\n");
+	}
+	m_last_graphics_key      = key;
+	m_last_graphics_pipeline = &pipeline;
+	m_last_graphics_inputs   = {.state_serial      = g_target_state_serial,
+	                            .topology          = state.topology,
+	                            .primitive_restart = state.primitive_restart_enable,
+	                            .pixel_active      = ps_active,
+	                            .mesh              = mesh,
+	                            .patch_points      = tessellation
+	                                                     ? static_cast<uint32_t>(
+	                                                           vs_input_info.tess.input_control_points)
+	                                                     : 0u,
+	                            .alpha_source   = ps_active ? ps_input_info.alpha_blend_source
+	                                                        : ShaderAlphaBlendSource::None,
+	                            .sample_shading = ps_active && ps_input_info.ps_sample_shading,
+	                            .valid          = true};
 	if (!inserted) {
 		return pipeline;
 	}

@@ -173,7 +173,7 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 	    "thread1,"
 	    "thread1_pct,thread2,thread2_pct,"
 	    "thread3,thread3_pct,record_packets,record_mb,record_drains,record_direct,record_sleeps,"
-	    "draw_chain_taken\n",
+	    "draw_chain_taken,draw_chain_dyn_kept,draw_chain_pipe_kept\n",
 	    file);
 	const char*              ab_file = std::getenv("KYTY_AB_FILE");
 	uint64_t                 ab      = Common::AbSwitch::Mask();
@@ -278,7 +278,8 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		std::fprintf(file, ",%.0f,%.1f,%.0f,%.0f,%.0f", rate(Counter::RecordStreamPackets),
 		             rate(Counter::RecordStreamBytes) / 1e6, rate(Counter::RecordStreamDrains),
 		             rate(Counter::RecordStreamDirectCalls), rate(Counter::RecordStreamSleeps));
-		std::fprintf(file, ",%.0f", rate(Counter::DrawChainTaken));
+		std::fprintf(file, ",%.0f,%.0f,%.0f", rate(Counter::DrawChainTaken),
+		             rate(Counter::DrawChainDynKept), rate(Counter::DrawChainPipeKept));
 		std::fputc('\n', file);
 		std::fflush(file);
 		// The variant applies from the next row on, so every row measures a single variant.

@@ -67,18 +67,36 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		                         Common::DebugCounters::Counter::GpuThreadWaitNs);
 		// The command processor mostly waits here for a few hundred microseconds of GPU work
 		// that reads back what a shader just wrote; polling the timeline avoids the wake-up
-		// latency of a blocking wait (AbSwitch SPIN_GPU_WAIT, up to 2 ms).
+		// latency of a blocking wait (AbSwitch SPIN_GPU_WAIT, up to 2 ms). Every poll is a driver
+		// call and a clock read: polled every eight rounds of pauses, it stays within ~20 us of the
+		// GPU while costing an eighth of the calls (AbSwitch SPIN_GPU_WAIT_TUNE).
 		if (Common::AbSwitch::Enabled(Common::AbSwitch::SPIN_GPU_WAIT)) {
 			const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
-			do {
-				for (int i = 0; i < 16; i++) {
-					_mm_pause();
-				}
-				Refresh();
-				if (IsFree(tick)) {
-					return;
-				}
-			} while (std::chrono::steady_clock::now() < deadline);
+			if (Common::AbSwitch::Enabled(Common::AbSwitch::SPIN_GPU_WAIT_TUNE)) {
+				uint32_t      polls = 0;
+				constexpr int PauseRounds = 128;
+				do {
+					for (int i = 0; i < PauseRounds; i++) {
+						_mm_pause();
+					}
+					if ((polls++ & 7u) == 0) {
+						Refresh();
+						if (IsFree(tick)) {
+							return;
+						}
+					}
+				} while (std::chrono::steady_clock::now() < deadline);
+			} else {
+				do {
+					for (int i = 0; i < 16; i++) {
+						_mm_pause();
+					}
+					Refresh();
+					if (IsFree(tick)) {
+						return;
+					}
+				} while (std::chrono::steady_clock::now() < deadline);
+			}
 		}
 	}
 	auto result = m_graphics.device.waitSemaphores(&wait_info,

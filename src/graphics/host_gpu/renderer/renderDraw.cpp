@@ -443,6 +443,42 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 #endif
 }
 
+// KYTY_VERIFY_DYNAMIC_KEEP=1: a draw that keeps the recorded dynamic state records it anyway, and
+// exits if that would have changed anything.
+static bool VerifyDynamicKeep() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_DYNAMIC_KEEP") != nullptr;
+	return enabled;
+}
+
+static bool SameDynamicState(const DynamicState& a, const DynamicState& b) {
+	return a.num_viewports == b.num_viewports && a.viewports == b.viewports &&
+	       a.num_scissors == b.num_scissors && a.scissors == b.scissors &&
+	       a.depth_test_enabled == b.depth_test_enabled &&
+	       a.depth_write_enabled == b.depth_write_enabled &&
+	       a.depth_compare_op == b.depth_compare_op &&
+	       a.depth_bounds_test_enabled == b.depth_bounds_test_enabled &&
+	       a.depth_bounds_min == b.depth_bounds_min &&
+	       a.depth_bounds_max == b.depth_bounds_max &&
+	       a.depth_bias_enabled == b.depth_bias_enabled &&
+	       a.depth_bias_constant == b.depth_bias_constant &&
+	       a.depth_bias_clamp == b.depth_bias_clamp &&
+	       a.depth_bias_slope == b.depth_bias_slope &&
+	       a.stencil_test_enabled == b.stencil_test_enabled &&
+	       a.stencil_front_ops == b.stencil_front_ops &&
+	       a.stencil_back_ops == b.stencil_back_ops &&
+	       a.stencil_front_reference == b.stencil_front_reference &&
+	       a.stencil_back_reference == b.stencil_back_reference &&
+	       a.stencil_front_write_mask == b.stencil_front_write_mask &&
+	       a.stencil_back_write_mask == b.stencil_back_write_mask &&
+	       a.stencil_front_compare_mask == b.stencil_front_compare_mask &&
+	       a.stencil_back_compare_mask == b.stencil_back_compare_mask &&
+	       a.cull_mode == b.cull_mode && a.front_face == b.front_face &&
+	       a.blend_constants == b.blend_constants &&
+	       a.num_color_write_enables == b.num_color_write_enables &&
+	       a.color_write_enables == b.color_write_enables &&
+	       a.line_width == b.line_width && a.feedback_loop_aspects == b.feedback_loop_aspects;
+}
+
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
@@ -1410,8 +1446,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
-	                           rendering);
+	// A draw that took the previous draw's targets, with the same last pre-rasterization stage and
+	// no command since that could have changed a context register, would record the same values:
+	// working them out (sixteen viewports and scissors, a dozen other values) was 3% of the GPU
+	// thread in the fork's GPU Jungle (Bruno Cardenas Torres dc7524760).
+	// KYTY_VERIFY_DYNAMIC_KEEP=1 records anyway and exits on a difference.
+	const bool dynamic_kept =
+	    state.target_memo && dynamic_state.recorded_module == vertex_stages.back().stage.module &&
+	    dynamic_state.recorded_serial == g_target_state_serial &&
+	    dynamic_state.recorded_rendering == buffer.RenderingSerial() &&
+	    Common::AbSwitch::Enabled(Common::AbSwitch::DRAW_CHAIN_DYNAMIC);
+	if (!dynamic_kept) {
+		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+		                           rendering);
+	} else {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawChainDynKept);
+		if (VerifyDynamicKeep()) [[unlikely]] {
+			const auto before = dynamic_state;
+			UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(),
+			                           state.depth_info, rendering);
+			if (!SameDynamicState(before, dynamic_state)) {
+				EXIT("dynamic keep: the kept dynamic state differs from the one recorded now\n");
+			}
+		}
+	}
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
@@ -1437,6 +1495,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!target_memo_taken) {
 		KeepTargetMemo(buffer, state, rendering, feedback_aspects);
 	}
+	// The values above are what this command buffer now has for this program, these registers and
+	// this rendering instance. Recorded after BeginRendering because the pass serial only names the
+	// open instance afterwards: recording before it would cost one recompute per pass.
+	dynamic_state.recorded_module    = vertex_stages.back().stage.module;
+	dynamic_state.recorded_serial    = g_target_state_serial;
+	dynamic_state.recorded_rendering = buffer.RenderingSerial();
 	auto& bound = m_context.GetCommandScheduler().GetDynamicState().bound_graphics_pipeline;
 	if (bound != pipeline.pipeline ||
 	    !Common::AbSwitch::Enabled(Common::AbSwitch::PIPELINE_BIND_DEDUPE)) {
@@ -1549,6 +1613,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	Common::AbSwitch::DelayProbe();
+	// A chained compute dispatch's barrier belongs before anything this draw records (AbSwitch
+	// COMPUTE_CHAIN; the draw reads what the dispatch wrote).
+	m_context.GetCommandScheduler().FlushDeferredShaderAccessBarrier(
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
@@ -1657,6 +1725,9 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	Common::AbSwitch::DelayProbe();
+	// A chained compute dispatch's barrier belongs before anything this draw records.
+	m_context.GetCommandScheduler().FlushDeferredShaderAccessBarrier(
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}

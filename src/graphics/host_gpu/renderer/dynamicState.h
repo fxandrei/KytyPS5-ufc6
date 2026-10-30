@@ -14,6 +14,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+struct ShaderModule;
 
 struct StencilOps {
 	vk::StencilOp fail_op {};
@@ -106,6 +107,9 @@ struct DynamicState {
 		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
 		bound_graphics_pipeline = nullptr;
 		bound_compute_pipeline  = nullptr;
+		recorded_module         = nullptr;
+		recorded_serial         = 0;
+		recorded_rendering      = 0;
 	}
 
 	/// The graphics pipeline that the command buffer has bound (AbSwitch PIPELINE_BIND_DEDUPE).
@@ -113,6 +117,14 @@ struct DynamicState {
 	/// The compute pipeline that guest dispatches bound (AbSwitch COMPUTE_BIND_DEDUPE). Code that
 	/// binds another compute pipeline into the scheduler's command buffer resets it.
 	vk::Pipeline bound_compute_pipeline = nullptr;
+	// What the values above were last worked out from (AbSwitch DRAW_CHAIN_DYNAMIC; see
+	// UpdateGraphicsDynamicState and ExecutePreparedDraw): the last pre-rasterization stage's
+	// module, g_target_state_serial then, and the rendering instance the values were recorded in.
+	// A draw that finds the same three would record nothing. Invalidate() clears them, so the first
+	// draw of a new command buffer always records.
+	const ShaderModule* recorded_module    = nullptr;
+	uint64_t            recorded_serial    = 0;
+	uint64_t            recorded_rendering = 0;
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

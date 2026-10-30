@@ -260,6 +260,26 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
+	// The last pipeline this cache returned and the key it was found or built with, plus what that
+	// key was built from besides the registers and the targets (AbSwitch DRAW_CHAIN_PIPELINE;
+	// Bruno Cardenas Torres 9153daf18). A draw that took the previous draw's targets with the same
+	// target-state serial and these inputs has the same key, and takes the pipeline without
+	// zeroing, filling and hashing one.
+	struct LastGraphicsInputs {
+		uint64_t               state_serial      = 0;
+		vk::PrimitiveTopology  topology {};
+		bool                   primitive_restart = false;
+		bool                   pixel_active      = false;
+		bool                   mesh             = false;
+		uint32_t               patch_points     = 0;
+		ShaderAlphaBlendSource alpha_source     = ShaderAlphaBlendSource::None;
+		bool                   sample_shading   = false;
+		bool                   valid            = false;
+	};
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
+	LastGraphicsInputs  m_last_graphics_inputs;
+
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
 	GraphicContext&                        m_graphics;

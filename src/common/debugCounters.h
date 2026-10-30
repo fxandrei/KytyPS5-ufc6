@@ -87,7 +87,9 @@ enum class Counter {
 	RecordStreamDirectCalls, // Calls that drained and ran on the caller: a missing hook.
 	RecordStreamSleeps,      // Times the consumer slept.
 	// The draw chain (AbSwitch DRAW_CHAIN).
-	DrawChainTaken, // Draws that took the previous draw's render targets.
+	DrawChainTaken,   // Draws that took the previous draw's render targets.
+	DrawChainDynKept, // ... whose dynamic state the previous draw's record covered (bit 46).
+	DrawChainPipeKept, // ... that took the previous pipeline without building its key (bit 47).
 	Count
 };
 

@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include <algorithm>
 #include <array>
@@ -228,6 +229,27 @@ void CommandScheduler::EndRendering() {
 void CommandScheduler::Flush() {
 	SubmitInfo submit;
 	Flush(submit);
+}
+
+void CommandScheduler::DeferShaderAccessBarrier() {
+	m_deferred_shader_access = true;
+}
+
+void CommandScheduler::FlushDeferredShaderAccessBarrier(bool full) {
+	if (!m_deferred_shader_access) {
+		return;
+	}
+	m_deferred_shader_access = false;
+	if (m_command.IsInvalid()) {
+		return;
+	}
+	EndRendering();
+	if (full) {
+		GuestFlushBarrier(m_command.Handle());
+	} else {
+		ShaderAccessBarrier(m_command.Handle(), vk::PipelineStageFlagBits::eComputeShader);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFlushBarriers);
 }
 
 void CommandScheduler::FlushUrgent() {
@@ -715,6 +737,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                                   vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0,
 		                                   nullptr, 0, nullptr);
 	}
+	// A chained dispatch's access barrier belongs before the end of this command buffer.
+	FlushDeferredShaderAccessBarrier(!Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
 	if (m_gpu_timer_query != UINT32_MAX) {
 		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
 		                                  m_gpu_timer_pool, m_gpu_timer_query + 1);

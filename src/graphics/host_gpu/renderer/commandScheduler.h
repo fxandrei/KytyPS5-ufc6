@@ -50,6 +50,15 @@ public:
 	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
+	// A compute dispatch deferred its post-dispatch ShaderAccessBarrier (AbSwitch COMPUTE_CHAIN):
+	// consecutive dispatches are ordered by one barrier at the end of the run.
+	void DeferShaderAccessBarrier();
+	// Records the pending deferred barrier on the current command buffer, if any. `full` selects a
+	// GuestFlushBarrier (AbSwitch BARRIER_LITE off) instead of the narrow compute one.
+	void FlushDeferredShaderAccessBarrier(bool full);
+	[[nodiscard]] bool HasDeferredShaderAccessBarrier() const noexcept {
+		return m_deferred_shader_access;
+	}
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
@@ -226,6 +235,9 @@ private:
 	bool                                      m_flush_after_record    = false;
 	uint32_t                                  m_pop_calls             = 0; // AbSwitch LAZY_GPU_POLL
 	uint64_t                                  m_last_verify_tick = UINT64_MAX; // KYTY_VERIFY_RECORD
+	// A chained compute dispatch left its access barrier for the next sync point (AbSwitch
+	// COMPUTE_CHAIN): submitted before the command buffer ends.
+	bool m_deferred_shader_access = false;
 };
 
 } // namespace Libs::Graphics

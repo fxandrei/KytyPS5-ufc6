@@ -278,6 +278,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	Common::AbSwitch::DelayProbe();
+	// A chained dispatch's barrier belongs before anything this one records.
+	m_context.GetCommandScheduler().FlushDeferredShaderAccessBarrier(
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -393,9 +396,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                }) ||
 	    has_storage_writes;
 	// Emulated LDS and GDS live in buffers every such dispatch shares, so those stay serialized.
+	const bool lds_shared = bindings.shared_memory.buffer != nullptr || program.info.uses_gds;
+	const bool chain =
+	    Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) && !lds_shared && !async_compute;
 	const bool guest_ordered = Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS) &&
-	                           bindings.shared_memory.buffer == nullptr && !program.info.uses_gds;
-	if (has_storage_writes && !guest_ordered) {
+	                           !Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) &&
+	                           !lds_shared;
+	if (has_storage_writes && !guest_ordered && !chain) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -501,18 +508,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	if (!guest_ordered) {
+	if (chain) {
+		scheduler.DeferShaderAccessBarrier();
+	} else if (!guest_ordered) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	ResetBindings();
 }
 
 void RenderExecutor::GuestFlush() {
-	if (!Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS)) {
-		return;
-	}
 	auto& scheduler = m_context.GetCommandScheduler();
 	if (!scheduler.Active()) {
+		return;
+	}
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN)) {
+		// The chained dispatches' policy owns the guest sync points: flush the one deferred
+		// barrier (full unless BARRIER_LITE) only if a dispatch left one.
+		scheduler.FlushDeferredShaderAccessBarrier(
+		    !Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
+		return;
+	}
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS)) {
 		return;
 	}
 	scheduler.EndRendering();
@@ -530,6 +546,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	Common::AbSwitch::DelayProbe();
+	// A chained dispatch's barrier belongs before anything this one records.
+	m_context.GetCommandScheduler().FlushDeferredShaderAccessBarrier(
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
 	vk::DispatchIndirectCommand args {};
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
@@ -574,9 +593,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
+	const bool lds_shared = bindings.shared_memory.buffer != nullptr || program.info.uses_gds;
+	const bool chain =
+	    Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) && !lds_shared && !async_compute;
 	const bool guest_ordered = Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS) &&
-	                           bindings.shared_memory.buffer == nullptr && !program.info.uses_gds;
-	if (has_storage_writes && !guest_ordered) {
+	                           !Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) &&
+	                           !lds_shared;
+	if (has_storage_writes && !guest_ordered && !chain) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};

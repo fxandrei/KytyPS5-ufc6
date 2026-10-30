@@ -662,20 +662,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !(Common::AbSwitch::Enabled(Common::AbSwitch::UPLOAD_PRECHECK) &&
-	      m_memory_tracker.IsUploaded(vaddr, size)) &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
-		const auto alignment = std::max<uint64_t>(
-		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
-		if (mapped != nullptr) {
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+	if (!is_written && size <= CACHING_PAGESIZE) {
+		// One pass over the regions for the three questions the fast path used to ask separately.
+		const auto region = m_memory_tracker.QueryRegionState(vaddr, size);
+		if (region.cpu_modified && !region.gpu_modified) {
+			const auto alignment = std::max<uint64_t>(
+			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+			auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+			if (mapped != nullptr) {
+				if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+					EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				}
+				m_stream_buffer.Commit();
+				return {&m_stream_buffer, offset};
 			}
-			m_stream_buffer.Commit();
-			return {&m_stream_buffer, offset};
 		}
 	}
 

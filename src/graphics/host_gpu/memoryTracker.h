@@ -136,6 +136,38 @@ public:
 		return true;
 	}
 
+	struct RegionState {
+		bool cpu_modified = false;
+		bool gpu_modified = false;
+	};
+	// The two dirty tests in one pass, one lock per region: a small read binding asked the same
+	// bitsets three times (IsUploaded, IsRegionGpuModified, IsRegionCpuModified). A region created
+	// here starts CPU-dirty, as IsRegionCpuModified would make it.
+	[[nodiscard]] RegionState QueryRegionState(uint64_t vaddr, uint64_t size) {
+		CheckNotInUploadCallback();
+		ValidateRange(vaddr, size);
+		RegionState state;
+		uint64_t    remaining = size;
+		uint64_t    index     = vaddr / TRACKER_REGION_SIZE;
+		uint64_t    offset    = vaddr % TRACKER_REGION_SIZE;
+		while (remaining != 0) {
+			const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+			auto*      manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				manager = GetOrCreateRegion(index);
+			}
+			{
+				std::scoped_lock lock(manager->lock);
+				state.cpu_modified |= manager->template IsModified<DirtySource::Cpu>(offset, bytes);
+				state.gpu_modified |= manager->template IsModified<DirtySource::Gpu>(offset, bytes);
+			}
+			remaining -= bytes;
+			offset = 0;
+			index++;
+		}
+		return state;
+	}
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;

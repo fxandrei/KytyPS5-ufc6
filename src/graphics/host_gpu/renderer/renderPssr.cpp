@@ -1,3 +1,4 @@
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
@@ -40,6 +41,9 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
+	// PSSR reads what the chained compute dispatches wrote (AbSwitch COMPUTE_CHAIN).
+	m_context.GetCommandScheduler().FlushDeferredShaderAccessBarrier(
+	    !Common::AbSwitch::Enabled(Common::AbSwitch::BARRIER_LITE));
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
 	std::copy_n(request.input, 8, input_descriptor.fields);
 	std::copy_n(request.output, 8, output_descriptor.fields);

@@ -208,6 +208,24 @@ inline constexpr uint32_t EOP_IRQ_AT_CP = 42;
 // is open; that draw then skips resolving registers and acquiring the targets again (Bruno
 // Cardenas Torres 28073f9ed; the same design is in the private UFC 6 build, KYTY_DRAW_CHAIN).
 inline constexpr uint32_t DRAW_CHAIN = 45;
+// A draw that took the previous draw's render targets (DRAW_CHAIN), with the same last
+// pre-rasterization stage and no command since that could have changed a context register, keeps
+// the dynamic state the previous draw recorded instead of working out sixteen viewports and
+// scissors and a dozen values to record nothing (Bruno Cardenas Torres dc7524760).
+inline constexpr uint32_t DRAW_CHAIN_DYNAMIC = 46;
+// A draw with the previous draw's targets and target-state serial, the same stages and the same
+// vertex input layout, topology and pixel input takes the previous pipeline without zeroing,
+// filling and hashing its half-kilobyte key (Bruno Cardenas Torres 9153daf18).
+inline constexpr uint32_t DRAW_CHAIN_PIPELINE = 47;
+// Within SPIN_GPU_WAIT, the GPU timeline is polled every eight rounds of pauses: each poll is a
+// driver call and a clock read, and the wait is for hundreds of microseconds of GPU work.
+inline constexpr uint32_t SPIN_GPU_WAIT_TUNE = 49;
+// Consecutive compute dispatches are ordered by one deferred ShaderAccessBarrier instead of a
+// pre-write hazard and a post-dispatch access barrier around each dispatch (private UFC 6 build).
+inline constexpr uint32_t COMPUTE_CHAIN = 50;
+// At a guest release/acquire point, flush the deferred compute barrier only, and only if one is
+// pending, instead of a full all-commands GuestFlushBarrier (only meaningful with COMPUTE_CHAIN).
+inline constexpr uint32_t BARRIER_LITE = 51;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {
