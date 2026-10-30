@@ -781,6 +781,30 @@ void PerformanceOverlayRecordDepthTarget(uint32_t width, uint32_t height) noexce
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
 	EnsurePerfCsv();
+	// KYTY_FPS_LOG=1: the guest's flip rate once a second, with no counters, no panel and no CSV
+	// (the panel and the CSV both turn every counter and the per-buffer GPU timers on, so this is
+	// how the release's real rate, and the overlay's own cost, are measured).
+	static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	if (fps_log) {
+		static std::atomic<uint32_t> window_flips {0};
+		static std::atomic<int64_t>  window_start {0};
+		const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                        Clock::now().time_since_epoch())
+		                        .count();
+		if (window_start.load(std::memory_order_relaxed) == 0) {
+			window_start.store(now_ns, std::memory_order_relaxed);
+		}
+		const auto flips = window_flips.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto start = window_start.load(std::memory_order_relaxed);
+		if (now_ns - start >= 1'000'000'000) {
+			const auto seconds = static_cast<double>(now_ns - start) / 1e9;
+			std::printf("Kyty FPS: %.2f (%u flips in %.0f ms)\n",
+			            static_cast<double>(flips) / seconds, flips, seconds * 1000.0);
+			std::fflush(stdout);
+			window_flips.store(0, std::memory_order_relaxed);
+			window_start.store(now_ns, std::memory_order_relaxed);
+		}
+	}
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}

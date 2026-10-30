@@ -3,7 +3,7 @@
 **Windows x64 binary release of the `KytyPS5-ufc6` fork.**
 Built from the `ufc6-perf` branch of
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6), on top of upstream
-KytyPS5 `4919fdb6` (2026-10-30). Source tag for this build: **`ufc6-v20261030`**.
+KytyPS5 `4919fdb6` (2026-10-30). Source tag for this build: **`ufc6-v20261031`**.
 
 This is **not** an official KytyPS5 release. It is a community fork focused on EA SPORTS UFC 6
 (`PPSA23566`, v01.005.000), distributed under **GPL-2.0-only**. It contains no game files.
@@ -20,7 +20,7 @@ the frame takes 30-32 ms.
 | Area | Change | Measured effect |
 |---|---|---|
 | Command recording | The GPU thread's Vulkan commands are deep-copied into a ring and recorded on the submit thread, which also submits in order (`RECORD_THREAD`, bit 37). | In-fight A/B over 16 pairs: **+18% FPS and +19% draws/s** (25.7 -> 30.8 FPS). ~895k packets/s, ~155 MB/s, zero direct calls/drains in the fight. |
-| Draw chain | A draw keeps the previous draw's resolved render targets while no command that could change them ran and the same rendering instance is open; it then skips resolving the registers and acquiring the targets again (`DRAW_CHAIN`, bit 45). | **+2-3%** in-fight A/B (median ratio 1.023-1.029, faster in 69-75% of pairs). About 56% of the fight's draws take the previous targets (~79k of ~142k draws/s). |
+| Draw chain | A draw keeps the previous draw's resolved render targets while no command that could change them ran and the same rendering instance is open; it then skips resolving the registers and acquiring the targets again (`DRAW_CHAIN`, bit 45). The next draw also keeps the previous dynamic state (viewports, scissors, depth/stencil/blend state) and pipeline when its stages, targets and register state are unchanged (bits 46/47). | **+2-3%** in-fight A/B for the targets (median ratio 1.023-1.029, faster in 69-75% of pairs); the dynamic-state and pipeline keeps add ~1-3% of work/s. About 56% of the fight's draws take the previous targets (~80k of ~142k draws/s), and ~99% of those keep the state too. |
 | Submission and readback | Queued submits, urgent submit, eager flushes, lazy GPU polling, spin-before-wait, direct readback through the resizable BAR, per-range write ticks, labels written in command order. | Cumulative; removes most of the CPU-side wait for short GPU readbacks. |
 | Caching and deduplication | Image pool, target/texture/LRU memos, shader map cache, image start index, exact draw state, pipeline/compute bind deduplication. | Cumulative; the command processor spends less time on repeated lookups and binds. |
 | Stability | Render-area clamp, depth-copy clamp at 1080p, depth-target recreation, HTile/stencil ownership fixes. | Fixes the `3D WIDTH ZT Violation` TDR in long fights and the 1080p device loss from the depth copy; also the fighter-select blocks/green screen. |
@@ -28,7 +28,7 @@ the frame takes 30-32 ms.
 | PS5 Pro | Decoder fixes for the `--trinity` path. | Experimental only; the Pro path still renders black 3D scenes. Leave it off. |
 | Diagnostics | A/B mask (`KYTY_AB`), per-second CSV, record-thread and draw-chain counters in the performance panel/CSV. | For testing; the CSV and overlay are off by default, and the counters are cheap. |
 
-The cumulative result on the test machine is **about 31-33 FPS standing at the start of the fight**
+The cumulative result on the test machine is **about 30-33 FPS standing at the start of the fight**
 with a 1080p internal render and a 4K output. Details in [Performance](#performance).
 
 The performance changes above are individual A/B switches in `src/common/abSwitch.h`. The ones that
@@ -151,10 +151,10 @@ line option. If you start `kyty_emulator.exe` directly, pass `--game-patch _Patc
 yourself. Delete the file (or disable the entry in the launcher's **Cheats (experimental)** dialog)
 to disable it.
 
-**Why it is needed.** UFC 6 advances at most **25 ms of game time per rendered frame**. At 31-33 FPS
+**Why it is needed.** UFC 6 advances at most **25 ms of game time per rendered frame**. At 30-33 FPS
 a frame takes 30-32 ms, so without the patch the fight would run at about **0.78-0.83x** real time;
 at 24 FPS it runs at 0.61x. The patch hooks the game's frame-sync code and, when a frame takes
-longer than 25 ms, scales the gameplay step by `elapsed / 25 ms`. At 31-33 FPS the scale is about
+longer than 25 ms, scales the gameplay step by `elapsed / 25 ms`. At 30-33 FPS the scale is about
 1.2-1.3, so the round clock advances in real time. At 40 FPS or more the patch is a no-op.
 
 **The 100 ms catch-up.** The elapsed time used for the scale is capped at **100 ms**, not 50 ms.
@@ -199,7 +199,7 @@ Windows 11, current NVIDIA driver:
 
 | Scene | FPS (median) | Notes |
 |---|---|---|
-| Fight, standing at the start | **31-33** | ~4,400 draws/frame; the number this release targets. |
+| Fight, standing at the start | **30-33** | ~4,400 draws/frame; the number this release targets. |
 | Fight, ground/clinch | 40-48 | Fewer draws; the command processor is less loaded. |
 | Main menus | 50-60 | The game caps the menu at 30 Hz; with vblank 120 the emulator presents 60. |
 | Title screen | 60 | Not representative of the fight. |
@@ -208,10 +208,17 @@ Windows 11, current NVIDIA driver:
 Expect **±5-8% between fights**: the AI fights differently and the camera cuts change the draw
 count. Differences of 1-2% are noise unless measured A/B in the same fight.
 
+These numbers are with the **performance panel and the Tracy profiler off**. The panel (or
+`KYTY_PERF_CSV`) turns every debug counter and the per-command-buffer GPU timestamps on; measured
+in the same fight it costs a few percent. For a recording, press **F2** to hide it (that also turns
+the counters off) or leave **Show performance panel** off in the launcher. Set the environment
+variable `KYTY_FPS_LOG=1` to print the real flip rate once per second in the console without any
+counter, panel or CSV.
+
 This is a **CPU-bound** result, not a GPU-bound one. The GPU is busy about 16-17 ms per frame while
 the frame takes 30-32 ms; the command processor is the limit. A faster GPU will not move the fight
 much; a CPU with a large cache (9800X3D class) does. 60 FPS in the standing phases is not reached by
-this build; 31-33 FPS is the realistic result at these settings.
+this build; 30-33 FPS is the realistic result at these settings.
 
 The **25 ms** in this document is the game's gameplay simulation cap (see
 [The game-speed patch](#the-game-speed-patch)), not a frame-rate cap. The fight itself asks for
@@ -223,7 +230,7 @@ time, waits included. In the fight the internal buffer sits around **1920x1080**
 1600x900); the 3840x2160 output is an upscale of that. Do not expect native 4K pixels, and raising
 the screen resolution alone will not add detail that the game is not rendering.
 
-If you see about 27-28 FPS instead of 31-33, check, in this order: the GPU is in **P0**, the shader
+If you see about 27-28 FPS instead of 30-33, check, in this order: the GPU is in **P0**, the shader
 cache is warm (not the first run), the performance panel and Tracy profiler are off, the game-speed
 patch is applied, and you are on the latest build. A cold cache or P3 alone explains the difference.
 
@@ -261,7 +268,7 @@ patch is applied, and you are on the latest build. A cold cache or P3 alone expl
 ## Troubleshooting
 
 - **Stutter for minutes, then smooth:** shader cache warm-up; let it finish and restart.
-- **FPS lower than 31-33:** check P0, warm cache, overlays off, patch applied, no background
+- **FPS lower than 30-33:** check P0, warm cache, overlays off, patch applied, no background
   memory pressure; see [Performance](#performance).
 - **Fight feels slow:** the game-speed patch is missing or did not match the game version. Check
   `_Patches/PPSA23566.json` is next to `kyty_launcher.exe`, the game is v01.005.000, and the log
@@ -287,7 +294,7 @@ KytyPS5 is free software under the **GNU General Public License version 2 only**
 The full text is in **`LICENSE`** at the root of the zip.
 
 **Source availability.** The complete corresponding source for this binary is the public tag
-**`ufc6-v20261030`** in
+**`ufc6-v20261031`** in
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6). GitHub also attaches
 `Source code (zip)` and `Source code (tar.gz)` to the release page. Those archives contain the
 repository at the tag; the `3rdparty` submodules are pinned by `.gitmodules` to specific commits and
