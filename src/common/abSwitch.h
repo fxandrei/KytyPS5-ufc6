@@ -18,7 +18,7 @@ inline constexpr uint64_t    UNSET = uint64_t {1} << 63u;
 inline std::atomic<uint64_t> g_mask {UNSET};
 
 // The switches that measured faster and showed no problem: FLIP_RUNAHEAD, CP_READ_BACKING,
-// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, SKIP_DRAW_CHECKS, EAGER_FLUSH_COARSE, IMAGE_POOL,
+// SRT_READ_BACKING, LABEL_IN_ORDER, EAGER_FLUSH, EAGER_FLUSH_COARSE, IMAGE_POOL,
 // QUEUED_SUBMIT, DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
 // PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
 // DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO, TEXTURE_INFO_MEMO,
@@ -27,7 +27,7 @@ inline std::atomic<uint64_t> g_mask {UNSET};
 [[nodiscard]] constexpr uint64_t Bit(uint32_t bit) noexcept {
 	return uint64_t {1} << bit;
 }
-inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit(6) | Bit(7) |
+inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit(6) |
                                          Bit(8) | Bit(9) | Bit(10) | Bit(11) | Bit(13) | Bit(14) |
                                          Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) |
                                          Bit(22) | Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) |
@@ -79,9 +79,10 @@ inline constexpr uint32_t GUEST_BARRIERS = 5;
 // (checked every 16 recorded draws or dispatches) or after 256 of them, so recording and GPU
 // execution overlap instead of alternating at the sync points.
 inline constexpr uint32_t EAGER_FLUSH = 6;
-// CommitBindings skips its per-draw proof that the scalar reads behind a shader specialization do
-// not overlap image, attachment or shader-buffer writes. The proof only exits on a violation.
-inline constexpr uint32_t SKIP_DRAW_CHECKS = 7;
+// Bit 7 was SKIP_DRAW_CHECKS (the per-draw proof that scalar specialization reads do not overlap
+// image, attachment or shader-buffer writes). Upstream eb3cb472 removed the proof and its
+// BufferResource::write_extent entirely (the shader is now written so the reads are exact), so the
+// bit is reserved and unused.
 // EAGER_FLUSH checks every 64 recorded draws or dispatches instead of 16: fewer and larger
 // submits when the GPU is waiting for the command processor (each submit costs the driver
 // about 13 us of CPU in the fight). Together with EARLY_FLUSH_WRITERS, which spends those submits
