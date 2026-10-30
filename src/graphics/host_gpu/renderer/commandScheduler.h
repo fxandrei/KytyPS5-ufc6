@@ -81,6 +81,10 @@ public:
 	// far (a no-op without a stream). Call from a thread that does not record before taking the
 	// queue lock, like the presenter's RenderDoc capture.
 	void DrainGpuCommands();
+	// The record stream's consumer thread id, or 0 when no stream runs (AbSwitch OWN_CORES).
+	[[nodiscard]] uint32_t RecordThreadId() const noexcept {
+		return m_stream != nullptr ? m_record_thread_id.load(std::memory_order_relaxed) : 0;
+	}
 
 	// Diagnostics while the counters are on: GPU time of the commands recorded between the two
 	// calls, added to `counter` once their tick completes. Ends rendering first.
@@ -197,6 +201,7 @@ private:
 	std::deque<QueuedSubmit>     m_submit_queue;
 	bool                         m_submit_busy = false;
 	std::jthread                 m_submit_thread; // Started by the first queued submit.
+	std::atomic<uint32_t>        m_record_thread_id {0}; // The stream consumer (OWN_CORES).
 	// Deferred recording (AbSwitch RECORD_THREAD): the GPU thread's commands and submits,
 	// recorded and submitted in order by the submit thread (see CommandStream).
 	std::unique_ptr<CommandStream> m_stream;

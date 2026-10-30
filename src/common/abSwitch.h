@@ -22,7 +22,8 @@ inline std::atomic<uint64_t> g_mask {UNSET};
 // QUEUED_SUBMIT, DIRECT_READBACK, BDA_SYNC_PER_SUBMIT, LAZY_GPU_POLL, BDA_SYNC_WRITE_RANGES,
 // PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
 // DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO, TEXTURE_INFO_MEMO,
-// EXACT_DRAW_STATE, COMPUTE_BIND_DEDUPE, RANGE_WRITE_TICKS, SHADER_MAP_CACHE and IMAGE_START_INDEX.
+// EXACT_DRAW_STATE, COMPUTE_BIND_DEDUPE, RANGE_WRITE_TICKS, SHADER_MAP_CACHE, IMAGE_START_INDEX,
+// RECORD_THREAD, DRAW_CHAIN, DRAW_CHAIN_DYNAMIC, DRAW_CHAIN_PIPELINE and SPIN_GPU_WAIT_TUNE.
 // KYTY_AB=0 turns them all off.
 [[nodiscard]] constexpr uint64_t Bit(uint32_t bit) noexcept {
 	return uint64_t {1} << bit;
@@ -31,7 +32,8 @@ inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit
                                          Bit(8) | Bit(9) | Bit(10) | Bit(11) | Bit(13) | Bit(14) |
                                          Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) |
                                          Bit(22) | Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) |
-                                         Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37) | Bit(45);
+                                         Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37) | Bit(45) |
+                                         Bit(46) | Bit(47) | Bit(49);
 
 // The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
 [[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
@@ -217,8 +219,12 @@ inline constexpr uint32_t DRAW_CHAIN_DYNAMIC = 46;
 // vertex input layout, topology and pixel input takes the previous pipeline without zeroing,
 // filling and hashing its half-kilobyte key (Bruno Cardenas Torres 9153daf18).
 inline constexpr uint32_t DRAW_CHAIN_PIPELINE = 47;
-// Within SPIN_GPU_WAIT, the GPU timeline is polled every eight rounds of pauses: each poll is a
-// driver call and a clock read, and the wait is for hundreds of microseconds of GPU work.
+// One physical core for the GPU command-processor thread and a second for the record-stream
+// consumer, every other thread of the process off both (corePlacement.cpp; KYTY_GPU_CORE and
+// KYTY_RECORD_CORE pick the logical processors, 0 = no second core).
+inline constexpr uint32_t OWN_CORES = 48;
+// Within SPIN_GPU_WAIT, the GPU timeline is polled every four pauses instead of every sixteen:
+// the thread has nothing else to do while it waits, and the looser poll lost 3% (it woke later).
 inline constexpr uint32_t SPIN_GPU_WAIT_TUNE = 49;
 // Consecutive compute dispatches are ordered by one deferred ShaderAccessBarrier instead of a
 // pre-write hazard and a post-dispatch access barrier around each dispatch (private UFC 6 build).

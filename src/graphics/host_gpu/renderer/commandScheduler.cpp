@@ -24,6 +24,13 @@
 #include <unordered_map>
 #include <utility>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
+
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
@@ -857,11 +864,15 @@ void CommandScheduler::DrainGpuCommands() {
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
 	if (m_stream != nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		m_record_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
 		if (Common::AbSwitch::Enabled(Common::AbSwitch::GPU_THREAD_PRIORITY) &&
 		    !Common::AbSwitch::Enabled(Common::AbSwitch::RESERVE_CORE)) {
 			Common::CorePlacement::SetCurrentThreadAboveNormal(true);
 		}
 		m_stream->Consume(stop);
+		m_record_thread_id.store(0, std::memory_order_relaxed);
 		return;
 	}
 	for (;;) {

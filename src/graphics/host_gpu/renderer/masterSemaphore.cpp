@@ -73,17 +73,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		if (Common::AbSwitch::Enabled(Common::AbSwitch::SPIN_GPU_WAIT)) {
 			const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
 			if (Common::AbSwitch::Enabled(Common::AbSwitch::SPIN_GPU_WAIT_TUNE)) {
-				uint32_t      polls = 0;
-				constexpr int PauseRounds = 128;
 				do {
-					for (int i = 0; i < PauseRounds; i++) {
+					for (int i = 0; i < 4; i++) {
 						_mm_pause();
 					}
-					if ((polls++ & 7u) == 0) {
-						Refresh();
-						if (IsFree(tick)) {
-							return;
-						}
+					Refresh();
+					if (IsFree(tick)) {
+						return;
 					}
 				} while (std::chrono::steady_clock::now() < deadline);
 			} else {

@@ -435,16 +435,38 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
-	bool core_reserved = false;
-	bool boosted       = false;
+	bool     core_reserved = false;
+	bool     own_cores     = false;
+	uint32_t own_record    = 0;
+	bool     boosted       = false;
 	for (;;) {
-		if (const bool reserve = Common::AbSwitch::Enabled(Common::AbSwitch::RESERVE_CORE);
-		    reserve != core_reserved) {
-			Common::CorePlacement::SetReserved(reserve);
-			core_reserved = reserve;
+		// AbSwitch OWN_CORES takes precedence over RESERVE_CORE: the GPU thread and the record
+		// stream's consumer each get a physical core (the id appears once the consumer starts).
+		const bool     own = Common::AbSwitch::Enabled(Common::AbSwitch::OWN_CORES);
+		const uint32_t record_id =
+		    own ? gpu->m_renderer.GetCommandScheduler().RecordThreadId() : 0;
+		if (own != own_cores || (own && record_id != own_record)) {
+			if (own) {
+				if (core_reserved) {
+					Common::CorePlacement::SetReserved(false);
+					core_reserved = false;
+				}
+				Common::CorePlacement::SetOwnCores(true, record_id);
+			} else {
+				Common::CorePlacement::SetOwnCores(false, 0);
+			}
+			own_cores  = own;
+			own_record = record_id;
+		}
+		if (!own) {
+			if (const bool reserve = Common::AbSwitch::Enabled(Common::AbSwitch::RESERVE_CORE);
+			    reserve != core_reserved) {
+				Common::CorePlacement::SetReserved(reserve);
+				core_reserved = reserve;
+			}
 		}
 		if (const bool boost = Common::AbSwitch::Enabled(Common::AbSwitch::GPU_THREAD_PRIORITY);
-		    boost != boosted && !core_reserved) {
+		    boost != boosted && !core_reserved && !own) {
 			Common::CorePlacement::SetCurrentThreadAboveNormal(boost);
 			boosted = boost;
 		}
