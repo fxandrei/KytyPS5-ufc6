@@ -627,6 +627,25 @@ void CommandScheduler::EndGpuScope(uint32_t scope, Common::DebugCounters::Counte
 
 // A wait of several seconds is a GPU hang or a deadlock. With KYTY_GPU_SHADERS the timer pairs
 // around each draw and dispatch show which one the GPU started and has not finished.
+void CommandScheduler::RecordRecentSubmit(uint64_t tick, uint32_t op, uint64_t submit_id) {
+	std::lock_guard lock(m_recent_submit_mutex);
+	m_recent_submits.push_back({tick, op, submit_id});
+	while (m_recent_submits.size() > 64) {
+		m_recent_submits.pop_front();
+	}
+}
+
+std::optional<CommandScheduler::RecentSubmit> CommandScheduler::FindRecentSubmit(
+    uint64_t tick) const {
+	std::lock_guard lock(m_recent_submit_mutex);
+	for (auto it = m_recent_submits.rbegin(); it != m_recent_submits.rend(); ++it) {
+		if (it->tick == tick) {
+			return *it;
+		}
+	}
+	return std::nullopt;
+}
+
 void CommandScheduler::ReportStall(uint64_t tick) {
 	// Not Refresh(): it exits on a lost device, which is when this report matters most.
 	uint64_t finished = 0;
@@ -677,8 +696,14 @@ void CommandScheduler::ReportStall(uint64_t tick) {
 		if (started && ended) {
 			last_done = name;
 		} else if (started) {
-			std::printf("GPU stall: started, not finished: %s (tick %" PRIu64 ")\n", name,
+			std::printf("GPU stall: started, not finished: %s (tick %" PRIu64 ")", name,
 			            timer.tick);
+			if (timer.counter == Common::DebugCounters::Counter::GpuBusyNs) {
+				if (const auto recent = FindRecentSubmit(timer.tick); recent.has_value()) {
+					std::printf(" op=%u submit=%" PRIu64, recent->op, recent->submit_id);
+				}
+			}
+			std::printf("\n");
 			if (++reported == 8) break;
 		}
 	}
@@ -801,6 +826,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
+		RecordRecentSubmit(tick, m_command.m_debug_op, m_command.m_debug_submit_id);
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -897,6 +923,7 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 }
 
 void CommandScheduler::SubmitQueuedJob(const QueuedSubmit& job) {
+	RecordRecentSubmit(job.tick, job.debug_op, job.debug_submit);
 	// KYTY_VERIFY_RECORD: the consumer submits in packet order, so its ticks increase. (The
 	// direct branch allocates its ticks after draining, so a strict +1 does not always hold.)
 	static const bool verify_ticks = [] {

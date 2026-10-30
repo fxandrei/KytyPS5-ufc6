@@ -219,6 +219,18 @@ private:
 	};
 	[[nodiscard]] uint32_t AllocateGpuTimer();
 	void                   DumpGpuMarkers();
+	// The last submitted command buffers, for the stall report: a command buffer that started and
+	// never finished is named by its tick, and this says what it was (draw, dispatch, submit).
+	struct RecentSubmit {
+		uint64_t tick      = 0;
+		uint32_t op        = 0; // CommandBufferDebugOp
+		uint64_t submit_id = 0;
+	};
+	void                                      RecordRecentSubmit(uint64_t tick, uint32_t op,
+	                                                             uint64_t submit_id);
+	[[nodiscard]] std::optional<RecentSubmit> FindRecentSubmit(uint64_t tick) const;
+	mutable std::mutex                        m_recent_submit_mutex;
+	std::deque<RecentSubmit>                  m_recent_submits;
 
 	static constexpr uint32_t GPU_TIMER_QUERIES = 16384;
 	vk::QueryPool             m_gpu_timer_pool;
