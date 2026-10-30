@@ -169,7 +169,10 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		}
 	}
 
-	// Capture boundaries follow presentation and exclude concurrent queue access.
+	// Capture boundaries follow presentation and exclude concurrent queue access. The record
+	// stream's consumer needs the queue lock to submit, so wait for everything recorded so far
+	// first (never while holding the lock).
+	renderer.GetCommandScheduler().DrainGpuCommands();
 	Common::LockGuard render_lock(renderer.GetMutex());
 	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 	if (state == RenderDocState::Requested) {

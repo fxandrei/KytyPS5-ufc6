@@ -2,8 +2,10 @@
 
 #include "common/abSwitch.h"
 #include "common/assert.h"
+#include "common/corePlacement.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -14,6 +16,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -427,6 +430,17 @@ CommandBuffer& CommandScheduler::Current() {
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	// Only the GPU thread routes: BufferCache's constructor (BeginCommand + Fill on the main
+	// thread) and the shutdown Finish stay direct. With RECORD_THREAD off the GPU thread stays
+	// the stream's owner with a null buffer, so its direct calls drain what the stream holds.
+	if (m_stream != nullptr && GuestGpu::IsGpuThread()) {
+		const bool routed = Common::AbSwitch::Enabled(Common::AbSwitch::RECORD_THREAD);
+		if (routed) {
+			EXIT_IF(!RecordingHooksInstalled());
+		}
+		m_stream->Route(routed ? m_command.m_buffer : VK_NULL_HANDLE);
+		MarkCommandHookThread();
+	}
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	StartGpuTimer();
@@ -591,6 +605,12 @@ void CommandScheduler::ReportStall(uint64_t tick) {
 	std::printf("GPU stall: still waiting for tick %" PRIu64 "; the GPU finished tick %" PRIu64
 	            ", recording tick %" PRIu64 "\n",
 	            tick, finished, CurrentTick());
+	if (m_stream != nullptr) {
+		std::printf("GPU stall: record stream: %" PRIu64 " of %" PRIu64 " bytes recorded, "
+		            "consumer %s\n",
+		            m_stream->ReadBytes(), m_stream->WrittenBytes(),
+		            m_stream->ConsumerSleeping() ? "sleeping" : "running");
+	}
 	if (m_graphics.checkpoints_enabled) {
 		std::vector<vk::CheckpointDataNV> checkpoints;
 		{
@@ -706,6 +726,27 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	// With the record stream, every submit without semaphores goes through it: its packets are
+	// submitted in tick order by the submit thread. An urgent flush (DIRECT_URGENT_SUBMIT) also
+	// pushes and wakes: the consumer is spinning. RECORD_URGENT_DIRECT selects the drain plus
+	// direct submit below, for A/B.
+	const bool stream_submit =
+	    m_stream != nullptr && submit.num_wait_semaphores == 0 &&
+	    submit.num_signal_semaphores == 0 &&
+	    (!m_direct_submit || !Common::AbSwitch::Enabled(Common::AbSwitch::RECORD_URGENT_DIRECT));
+	if (stream_submit) {
+		// The tick is allocated at push time, so ticks follow the push order.
+		tick = m_master.NextTick();
+		const QueuedSubmit job {buffer, tick, m_command.m_debug_op, m_command.m_debug_submit_id};
+		m_stream->Route(VK_NULL_HANDLE);
+		m_stream->Push([this, job] { SubmitQueuedJob(job); });
+		m_stream->Wake();
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+		EndGpuTimer(tick);
+		m_recorded_since_submit = 0;
+		m_command.m_buffer      = nullptr;
+		return tick;
+	}
 	if (submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0 && !m_direct_submit &&
 	    Common::AbSwitch::Enabled(Common::AbSwitch::QUEUED_SUBMIT)) {
 		{
@@ -766,7 +807,39 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	return tick;
 }
 
+void CommandScheduler::EnableRecordThread() {
+	// The hooks replace entries of the global dispatcher; install them once the device
+	// dispatcher is initialized (RenderContext construction, after vulkanWindow.cpp's init).
+	InstallCommandHooks();
+	if (CommandRecordingDeferred()) {
+		EXIT_IF(m_stream != nullptr);
+		m_stream = std::make_unique<CommandStream>();
+		// The submit thread records the stream's commands and submits in order; it starts now,
+		// not lazily like the deque submitter. KYTY_VERIFY_RECORD=2 replays each packet inline on
+		// the producer, so no consumer runs.
+		if (!VerifyRecordInline()) {
+			EXIT_IF(m_submit_thread.joinable());
+			m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+		}
+	}
+}
+
+void CommandScheduler::DrainGpuCommands() {
+	if (m_stream != nullptr) {
+		m_stream->Drain();
+	}
+}
+
 void CommandScheduler::SubmitThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	if (m_stream != nullptr) {
+		if (Common::AbSwitch::Enabled(Common::AbSwitch::GPU_THREAD_PRIORITY) &&
+		    !Common::AbSwitch::Enabled(Common::AbSwitch::RESERVE_CORE)) {
+			Common::CorePlacement::SetCurrentThreadAboveNormal(true);
+		}
+		m_stream->Consume(stop);
+		return;
+	}
 	for (;;) {
 		QueuedSubmit job;
 		{
@@ -779,27 +852,7 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 			m_submit_queue.pop_front();
 			m_submit_busy = true;
 		}
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.signalSemaphoreValueCount = 1;
-		timeline_info.pSignalSemaphoreValues    = &job.tick;
-		const auto     semaphore                = m_master.Handle();
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &job.buffer;
-		submit_info.signalSemaphoreCount = 1;
-		submit_info.pSignalSemaphores    = &semaphore;
-		vk::Result result;
-		{
-			Common::LockGuard lock(m_graphics.queue_mutex);
-			result = m_graphics.queue.submit(1, &submit_info, nullptr);
-		}
-		if (result != vk::Result::eSuccess) {
-			ReportStall(job.tick); // A lost device still reports its last checkpoints.
-			ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit, 0,
-			                  0, 0, 0, 0);
-		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		SubmitQueuedJob(job);
 		{
 			std::lock_guard lock(m_submit_mutex);
 			m_submit_busy = false;
@@ -808,7 +861,47 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 	}
 }
 
+void CommandScheduler::SubmitQueuedJob(const QueuedSubmit& job) {
+	// KYTY_VERIFY_RECORD: the consumer submits in packet order, so its ticks increase. (The
+	// direct branch allocates its ticks after draining, so a strict +1 does not always hold.)
+	static const bool verify_ticks = [] {
+		const char* value = std::getenv("KYTY_VERIFY_RECORD");
+		return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "2") == 0);
+	}();
+	if (verify_ticks) {
+		if (m_last_verify_tick != UINT64_MAX) {
+			EXIT_IF(job.tick <= m_last_verify_tick);
+		}
+		m_last_verify_tick = job.tick;
+	}
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.signalSemaphoreValueCount = 1;
+	timeline_info.pSignalSemaphoreValues    = &job.tick;
+	const auto     semaphore                = m_master.Handle();
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.commandBufferCount   = 1;
+	submit_info.pCommandBuffers      = &job.buffer;
+	submit_info.signalSemaphoreCount = 1;
+	submit_info.pSignalSemaphores    = &semaphore;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		result = m_graphics.queue.submit(1, &submit_info, nullptr);
+	}
+	if (result != vk::Result::eSuccess) {
+		ReportStall(job.tick); // A lost device still reports its last checkpoints.
+		ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit, 0, 0,
+		                  0, 0, 0);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
 void CommandScheduler::DrainQueuedSubmits() {
+	// The stream's consumer needs the queue lock to submit, so never drain it under that lock.
+	if (m_stream != nullptr) {
+		m_stream->Drain();
+	}
 	std::unique_lock lock(m_submit_mutex);
 	m_submit_changed.wait(lock, [this] { return m_submit_queue.empty() && !m_submit_busy; });
 }

@@ -27,10 +27,11 @@ inline std::atomic<uint64_t> g_mask {UNSET};
 [[nodiscard]] constexpr uint64_t Bit(uint32_t bit) noexcept {
 	return uint64_t {1} << bit;
 }
-inline constexpr uint64_t DEFAULT_MASK =
-    Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit(6) | Bit(7) | Bit(8) | Bit(9) | Bit(10) | Bit(11) |
-    Bit(13) | Bit(14) | Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) | Bit(22) |
-    Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) | Bit(32) | Bit(33) | Bit(34) | Bit(36);
+inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit(6) | Bit(7) |
+                                         Bit(8) | Bit(9) | Bit(10) | Bit(11) | Bit(13) | Bit(14) |
+                                         Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) |
+                                         Bit(22) | Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) |
+                                         Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37);
 
 // The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
 [[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
@@ -176,6 +177,20 @@ inline constexpr uint32_t DROP_SELECTED_STORES = 35;
 // images starting at the bound address, return at once when none does, instead of walking every
 // image page of the bound range (chenxiao07 fork, 05287b245).
 inline constexpr uint32_t IMAGE_START_INDEX = 36;
+// The GPU thread's Vulkan commands (vkCmd*, descriptor updates, begins, ends and submits) are
+// deep-copied into a ring and recorded by the scheduler's submit thread, which also submits in
+// order (CommandStream, commandHooks.cpp). The NVIDIA driver takes ~16% of the command processor,
+// which this moves to a second thread.
+inline constexpr uint32_t RECORD_THREAD = 37;
+// A/B only: with RECORD_THREAD, a flush that DIRECT_URGENT_SUBMIT would submit on the command
+// processor itself drains the stream and submits directly, instead of pushing through the stream.
+inline constexpr uint32_t RECORD_URGENT_DIRECT = 38;
+// A/B only: CommitBindings hands push constants plus the push-descriptor writes over as one
+// payload call instead of three copied hooked calls (later step).
+inline constexpr uint32_t RECORD_BINDINGS_PAYLOAD = 39;
+// A/B only: the small per-draw copies of CPU-written ranges are made by the recording thread, in
+// order with the commands (later step).
+inline constexpr uint32_t DEFER_GUEST_COPIES = 40;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -12,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -61,6 +63,15 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Installs the Vulkan command hooks and, with AbSwitch RECORD_THREAD (or KYTY_AB_FILE, so the
+	// switch can be toggled inside a run), starts the submit thread that records the GPU thread's
+	// commands through a CommandStream and submits them in order. The device dispatcher must be
+	// initialized (RenderContext construction). Enable before the first Submit().
+	void EnableRecordThread();
+	// Waits until the record stream's consumer has recorded and submitted everything appended so
+	// far (a no-op without a stream). Call from a thread that does not record before taking the
+	// queue lock, like the presenter's RenderDoc capture.
+	void DrainGpuCommands();
 
 	// Diagnostics while the counters are on: GPU time of the commands recorded between the two
 	// calls, added to `counter` once their tick completes. Ends rendering first.
@@ -152,6 +163,10 @@ private:
 		uint64_t          debug_submit = 0;
 	};
 	void SubmitThread(std::stop_token stop);
+	// The submit itself: a timeline signal on the master semaphore and the vkQueueSubmit under
+	// the queue lock, with the lost-device report. Runs on the submit thread (both the deque and
+	// the record stream).
+	void SubmitQueuedJob(const QueuedSubmit& job);
 	// Returns once every queued submit is in the queue, so a direct submit cannot overtake one.
 	void DrainQueuedSubmits();
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -173,6 +188,9 @@ private:
 	std::deque<QueuedSubmit>     m_submit_queue;
 	bool                         m_submit_busy = false;
 	std::jthread                 m_submit_thread; // Started by the first queued submit.
+	// Deferred recording (AbSwitch RECORD_THREAD): the GPU thread's commands and submits,
+	// recorded and submitted in order by the submit thread (see CommandStream).
+	std::unique_ptr<CommandStream> m_stream;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
@@ -207,6 +225,7 @@ private:
 	bool                                      m_direct_submit         = false; // FlushUrgent
 	bool                                      m_flush_after_record    = false;
 	uint32_t                                  m_pop_calls             = 0; // AbSwitch LAZY_GPU_POLL
+	uint64_t                                  m_last_verify_tick = UINT64_MAX; // KYTY_VERIFY_RECORD
 };
 
 } // namespace Libs::Graphics

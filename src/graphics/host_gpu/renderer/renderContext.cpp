@@ -26,6 +26,10 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Runs after VULKAN_HPP_DEFAULT_DISPATCHER.init(device) (vulkanWindow.cpp), and only for the
+	// render scheduler: with AbSwitch RECORD_THREAD, its commands are recorded by the submit
+	// thread. The present scheduler stays plain.
+	m_command_scheduler.EnableRecordThread();
 }
 
 RenderContext::~RenderContext() {
