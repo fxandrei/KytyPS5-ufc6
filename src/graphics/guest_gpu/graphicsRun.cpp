@@ -1182,12 +1182,18 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
 	}
 
-	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
+	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on. With
+	// EOP_IRQ_AT_CP the interrupt is raised here instead: the guest's reads of GPU-written bytes
+	// still wait on their write ticks, so the earlier wake-up cannot expose stale memory.
 	if (interrupt) {
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-		    });
+		if (Common::AbSwitch::Enabled(Common::AbSwitch::EOP_IRQ_AT_CP)) {
+			m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+		} else {
+			GetScheduler().DeferPriorityOperation(
+			    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    });
+		}
 	}
 }
 

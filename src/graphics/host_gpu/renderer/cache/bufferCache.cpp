@@ -862,13 +862,23 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// AbSwitch BUFFER_IDLE_GC: with an idle age the collector runs below the memory trigger too.
+	// Under the trigger the sweep skips GPU-dirty buffers, so only clean, unused ones are freed;
+	// one still needed is created again.
+	static const uint64_t idle_frames = [] {
+		const char* value = std::getenv("KYTY_BUFFER_IDLE_FRAMES");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {60};
+	}();
+	const bool idle_collect =
+	    Common::AbSwitch::Enabled(Common::AbSwitch::BUFFER_IDLE_GC) && idle_frames != 0;
+	if (m_total_used_memory < m_trigger_gc_memory && !idle_collect) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
-	const size_t   limit      = aggressive ? 64 : 32;
+	const uint64_t age =
+	    idle_collect && !aggressive ? idle_frames : std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const size_t limit = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;

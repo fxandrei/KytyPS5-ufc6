@@ -191,6 +191,17 @@ inline constexpr uint32_t RECORD_BINDINGS_PAYLOAD = 39;
 // A/B only: the small per-draw copies of CPU-written ranges are made by the recording thread, in
 // order with the commands (later step).
 inline constexpr uint32_t DEFER_GUEST_COPIES = 40;
+// The buffer cache collects buffers no draw or dispatch used for KYTY_BUFFER_IDLE_FRAMES frames
+// (default 60), whatever the cache holds, not only under memory pressure. Every registered buffer
+// keeps its pages write-tracked; a streaming title leaves thousands of stale ones over memory it
+// rewrites each frame, and each write then faults and each BDA walk uploads and re-protects
+// buffers nothing reads (Cozmaaa fork, 741ad572: +19% in UFC 5 fights).
+inline constexpr uint32_t BUFFER_IDLE_GC = 41;
+// The end-of-pipe interrupt of a RELEASE_MEM is raised on the command processor right after its
+// label write, instead of as a priority operation that waits for the submission's tick (the
+// private UFC 6 build does this). Reads of GPU-written memory still wait on their write ticks,
+// so the guest cannot observe stale bytes; only the wake-up itself moves earlier.
+inline constexpr uint32_t EOP_IRQ_AT_CP = 42;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {
