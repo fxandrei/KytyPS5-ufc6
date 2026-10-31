@@ -3,7 +3,7 @@
 **Windows x64 binary release of the `KytyPS5-ufc6` fork.**
 Built from the `ufc6-perf` branch of
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6), on top of upstream
-KytyPS5 `02618916` (2026-10-31). Source tag for this build: **`ufc6-v20261031c`**.
+KytyPS5 `02618916` (2026-10-31). Source tag for this build: **`ufc6-v20261031d`**.
 
 This is **not** an official KytyPS5 release. It is a community fork focused on EA SPORTS UFC 6
 (`PPSA23566`, v01.005.000), distributed under **GPL-2.0-only**. It contains no game files.
@@ -29,6 +29,7 @@ the frame takes 30-32 ms.
 | PS5 Pro | Decoder fixes for the `--trinity` path. | Experimental only; the Pro path still renders black 3D scenes. Leave it off. |
 | Diagnostics | A/B mask (`KYTY_AB`), per-second CSV, record-thread and draw-chain counters in the performance panel/CSV. | For testing; the CSV and overlay are off by default, and the counters are cheap. |
 | Upstream sync | Ported four of the five upstream commits from 2026-10-31 (`02618916`): an ambiguous compute call-target register becomes a logged skip instead of an abort, shader-store pipelines are created at boot on eight threads, `GET_LOD_STATS` reports proper mip-statistics slots, and HDR10 video-out is tone-mapped to SDR. | No steady-state FPS change. Boot pipeline load 1,253 -> 922 ms; the crash-to-skip change is stability only. The fifth commit (robustBufferAccess2 storage bounds) is deliberately not ported: GPU-side only, and it would invalidate the shader cache. |
+| 4K upscale | `KYTY_FSR=1` replaces the bilinear present blit with a 16-tap Catmull-Rom upscale when the frame is smaller than the output (the 1080p output mode). | Makes the +8.8% 1080p mode visibly sharper at ~0-1% FPS (19.9 vs 20.4 in the same fight). Opt-in; no effect when the source and output sizes match. |
 
 The cumulative result on the test machine is **about 31-34 FPS standing at the start of the fight**
 with a 1080p internal render and a 4K output. Details in [Performance](#performance).
@@ -237,8 +238,10 @@ depth buffer 3840x2160), which is why a 4K fight is slower than the same fight i
 Optional **1080p output mode**: set `KYTY_OUTPUT_1080P=1` in the environment before starting the
 emulator (in `run-ufc6.ps1`). The game then sizes its buffers at 1920x1080 while the window stays
 4K, and the presenter upscales the frame to 3840x2160. Measured in the same 4K fight: **19.8 -> 21.5
-FPS (+8.8%)**, GPU busy 56% -> 45%, GPU waits halved. The image is softer (1080p upscaled); leave it
-off if you want native 4K detail.
+FPS (+8.8%)**, GPU busy 56% -> 45%, GPU waits halved. The default blit is bilinear and looks soft;
+add `KYTY_FSR=1` to replace it with a 16-tap Catmull-Rom upscale. Measured in the same fight:
+**19.9 vs 20.4 FPS (about -0.5%)**, visibly sharper. Both options are opt-in; with `KYTY_FSR` unset,
+or when the source and output sizes match, the blit path is unchanged.
 
 If you see about 28-29 FPS instead of 31-34, check, in this order: the GPU is in **P0**, the shader
 cache is warm (not the first run), the performance panel and Tracy profiler are off, the game-speed
@@ -304,7 +307,7 @@ KytyPS5 is free software under the **GNU General Public License version 2 only**
 The full text is in **`LICENSE`** at the root of the zip.
 
 **Source availability.** The complete corresponding source for this binary is the public tag
-**`ufc6-v20261031c`** in
+**`ufc6-v20261031d`** in
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6). GitHub also attaches
 `Source code (zip)` and `Source code (tar.gz)` to the release page. Those archives contain the
 repository at the tag; the `3rdparty` submodules are pinned by `.gitmodules` to specific commits and
