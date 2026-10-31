@@ -94,6 +94,10 @@ enum class Counter {
 	TargetMemoStructureMiss, // An image was registered or unregistered since the memo was kept.
 	TargetMemoTargetMiss,    // A kept target is unregistered or needs a rebind.
 	TargetMemoStateMiss,     // Different registers, rendering instance, masks, slice or PS state.
+	TargetMemoInvalidMiss,   // No memo from this executor and command buffer yet.
+	TargetMemoSerialMiss,    // A command since changed a register the targets resolve from.
+	TargetMemoRenderingMiss, // No rendering instance is open, or a command since began another.
+	TargetMemoMaskMiss,      // Different attachment mask, slice or pixel-shader state.
 	Count
 };
 

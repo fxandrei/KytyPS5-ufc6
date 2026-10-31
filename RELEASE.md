@@ -195,8 +195,12 @@ stall is kept, so the retry is warmer.
 
 ## Performance
 
-Measured on **Ryzen 7 9800X3D + GeForce RTX 4090**, 3840x2160 output, 1080p internal render,
-Windows 11, current NVIDIA driver:
+Measured on **Ryzen 7 9800X3D + GeForce RTX 4090**, Windows 11, current NVIDIA driver. The A/B
+numbers below use a **1280x720 test window** (the game then renders 1080p internally); the frame cost
+is the command processor's per-draw work, which does not depend on the window size. At a **4K
+output** the game renders its own buffers natively at 3840x2160, which adds GPU work: a heavy fight
+(~5,700 draws/frame) measured **19.8 FPS** that way (GPU 56% busy) and **21.5 FPS** with the optional
+1080p output mode below.
 
 | Scene | FPS (median) | Notes |
 |---|---|---|
@@ -225,11 +229,15 @@ The **25 ms** in this document is the game's gameplay simulation cap (see
 [The game-speed patch](#the-game-speed-patch)), not a frame-rate cap. The fight itself asks for
 60 Hz; the emulator runs as fast as the command processor allows.
 
-The game's **dynamic resolution** (Frostbite DRS) lowers the internal render size when the frame
-time rises. Kyty reports guest GPU timestamps at command-processor time, so DRS reacts to CPU frame
-time, waits included. In the fight the internal buffer sits around **1920x1080** (occasionally
-1600x900); the 3840x2160 output is an upscale of that. Do not expect native 4K pixels, and raising
-the screen resolution alone will not add detail that the game is not rendering.
+The game sizes its internal buffers from the output resolution it is told about. In a 720p/1080p
+window it renders 1080p internally; at a **3840x2160 output it renders natively at 4K** (measured
+depth buffer 3840x2160), which is why a 4K fight is slower than the same fight in a small window.
+
+Optional **1080p output mode**: set `KYTY_OUTPUT_1080P=1` in the environment before starting the
+emulator (in `run-ufc6.ps1`). The game then sizes its buffers at 1920x1080 while the window stays
+4K, and the presenter upscales the frame to 3840x2160. Measured in the same 4K fight: **19.8 -> 21.5
+FPS (+8.8%)**, GPU busy 56% -> 45%, GPU waits halved. The image is softer (1080p upscaled); leave it
+off if you want native 4K detail.
 
 If you see about 28-29 FPS instead of 31-34, check, in this order: the GPU is in **P0**, the shader
 cache is warm (not the first run), the performance panel and Tracy profiler are off, the game-speed

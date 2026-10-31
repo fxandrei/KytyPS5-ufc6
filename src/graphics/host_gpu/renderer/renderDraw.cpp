@@ -971,10 +971,24 @@ bool RenderExecutor::TakeTargetMemo(CommandBuffer& buffer, DrawRenderState& stat
 	if (!Common::AbSwitch::Enabled(Common::AbSwitch::DRAW_CHAIN)) {
 		return false;
 	}
-	if (!memo.valid || memo.owner != this || memo.buffer != &buffer ||
-	    memo.state_serial != g_target_state_serial || !buffer.IsRendering() ||
-	    memo.rendering_serial != buffer.RenderingSerial() || memo.mrt_mask != state.mrt_mask ||
-	    memo.slice_offset != state.slice_offset || memo.ps_active != state.ps_active) {
+	if (!memo.valid || memo.owner != this || memo.buffer != &buffer) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoInvalidMiss);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoStateMiss);
+		return false;
+	}
+	if (memo.state_serial != g_target_state_serial) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoSerialMiss);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoStateMiss);
+		return false;
+	}
+	if (!buffer.IsRendering() || memo.rendering_serial != buffer.RenderingSerial()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoRenderingMiss);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoStateMiss);
+		return false;
+	}
+	if (memo.mrt_mask != state.mrt_mask || memo.slice_offset != state.slice_offset ||
+	    memo.ps_active != state.ps_active) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoMaskMiss);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoStateMiss);
 		return false;
 	}
