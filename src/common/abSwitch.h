@@ -23,7 +23,8 @@ inline std::atomic<uint64_t> g_mask {UNSET};
 // PIPELINE_BIND_DEDUPE, TARGET_LOOKUP_MEMO, SPIN_YIELD, SRT_LOAD_CHECK, SPIN_GPU_WAIT,
 // DIRECT_URGENT_SUBMIT, EARLY_FLUSH_WRITERS, UPLOAD_PRECHECK, LRU_TOUCH_MEMO, TEXTURE_INFO_MEMO,
 // EXACT_DRAW_STATE, COMPUTE_BIND_DEDUPE, RANGE_WRITE_TICKS, SHADER_MAP_CACHE, IMAGE_START_INDEX,
-// RECORD_THREAD, DRAW_CHAIN, DRAW_CHAIN_DYNAMIC, DRAW_CHAIN_PIPELINE and SPIN_GPU_WAIT_TUNE.
+// RECORD_THREAD, DRAW_CHAIN, DRAW_CHAIN_DYNAMIC, DRAW_CHAIN_PIPELINE, SPIN_GPU_WAIT_TUNE and
+// SRT_REFRESH_MEMO.
 // KYTY_AB=0 turns them all off.
 [[nodiscard]] constexpr uint64_t Bit(uint32_t bit) noexcept {
 	return uint64_t {1} << bit;
@@ -33,7 +34,7 @@ inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit
                                          Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) |
                                          Bit(22) | Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) |
                                          Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37) | Bit(45) |
-                                         Bit(46) | Bit(47) | Bit(49);
+                                         Bit(46) | Bit(47) | Bit(49) | Bit(52);
 
 // The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
 [[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
