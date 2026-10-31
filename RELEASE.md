@@ -3,7 +3,7 @@
 **Windows x64 binary release of the `KytyPS5-ufc6` fork.**
 Built from the `ufc6-perf` branch of
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6), on top of upstream
-KytyPS5 `4919fdb6` (2026-10-30). Source tag for this build: **`ufc6-v20261031b`**.
+KytyPS5 `02618916` (2026-10-31). Source tag for this build: **`ufc6-v20261031c`**.
 
 This is **not** an official KytyPS5 release. It is a community fork focused on EA SPORTS UFC 6
 (`PPSA23566`, v01.005.000), distributed under **GPL-2.0-only**. It contains no game files.
@@ -28,6 +28,7 @@ the frame takes 30-32 ms.
 | Game speed | `_Patches/PPSA23566.json` (not code in the emulator). | Removes the game's 25 ms gameplay slow motion below 40 FPS; the 100 ms catch-up covers down to 10 FPS. |
 | PS5 Pro | Decoder fixes for the `--trinity` path. | Experimental only; the Pro path still renders black 3D scenes. Leave it off. |
 | Diagnostics | A/B mask (`KYTY_AB`), per-second CSV, record-thread and draw-chain counters in the performance panel/CSV. | For testing; the CSV and overlay are off by default, and the counters are cheap. |
+| Upstream sync | Ported four of the five upstream commits from 2026-10-31 (`02618916`): an ambiguous compute call-target register becomes a logged skip instead of an abort, shader-store pipelines are created at boot on eight threads, `GET_LOD_STATS` reports proper mip-statistics slots, and HDR10 video-out is tone-mapped to SDR. | No steady-state FPS change. Boot pipeline load 1,253 -> 922 ms; the crash-to-skip change is stability only. The fifth commit (robustBufferAccess2 storage bounds) is deliberately not ported: GPU-side only, and it would invalidate the shader cache. |
 
 The cumulative result on the test machine is **about 31-34 FPS standing at the start of the fight**
 with a 1080p internal render and a 4K output. Details in [Performance](#performance).
@@ -303,12 +304,12 @@ KytyPS5 is free software under the **GNU General Public License version 2 only**
 The full text is in **`LICENSE`** at the root of the zip.
 
 **Source availability.** The complete corresponding source for this binary is the public tag
-**`ufc6-v20261031`** in
+**`ufc6-v20261031c`** in
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6). GitHub also attaches
 `Source code (zip)` and `Source code (tar.gz)` to the release page. Those archives contain the
 repository at the tag; the `3rdparty` submodules are pinned by `.gitmodules` to specific commits and
 are fetched by the build. Keep the repository and the tag public for as long as you distribute the
-binary. The changes relative to upstream are the commits on `ufc6-perf` between upstream `4919fdb6`
+binary. The changes relative to upstream are the commits on `ufc6-perf` between upstream `02618916`
 and this tag; the binary was built from that tag, not from a dirty tree.
 
 **If you redistribute this zip**, you must:
