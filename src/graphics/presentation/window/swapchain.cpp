@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -292,7 +293,7 @@ private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
 	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
-	               const vk::Rect2D& rect);
+	               const vk::Rect2D& rect, uint32_t extra_flags = 0);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -639,6 +640,17 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
+// KYTY_FSR=1 replaces the bilinear present blit with an edge-adaptive (FSR 1.0 EASU) upscale
+// when the source is smaller than the swapchain. The value is read once; a plain bilinear blit
+// remains the default.
+static bool FsrUpscaleEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FSR");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& target) {
 	const uint64_t src_w = std::max(source.width, 1u);
 	const uint64_t src_h = std::max(source.height, 1u);
@@ -655,7 +667,7 @@ static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& targ
 }
 
 void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
-                          const vk::Rect2D& rect) {
+                          const vk::Rect2D& rect, uint32_t extra_flags) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -761,7 +773,7 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
 	                       (frame.hdr ? 4u : 0u) |
 	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
-	                       (layer.bus == 0 ? 16u : 0u);
+	                       (layer.bus == 0 ? 16u : 0u) | extra_flags;
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -795,15 +807,27 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	if (GpuCheckpointsEnabled()) {
 		MarkGpuCheckpoint(vk_command, "present");
 	}
-	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
-	const bool blit_source     = source != nullptr && !convert_source;
-	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
+	const bool convert_source = source != nullptr && source->hdr && !m_hdr_active;
+	const bool draw_overlay   = overlay.frame != nullptr;
+
+	const auto* aspect_source = source != nullptr ? source : overlay.frame;
+	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
+	                               ? FitAspect(aspect_source->image.extent, m_extent)
+	                               : vk::Rect2D {{0, 0}, m_extent};
+	// Upscale a smaller non-HDR source instead of bilinear blitting it; HDR/PQ sources keep the
+	// existing HDR10-to-SDR conversion path.
+	const bool upscale_source = FsrUpscaleEnabled() && source != nullptr && !source->hdr &&
+	                            !convert_source &&
+	                            (source->image.extent.width < game_rect.extent.width ||
+	                             source->image.extent.height < game_rect.extent.height);
+	const bool blit_source     = source != nullptr && !convert_source && !upscale_source;
+	const bool draw_attachment = convert_source || upscale_source || draw_overlay ||
+	                             draw_system_overlay;
 	if (blit_source) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
 	}
-	if (convert_source) {
+	if (convert_source || upscale_source) {
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
 	}
@@ -830,10 +854,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
-	const auto* aspect_source = source != nullptr ? source : overlay.frame;
-	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
-	                               ? FitAspect(aspect_source->image.extent, m_extent)
-	                               : vk::Rect2D {{0, 0}, m_extent};
 	if (source == nullptr || game_rect.extent != m_extent) {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -905,6 +925,13 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		};
 		if (convert_source) {
 			DrawLayer(vk_command, {source, 0, false}, game_rect);
+			if (draw_overlay || draw_system_overlay) {
+				attachment_barrier();
+			}
+		}
+		if (upscale_source) {
+			// Opaque upscale: alpha 1 and premultiplied off, so the output is the filtered source.
+			DrawLayer(vk_command, {source, 0, false}, game_rect, 32u);
 			if (draw_overlay || draw_system_overlay) {
 				attachment_barrier();
 			}

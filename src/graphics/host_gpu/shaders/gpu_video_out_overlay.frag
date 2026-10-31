@@ -29,33 +29,41 @@ void main() {
 }
 #else
 #include "gpu_video_out_hdr10_to_sdr.inc"
+#include "gpu_fsr_easu.inc"
 
 layout(location = 0) in vec2 uv;
 layout(binding = 0) uniform sampler2D source;
 layout(push_constant) uniform AlphaControl {
-	uint flags; // bit 0: premultiplied, 1: HDR target, 2: PQ source, 3: linear source, 4: opaque
+	uint flags; // bit 0: premultiplied, 1: HDR target, 2: PQ source, 3: linear source, 4: opaque, 5: upscale
 };
 
 void main() {
 	const uint HDR_TARGET = 2u;
 	const uint PQ_SOURCE = 4u;
-	vec4 sampled = texture(source, uv);
-	if ((flags & 16u) != 0u) {
-		sampled.a = 1.0;
-	}
-	bool premultiplied = (flags & 1u) != 0u;
-	uint conversion = flags & (HDR_TARGET | PQ_SOURCE);
-	bool convert = conversion == HDR_TARGET || conversion == PQ_SOURCE;
-	if (convert && premultiplied) {
-		sampled.rgb = sampled.a > 0.0 ? sampled.rgb / sampled.a : vec3(0.0);
-	}
-	if (conversion == HDR_TARGET) {
-		sampled.rgb = SdrToHdr10(sampled.rgb, (flags & 8u) != 0u);
-	} else if (conversion == PQ_SOURCE) {
-		sampled.rgb = Hdr10ToSdr(sampled.rgb, (flags & 8u) != 0u);
-	}
-	if (!premultiplied || convert) {
-		sampled.rgb *= sampled.a;
+	const uint UPSCALE = 32u;
+	vec4 sampled;
+	if ((flags & UPSCALE) != 0u) {
+		// Opaque edge-adaptive upscale: the filtered source is the output, alpha 1.
+		sampled = vec4(FsrEasu(source, uv, vec2(textureSize(source, 0))), 1.0);
+	} else {
+		sampled = texture(source, uv);
+		if ((flags & 16u) != 0u) {
+			sampled.a = 1.0;
+		}
+		bool premultiplied = (flags & 1u) != 0u;
+		uint conversion = flags & (HDR_TARGET | PQ_SOURCE);
+		bool convert = conversion == HDR_TARGET || conversion == PQ_SOURCE;
+		if (convert && premultiplied) {
+			sampled.rgb = sampled.a > 0.0 ? sampled.rgb / sampled.a : vec3(0.0);
+		}
+		if (conversion == HDR_TARGET) {
+			sampled.rgb = SdrToHdr10(sampled.rgb, (flags & 8u) != 0u);
+		} else if (conversion == PQ_SOURCE) {
+			sampled.rgb = Hdr10ToSdr(sampled.rgb, (flags & 8u) != 0u);
+		}
+		if (!premultiplied || convert) {
+			sampled.rgb *= sampled.a;
+		}
 	}
 	color = sampled;
 }
