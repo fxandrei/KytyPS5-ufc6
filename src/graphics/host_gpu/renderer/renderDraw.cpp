@@ -968,29 +968,36 @@ static bool VerifyTargetMemo() {
 
 bool RenderExecutor::TakeTargetMemo(CommandBuffer& buffer, DrawRenderState& state) {
 	const auto& memo = g_target_memo;
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::DRAW_CHAIN)) {
+		return false;
+	}
 	if (!memo.valid || memo.owner != this || memo.buffer != &buffer ||
 	    memo.state_serial != g_target_state_serial || !buffer.IsRendering() ||
 	    memo.rendering_serial != buffer.RenderingSerial() || memo.mrt_mask != state.mrt_mask ||
-	    memo.slice_offset != state.slice_offset || memo.ps_active != state.ps_active ||
-	    !Common::AbSwitch::Enabled(Common::AbSwitch::DRAW_CHAIN)) {
+	    memo.slice_offset != state.slice_offset || memo.ps_active != state.ps_active) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoStateMiss);
 		return false;
 	}
 	auto& cache = m_context.GetTextureCache();
 	if (memo.structure_generation != cache.StructureGeneration()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoStructureMiss);
 		return false;
 	}
 	for (uint32_t i = 0; i < memo.color_count; i++) {
 		if (!memo.colors[i].image_id) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoTargetMiss);
 			return false;
 		}
 		const auto& image = cache.m_slot_images[memo.colors[i].image_id];
 		if (!image.registered || image.binding.needs_rebind) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoTargetMiss);
 			return false;
 		}
 	}
 	if (memo.depth.image_id) {
 		const auto& image = cache.m_slot_images[memo.depth.image_id];
 		if (!image.registered || image.binding.needs_rebind) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoTargetMiss);
 			return false;
 		}
 	}

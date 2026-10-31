@@ -90,6 +90,10 @@ enum class Counter {
 	DrawChainTaken,   // Draws that took the previous draw's render targets.
 	DrawChainDynKept, // ... whose dynamic state the previous draw's record covered (bit 46).
 	DrawChainPipeKept, // ... that took the previous pipeline without building its key (bit 47).
+	// Why a draw did not take the previous draw's render targets (DRAW_CHAIN on, memo rejected).
+	TargetMemoStructureMiss, // An image was registered or unregistered since the memo was kept.
+	TargetMemoTargetMiss,    // A kept target is unregistered or needs a rebind.
+	TargetMemoStateMiss,     // Different registers, rendering instance, masks, slice or PS state.
 	Count
 };
 
