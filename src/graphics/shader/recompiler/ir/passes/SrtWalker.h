@@ -83,6 +83,26 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 
+// Scratch byte layout the resource-materialization memo reads (SrtWalker.cpp:153-169): nine DWORDs
+// per descriptor source (eight descriptor words plus the walker's `known` gate), one activity byte
+// per source then per image, padded to eight bytes. WalkedResourceKey is the whole-plan memo key
+// [0, OutputOffset(plan)); it does not cover the flat SRT slots, the walked outputs or the walker's
+// own state, which are all refreshed independently of the memo.
+inline constexpr uint32_t WalkedDescriptorStride = 9u * sizeof(uint32_t);
+
+inline uint32_t WalkedActiveOffset(const ResourcePlan& plan) {
+	return static_cast<uint32_t>(plan.descriptor_sources.size()) * WalkedDescriptorStride;
+}
+
+inline uint32_t WalkedOutputOffset(const ResourcePlan& plan) {
+	const auto active = plan.descriptor_sources.size() + plan.info.images.size();
+	return (WalkedActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
+}
+
+inline std::span<const uint8_t> WalkedResourceKey(const ResourcePlan& plan) {
+	return {reinterpret_cast<const uint8_t*>(plan.srt_scratch.data()), WalkedOutputOffset(plan)};
+}
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>

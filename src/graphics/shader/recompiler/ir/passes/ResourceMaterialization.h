@@ -3,7 +3,23 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <cstdint>
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+// Runtime-only memo of one Program's last successful post-walk materialization (AbSwitch
+// SRT_REFRESH_MEMO, bit 52). The key is the walker scratch bytes [0, OutputOffset(plan)); equal
+// bytes mean an identical resource snapshot and specialization, so the descriptor loops and
+// BuildResourceSpecialization are skipped. Never serialized and never shared across programs.
+struct MaterializationMemo {
+	std::vector<uint8_t> key;          // previous scratch [0, OutputOffset(plan))
+	uint32_t             miss_streak = 0;  // consecutive eligible whole-key misses
+	uint32_t             cooldown    = 0;  // refreshes to skip after a miss streak
+	bool                 valid       = false; // a successful store set the key
+	bool                 reused      = false; // the last refresh was an L1 hit
+	int8_t               eligible    = -1;    // -1 unknown, 0 no, 1 yes
+};
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
 // ResourceSnapshot and therefore do not create shader permutations.
@@ -59,8 +75,12 @@ std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// `memo`, when non-null, skips the post-walk descriptor loops and BuildResourceSpecialization when
+// the walk produced the same scratch bytes as the previous successful refresh (see
+// MaterializationMemo).
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializationMemo* memo = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

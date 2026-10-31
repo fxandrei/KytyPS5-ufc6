@@ -11,6 +11,8 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -1566,8 +1568,39 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// A direct plan's post-walk output depends only on the walker scratch [0, OutputOffset), the
+// uniform-fill outputs (recomputed before the memo check) and static plan metadata. Indirect
+// descriptors read tables, selector keys and image heaps outside that key, so they are ineligible.
+static bool EligibleForMemo(const ResourcePlan& program) {
+	return std::ranges::none_of(program.descriptor_sources, [](const DescriptorSource& source) {
+		return source.indirect_descriptor.has_value();
+	});
+}
+
+static bool SameSnapshot(const ResourceSnapshot& left, const ResourceSnapshot& right) {
+	return left.buffers == right.buffers && left.images == right.images &&
+	       left.samplers == right.samplers && left.flattened_srt == right.flattened_srt &&
+	       left.user_data == right.user_data &&
+	       left.specialization_reads == right.specialization_reads &&
+	       left.uniform_fill == right.uniform_fill;
+}
+
+// After this many consecutive whole-key misses a plan is likely changing every draw; skip the
+// memcmp and the key copy for a while, then retry.
+constexpr uint32_t MemoMissCooldownAfter = 32;
+constexpr uint32_t MemoCooldownRefreshes  = 1024;
+
+const bool g_verify_srt_memo = std::getenv("KYTY_VERIFY_SRT_MEMO") != nullptr;
+
+// The post-walk half of MaterializeResources: turns the walker scratch into the resource snapshot
+// and specialization. `observed` is the capture-wrapped runtime.
+static bool MaterializeWalked(const ResourcePlan& program, const SrtRuntime& observed,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                              MaterializationMemo* memo);
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializationMemo* memo) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1579,6 +1612,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
 	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+		if (memo != nullptr) {
+			memo->valid  = false;
+			memo->reused = false;
+		}
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
@@ -1596,6 +1633,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			break;
 		}
 	}
+	return MaterializeWalked(program, observed, snapshot, specialization, memo);
+}
+
+static bool MaterializeWalked(const ResourcePlan& program, const SrtRuntime& observed,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                              MaterializationMemo* memo) {
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	auto words = fill.fill.words;
@@ -1613,6 +1656,59 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 		snapshot.uniform_fill.bounded_elements = elements;
+	}
+	// L1 whole-plan memo: equal scratch means equal buffers, images, samplers and specialization.
+	// The uniform fill above and flattened_srt / specialization_reads / user_data are refreshed
+	// outside the memo, so a hit still uploads the current scalar SRT data.
+	if (memo != nullptr) {
+		if (memo->cooldown > 0) {
+			--memo->cooldown;
+			memo->valid  = false;
+			memo->reused = false;
+		} else {
+			if (memo->eligible < 0) memo->eligible = EligibleForMemo(program) ? 1 : 0;
+			if (memo->eligible != 0) {
+				if (memo->valid) {
+					const auto key = WalkedResourceKey(program);
+					if (memo->key.size() == key.size() &&
+					    (key.empty() || std::memcmp(memo->key.data(), key.data(), key.size()) == 0)) {
+						snapshot.user_data.assign(observed.user_data.begin(),
+						                          observed.user_data.end());
+						memo->reused      = true;
+						memo->miss_streak = 0;
+						if (g_verify_srt_memo) {
+							ResourceSnapshot      fresh_snapshot;
+							ResourceSpecialization fresh_specialization;
+							fresh_snapshot.flattened_srt        = snapshot.flattened_srt;
+							fresh_snapshot.specialization_reads = snapshot.specialization_reads;
+							if (!MaterializeWalked(program, observed, fresh_snapshot,
+							                       fresh_specialization, nullptr)) {
+								EXIT("SRT memo verify: fresh materialization failed (stage={} "
+								     "hash=0x{:016x})\n",
+								     static_cast<uint32_t>(program.stage), program.shader_hash);
+							}
+							if (!SameSnapshot(fresh_snapshot, snapshot)) {
+								EXIT("SRT memo verify: snapshot mismatch (stage={} hash=0x{:016x})\n",
+								     static_cast<uint32_t>(program.stage), program.shader_hash);
+							}
+							if (fresh_specialization != specialization) {
+								EXIT("SRT memo verify: specialization mismatch (stage={} "
+								     "hash=0x{:016x})\n",
+								     static_cast<uint32_t>(program.stage), program.shader_hash);
+							}
+						}
+						return true;
+					}
+					if (++memo->miss_streak >= MemoMissCooldownAfter) {
+						memo->miss_streak = 0;
+						memo->cooldown    = MemoCooldownRefreshes;
+						memo->key.clear();
+					}
+				}
+				memo->valid  = false;
+				memo->reused = false;
+			}
+		}
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
@@ -1766,8 +1862,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
-	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	snapshot.user_data.assign(observed.user_data.begin(), observed.user_data.end());
+	const bool ok = BuildResourceSpecialization(program, snapshot, specialization);
+	if (ok && memo != nullptr && memo->eligible > 0 && memo->cooldown == 0) {
+		const auto key = WalkedResourceKey(program);
+		memo->key.assign(key.begin(), key.end());
+		memo->valid  = true;
+		memo->reused = false;
+	}
+	return ok;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {

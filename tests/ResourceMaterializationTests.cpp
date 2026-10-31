@@ -1469,10 +1469,138 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+// An immediate buffer descriptor: its descriptor DWORDs do not depend on user data, so a change
+// of user data leaves the walker scratch (and the memo key) unchanged.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan ImmediateBufferPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  AddValueBlock(program);
+  DescriptorSource source;
+  source.dword_count = 4u;
+  source.dwords = {Value(0x8000u), Value(1u << 16u), Value(16u), Value(0u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0u});
+  return Extract(program);
+}
+
+void TestMaterializationMemoHitMiss() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  const std::array<uint32_t, 1> user_a{0x11111111u};
+  const std::array<uint32_t, 1> user_b{0x22222222u};
+
+  ResourceSnapshot reference;
+  ResourceSpecialization reference_specialization;
+  Check(MaterializeResources(plan, {.user_data = user_a}, reference,
+                             reference_specialization),
+        "memo reference materialization failed");
+
+  MaterializationMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // The first memoized refresh is a miss that stores its key.
+  Check(MaterializeResources(plan, {.user_data = user_a}, snapshot, specialization, &memo) &&
+            memo.valid && !memo.reused,
+        "first memoized refresh did not store its key");
+  Check(snapshot.buffers == reference.buffers && specialization == reference_specialization &&
+            snapshot.user_data == reference.user_data,
+        "first memoized refresh differs from the reference");
+
+  // A second identical refresh is an L1 hit that keeps the previous result.
+  Check(MaterializeResources(plan, {.user_data = user_a}, snapshot, specialization, &memo) &&
+            memo.valid && memo.reused,
+        "identical refresh was not an L1 hit");
+  Check(snapshot.buffers == reference.buffers && specialization == reference_specialization,
+        "L1 hit changed the resource snapshot or specialization");
+
+  // A changed descriptor DWORD is an L1 miss that re-evaluates.
+  Check(MaterializeResources(plan, {.user_data = user_b}, snapshot, specialization, &memo) &&
+            memo.valid && !memo.reused && snapshot.buffers[0].dwords[0] == user_b[0],
+        "changed descriptor was not an L1 miss or lost its new value");
+  ResourceSnapshot changed;
+  ResourceSpecialization changed_specialization;
+  Check(MaterializeResources(plan, {.user_data = user_b}, changed, changed_specialization),
+        "changed reference materialization failed");
+  Check(snapshot.buffers == changed.buffers && specialization == changed_specialization,
+        "L1 miss result differs from the reference");
+}
+
+void TestMaterializationMemoUserDataIgnored() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ImmediateBufferPlan();
+  MaterializationMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = std::array<uint32_t, 1>{5u}}, snapshot,
+                             specialization, &memo) &&
+            memo.valid && !memo.reused,
+        "immediate-buffer first refresh did not store its key");
+  // The descriptor does not read user data, so a user-data change is an L1 hit that still
+  // refreshes snapshot.user_data.
+  Check(MaterializeResources(plan, {.user_data = std::array<uint32_t, 1>{9u}}, snapshot,
+                             specialization, &memo) &&
+            memo.valid && memo.reused &&
+            snapshot.user_data == std::vector<uint32_t>{9u},
+        "unused user-data change was not an L1 hit or did not refresh user_data");
+}
+
+void TestMaterializationMemoFailureInvalidates() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  const std::array<uint32_t, 1> user{0x11111111u};
+  MaterializationMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = user}, snapshot, specialization, &memo) &&
+            memo.valid,
+        "memo did not store after a valid refresh");
+  // A failed refresh (too little user data) must clear the memo, so the next valid refresh is a
+  // miss, not a stale hit.
+  Check(!MaterializeResources(plan, {}, snapshot, specialization, &memo),
+        "empty user data did not fail");
+  Check(!memo.valid && !memo.reused, "failed refresh left a valid memo");
+  Check(MaterializeResources(plan, {.user_data = user}, snapshot, specialization, &memo) &&
+            memo.valid && !memo.reused && snapshot.buffers[0].dwords[0] == user[0],
+        "refresh after a failure was not a miss");
+}
+
+void TestMaterializationMemoIndirectIneligible() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  AddValueBlock(program);
+  for (uint32_t i = 0; i < 2; ++i) {
+    DescriptorSource source;
+    source.dword_count = 4u;
+    source.dwords = {Value(0x8000u + i), Value(1u << 16u), Value(16u), Value(0u)};
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource indirect;
+  indirect.dword_count = 4u;
+  indirect.dwords.fill(Value(0u));
+  indirect.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0u, 1u};
+  program.descriptor_sources.push_back(indirect);
+  program.info.buffers.push_back({.source = 2u});
+  auto plan = Extract(program);
+  MaterializationMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // An indirect-descriptor plan must never be memo-eligible (it reads tables and selector keys
+  // outside the walker scratch). Whether the materialization itself succeeds is irrelevant here.
+  (void)MaterializeResources(plan, {}, snapshot, specialization, &memo);
+  Check(memo.eligible == 0, "indirect plan was marked memo-eligible");
+  Check(!memo.reused, "indirect plan reused a memo hit");
+  Check(!memo.valid, "indirect plan stored a memo key");
+}
+
 } // namespace
 
 namespace Common {
-
 int DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
 
 int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
@@ -1510,6 +1638,10 @@ int main() {
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestShaderCacheRecords();
+  TestMaterializationMemoHitMiss();
+  TestMaterializationMemoUserDataIgnored();
+  TestMaterializationMemoFailureInvalidates();
+  TestMaterializationMemoIndirectIneligible();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

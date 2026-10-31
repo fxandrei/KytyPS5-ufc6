@@ -234,6 +234,10 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
+		// SRT materialization memo and the last module a search found (AbSwitch SRT_REFRESH_MEMO).
+		ShaderRecompiler::IR::MaterializationMemo memo;
+		uint32_t                                 last_module      = UINT32_MAX;
+		uint32_t                                 last_push_cursor = UINT32_MAX;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);

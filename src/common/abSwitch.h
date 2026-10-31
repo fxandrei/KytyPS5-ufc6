@@ -232,6 +232,12 @@ inline constexpr uint32_t COMPUTE_CHAIN = 50;
 // At a guest release/acquire point, flush the deferred compute barrier only, and only if one is
 // pending, instead of a full all-commands GuestFlushBarrier (only meaningful with COMPUTE_CHAIN).
 inline constexpr uint32_t BARRIER_LITE = 51;
+// A shader whose resource table walked to the same descriptor bytes as its last refresh reuses
+// the materialized resources, specialization and the last matching module instead of re-decoding
+// every descriptor and re-searching the module list (pipelineCache.cpp, ResourceMaterialization.cpp).
+// Diagnostic only, never on by default: KYTY_VERIFY_SRT_MEMO=1 re-materializes on every reuse and
+// exits on any difference.
+inline constexpr uint32_t SRT_REFRESH_MEMO = 52;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {

@@ -280,18 +280,38 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
+	// Call programs never memoize: their resource plan is refreshed per draw.
+	const bool memo_enabled =
+	    !HasCalls && Common::AbSwitch::Enabled(Common::AbSwitch::SRT_REFRESH_MEMO);
+	if (!memo_enabled) {
+		memo.valid  = false;
+		memo.reused = false;
+	}
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
-	for (auto& candidate: modules) {
+	                                                    specialization,
+	                                                    memo_enabled ? &memo : nullptr));
+	// A whole-plan memo hit with the same push cursor reuses the last module without a search.
+	if (memo.reused && last_module < modules.size() && push_data_cursor == last_push_cursor) {
+		return &modules[last_module];
+	}
+	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
-		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-		        push_data_cursor, layout.ShaderDataDwords()) ||
-		    candidate.specialization != specialization) {
+		return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+		           push_data_cursor, layout.ShaderDataDwords()) &&
+		       candidate.specialization == specialization &&
+		       (!HasCalls || std::ranges::equal(candidate.function_code, FunctionCode()));
+	};
+	// Modules are append-only, so the last match is tried first on the next refresh.
+	if (memo_enabled && last_module < modules.size() && matches(modules[last_module])) {
+		last_push_cursor = push_data_cursor;
+		return &modules[last_module];
+	}
+	for (auto& candidate: modules) {
+		if (!matches(candidate)) {
 			continue;
 		}
-		if constexpr (HasCalls) {
-			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
-		}
+		last_module      = static_cast<uint32_t>(&candidate - modules.data());
+		last_push_cursor = push_data_cursor;
 		return &candidate;
 	}
 	return nullptr;
@@ -329,6 +349,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	EXIT_IF(module.module == nullptr);
+	program.last_module      = static_cast<uint32_t>(program.modules.size() - 1u);
+	program.last_push_cursor = push_data_cursor;
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -449,9 +471,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}).first;
 		auto& program = entry->second;
 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		    program.resource_plan, runtime, program.resources, program.specialization,
+		    program.call_source == nullptr &&
+		            Common::AbSwitch::Enabled(Common::AbSwitch::SRT_REFRESH_MEMO)
+		        ? &program.memo
+		        : nullptr));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		// The plan changed: any memo key and last-module hint are for the old plan.
+		entry->second.memo            = {};
+		entry->second.last_module      = UINT32_MAX;
+		entry->second.last_push_cursor = UINT32_MAX;
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}
