@@ -23,19 +23,68 @@ layout(set = 0, binding = 0) uniform texture2D image;
 layout(set = 1, binding = 0) uniform sampler image_sampler;
 layout(location = 0) in struct { vec4 Color; vec2 UV; } In;
 
+// Bicubic Catmull-Rom upscale: 16 taps, clamped to the source. Much cheaper than the EASU port
+// (which cost ~80 ms/frame at 4K in the first test) and sharper than bilinear.
+vec3 CatmullRomSample(sampler2D src, vec2 uv, vec2 size) {
+	vec2 pos  = uv * size - 0.5;
+	vec2 base = floor(pos);
+	vec2 f    = pos - base;
+	vec4 wx = vec4(-0.5 * f.x + f.x * f.x - 0.5 * f.x * f.x * f.x,
+	               1.0 - 2.5 * f.x * f.x + 1.5 * f.x * f.x * f.x,
+	               0.5 * f.x + 2.0 * f.x * f.x - 1.5 * f.x * f.x * f.x,
+	               -0.5 * f.x * f.x + 0.5 * f.x * f.x * f.x);
+	vec4 wy = vec4(-0.5 * f.y + f.y * f.y - 0.5 * f.y * f.y * f.y,
+	               1.0 - 2.5 * f.y * f.y + 1.5 * f.y * f.y * f.y,
+	               0.5 * f.y + 2.0 * f.y * f.y - 1.5 * f.y * f.y * f.y,
+	               -0.5 * f.y * f.y + 0.5 * f.y * f.y * f.y);
+	ivec2 limit = ivec2(size) - 1;
+	vec3  sum   = vec3(0.0);
+	for (int y = 0; y < 4; ++y) {
+		for (int x = 0; x < 4; ++x) {
+			ivec2 p = clamp(ivec2(base) + ivec2(x - 1, y - 1), ivec2(0), limit);
+			sum += texelFetch(src, p, 0).rgb * wx[x] * wy[y];
+		}
+	}
+	return sum;
+}
+
 void main() {
 	vec4 sampled = In.Color * texture(sampler2D(image, image_sampler), In.UV);
 	color = vec4(SdrToHdr10(sampled.rgb, false), sampled.a);
 }
 #else
 #include "gpu_video_out_hdr10_to_sdr.inc"
-#include "gpu_fsr_easu.inc"
 
 layout(location = 0) in vec2 uv;
 layout(binding = 0) uniform sampler2D source;
 layout(push_constant) uniform AlphaControl {
 	uint flags; // bit 0: premultiplied, 1: HDR target, 2: PQ source, 3: linear source, 4: opaque, 5: upscale
 };
+
+// Bicubic Catmull-Rom upscale: 16 taps, clamped to the source. Much cheaper than the EASU port
+// (which cost ~80 ms/frame at 4K in the first test) and sharper than bilinear.
+vec3 CatmullRomSample(sampler2D src, vec2 uv, vec2 size) {
+	vec2 pos  = uv * size - 0.5;
+	vec2 base = floor(pos);
+	vec2 f    = pos - base;
+	vec4 wx = vec4(-0.5 * f.x + f.x * f.x - 0.5 * f.x * f.x * f.x,
+	               1.0 - 2.5 * f.x * f.x + 1.5 * f.x * f.x * f.x,
+	               0.5 * f.x + 2.0 * f.x * f.x - 1.5 * f.x * f.x * f.x,
+	               -0.5 * f.x * f.x + 0.5 * f.x * f.x * f.x);
+	vec4 wy = vec4(-0.5 * f.y + f.y * f.y - 0.5 * f.y * f.y * f.y,
+	               1.0 - 2.5 * f.y * f.y + 1.5 * f.y * f.y * f.y,
+	               0.5 * f.y + 2.0 * f.y * f.y - 1.5 * f.y * f.y * f.y,
+	               -0.5 * f.y * f.y + 0.5 * f.y * f.y * f.y);
+	ivec2 limit = ivec2(size) - 1;
+	vec3  sum   = vec3(0.0);
+	for (int y = 0; y < 4; ++y) {
+		for (int x = 0; x < 4; ++x) {
+			ivec2 p = clamp(ivec2(base) + ivec2(x - 1, y - 1), ivec2(0), limit);
+			sum += texelFetch(src, p, 0).rgb * wx[x] * wy[y];
+		}
+	}
+	return sum;
+}
 
 void main() {
 	const uint HDR_TARGET = 2u;
@@ -44,7 +93,7 @@ void main() {
 	vec4 sampled;
 	if ((flags & UPSCALE) != 0u) {
 		// Opaque edge-adaptive upscale: the filtered source is the output, alpha 1.
-		sampled = vec4(FsrEasu(source, uv, vec2(textureSize(source, 0))), 1.0);
+		sampled = vec4(CatmullRomSample(source, uv, vec2(textureSize(source, 0))), 1.0);
 	} else {
 		sampled = texture(source, uv);
 		if ((flags & 16u) != 0u) {
