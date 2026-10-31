@@ -3,7 +3,7 @@
 **Windows x64 binary release of the `KytyPS5-ufc6` fork.**
 Built from the `ufc6-perf` branch of
 [fxandrei/KytyPS5-ufc6](https://github.com/fxandrei/KytyPS5-ufc6), on top of upstream
-KytyPS5 `4919fdb6` (2026-10-30). Source tag for this build: **`ufc6-v20261031`**.
+KytyPS5 `4919fdb6` (2026-10-30). Source tag for this build: **`ufc6-v20261031b`**.
 
 This is **not** an official KytyPS5 release. It is a community fork focused on EA SPORTS UFC 6
 (`PPSA23566`, v01.005.000), distributed under **GPL-2.0-only**. It contains no game files.
@@ -21,6 +21,7 @@ the frame takes 30-32 ms.
 |---|---|---|
 | Command recording | The GPU thread's Vulkan commands are deep-copied into a ring and recorded on the submit thread, which also submits in order (`RECORD_THREAD`, bit 37). | In-fight A/B over 16 pairs: **+18% FPS and +19% draws/s** (25.7 -> 30.8 FPS). ~895k packets/s, ~155 MB/s, zero direct calls/drains in the fight. |
 | Draw chain | A draw keeps the previous draw's resolved render targets while no command that could change them ran and the same rendering instance is open; it then skips resolving the registers and acquiring the targets again (`DRAW_CHAIN`, bit 45). The next draw also keeps the previous dynamic state (viewports, scissors, depth/stencil/blend state) and pipeline when its stages, targets and register state are unchanged (bits 46/47). | **+2-3%** in-fight A/B for the targets (median ratio 1.023-1.029, faster in 69-75% of pairs); the dynamic-state and pipeline keeps add ~1-3% of work/s. About 56% of the fight's draws take the previous targets (~80k of ~142k draws/s), and ~99% of those keep the state too. |
+| SRT materialization memo | A shader whose resource table walks to the same descriptor bytes reuses the materialized resources, specialization and the last matching module instead of re-decoding every descriptor and re-searching the module list (`SRT_REFRESH_MEMO`, bit 52). A verifier (`KYTY_VERIFY_SRT_MEMO=1`) re-materializes on every reuse and exits on any difference. | In-fight A/B **1.030** over 10 pairs, faster in 60%. A full fight with the verifier found no difference. |
 | Submission and readback | Queued submits, urgent submit, eager flushes, lazy GPU polling, spin-before-wait, direct readback through the resizable BAR, per-range write ticks, labels written in command order. | Cumulative; removes most of the CPU-side wait for short GPU readbacks. |
 | Caching and deduplication | Image pool, target/texture/LRU memos, shader map cache, image start index, exact draw state, pipeline/compute bind deduplication. | Cumulative; the command processor spends less time on repeated lookups and binds. |
 | Stability | Render-area clamp, depth-copy clamp at 1080p, depth-target recreation, HTile/stencil ownership fixes. | Fixes the `3D WIDTH ZT Violation` TDR in long fights and the 1080p device loss from the depth copy; also the fighter-select blocks/green screen. |
@@ -28,7 +29,7 @@ the frame takes 30-32 ms.
 | PS5 Pro | Decoder fixes for the `--trinity` path. | Experimental only; the Pro path still renders black 3D scenes. Leave it off. |
 | Diagnostics | A/B mask (`KYTY_AB`), per-second CSV, record-thread and draw-chain counters in the performance panel/CSV. | For testing; the CSV and overlay are off by default, and the counters are cheap. |
 
-The cumulative result on the test machine is **about 30-33 FPS standing at the start of the fight**
+The cumulative result on the test machine is **about 31-34 FPS standing at the start of the fight**
 with a 1080p internal render and a 4K output. Details in [Performance](#performance).
 
 The performance changes above are individual A/B switches in `src/common/abSwitch.h`. The ones that
@@ -199,7 +200,7 @@ Windows 11, current NVIDIA driver:
 
 | Scene | FPS (median) | Notes |
 |---|---|---|
-| Fight, standing at the start | **30-33** | ~4,400 draws/frame; the number this release targets. |
+| Fight, standing at the start | **31-34** | ~4,400 draws/frame; the number this release targets. |
 | Fight, ground/clinch | 40-48 | Fewer draws; the command processor is less loaded. |
 | Main menus | 50-60 | The game caps the menu at 30 Hz; with vblank 120 the emulator presents 60. |
 | Title screen | 60 | Not representative of the fight. |
@@ -216,9 +217,9 @@ variable `KYTY_FPS_LOG=1` to print the real flip rate once per second in the con
 counter, panel or CSV.
 
 This is a **CPU-bound** result, not a GPU-bound one. The GPU is busy about 16-17 ms per frame while
-the frame takes 30-32 ms; the command processor is the limit. A faster GPU will not move the fight
+the frame takes 29-32 ms; the command processor is the limit. A faster GPU will not move the fight
 much; a CPU with a large cache (9800X3D class) does. 60 FPS in the standing phases is not reached by
-this build; 30-33 FPS is the realistic result at these settings.
+this build; 31-34 FPS is the realistic result at these settings.
 
 The **25 ms** in this document is the game's gameplay simulation cap (see
 [The game-speed patch](#the-game-speed-patch)), not a frame-rate cap. The fight itself asks for
@@ -230,7 +231,7 @@ time, waits included. In the fight the internal buffer sits around **1920x1080**
 1600x900); the 3840x2160 output is an upscale of that. Do not expect native 4K pixels, and raising
 the screen resolution alone will not add detail that the game is not rendering.
 
-If you see about 27-28 FPS instead of 30-33, check, in this order: the GPU is in **P0**, the shader
+If you see about 28-29 FPS instead of 31-34, check, in this order: the GPU is in **P0**, the shader
 cache is warm (not the first run), the performance panel and Tracy profiler are off, the game-speed
 patch is applied, and you are on the latest build. A cold cache or P3 alone explains the difference.
 
