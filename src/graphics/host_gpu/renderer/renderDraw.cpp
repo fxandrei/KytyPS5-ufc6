@@ -36,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -737,10 +739,238 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
+// Opt-in observation only: no prepared binding or synchronization is ever reused. Keys describe
+// effective guest requests, not SRT hits. Timings sample roughly 1/64 draws; exact key counters
+// include every non-mesh draw. No extra dirty-state query is made: that can allocate a region and
+// warm the memory tracker before ObtainBuffer. plan_ns includes descriptor-size calculation, so
+// repeat_plan_ns is an optimistic bound before memo-key overhead. Vertex calls include empty
+// plans; active_calls/active_*_ns select calls with a non-empty guest range. Clock overhead and
+// the probe's own key/counter work still affect timings; verify FPS with probes off.
+struct VertexIndexProbe {
+	using Clock = std::chrono::steady_clock;
+	struct VertexKey {
+		std::array<uint64_t, PreparedVertexBuffers::MaxBuffers> addresses {};
+		std::array<uint64_t, PreparedVertexBuffers::MaxBuffers> sizes {};
+		uint32_t                                                count = 0;
+		bool operator==(const VertexKey&) const                       = default;
+	};
+	struct IndexKey {
+		uint64_t      address                           = 0;
+		uint64_t      size                              = 0;
+		vk::IndexType type                              = vk::IndexType::eUint16;
+		bool          operator==(const IndexKey&) const = default;
+	};
+	struct ProgramEntry {
+		uint64_t  module_id = 0;
+		uint64_t  last_draw = 0;
+		VertexKey vertex;
+		IndexKey  index;
+		bool      vertex_valid = false;
+		bool      index_valid  = false;
+	};
+	struct Timing {
+		uint64_t calls                       = 0;
+		uint64_t active_calls                = 0;
+		uint64_t plan_ns                     = 0;
+		uint64_t active_plan_ns              = 0;
+		uint64_t obtain_ns                   = 0;
+		uint64_t slots_ns                    = 0;
+		uint64_t active_slots_ns             = 0;
+		uint64_t repeat_plan_ns              = 0;
+		uint64_t repeat_calls                = 0;
+		uint64_t repeat_obtain_ns            = 0;
+		uint64_t ranges                      = 0;
+		uint64_t stream                      = 0;
+		uint64_t repeat_stream               = 0;
+		uint64_t repeat_same_program_calls   = 0;
+		uint64_t repeat_same_program_plan_ns = 0;
+	};
+	struct Window {
+		uint64_t              draws                        = 0;
+		uint64_t              sampled_draws                = 0;
+		uint64_t              vertex_draws                 = 0;
+		uint64_t              vertex_repeat                = 0;
+		uint64_t              index_draws                  = 0;
+		uint64_t              index_repeat                 = 0;
+		uint64_t              host_index_draws             = 0;
+		uint64_t              retry_passes                 = 0;
+		uint64_t              program_cache_hits           = 0;
+		uint64_t              program_cache_misses         = 0;
+		uint64_t              program_cache_evictions      = 0;
+		uint64_t              vertex_same_program_draws    = 0;
+		uint64_t              vertex_same_program_compares = 0;
+		uint64_t              vertex_repeat_same_program   = 0;
+		uint64_t              index_same_program_draws     = 0;
+		uint64_t              index_same_program_compares  = 0;
+		uint64_t              index_repeat_same_program    = 0;
+		std::array<Timing, 4> timings {}; // Vertex/index, then their merge-retry calls.
+	} window;
+	// Stable compiled-module IDs distinguish shader specializations. This is a bounded LRU of
+	// the last key seen per module, so interleaved shaders do not look like compulsory misses.
+	static constexpr size_t                   ProgramCapacity = 64;
+	std::array<ProgramEntry, ProgramCapacity> programs {};
+	ProgramEntry*                             current_program = nullptr;
+	size_t                                    program_count   = 0;
+	uint64_t                                  draw_serial     = 0;
+	VertexKey                                 previous_vertex;
+	IndexKey                                  previous_index;
+	bool                                      vertex_valid               = false;
+	bool                                      index_valid                = false;
+	bool                                      vertex_repeat              = false;
+	bool                                      index_repeat               = false;
+	bool                                      vertex_repeat_same_program = false;
+	bool                                      index_repeat_same_program  = false;
+	bool                                      sampled                    = false;
+	bool                                      retry                      = false;
+	uint32_t                                  sequence                   = 0;
+	Clock::time_point                         window_start               = Clock::now();
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_PROBE_VERTEX_INDEX");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+	static VertexIndexProbe& Get() {
+		thread_local VertexIndexProbe probe;
+		return probe;
+	}
+	static uint64_t Ns(Clock::time_point begin, Clock::time_point end) {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+	}
+	void BeginDraw(uint64_t module_id) {
+		++window.draws;
+		// High bits of a multiplicative sequence avoid sampling the same draw modulo 64.
+		sampled = ((++sequence * uint32_t {0x9e3779b9}) >> 26u) == 0;
+		window.sampled_draws += sampled;
+		retry      = false;
+		auto end   = programs.begin() + program_count;
+		auto entry = std::find_if(programs.begin(), end, [module_id](const ProgramEntry& value) {
+			return value.module_id == module_id;
+		});
+		if (entry != end) {
+			++window.program_cache_hits;
+		} else {
+			++window.program_cache_misses;
+			if (program_count < ProgramCapacity) {
+				entry = programs.begin() + program_count++;
+			} else {
+				++window.program_cache_evictions;
+				entry = std::min_element(programs.begin(), end,
+				                         [](const ProgramEntry& a, const ProgramEntry& b) {
+					                         return a.last_draw < b.last_draw;
+				                         });
+			}
+			*entry           = {};
+			entry->module_id = module_id;
+		}
+		entry->last_draw = ++draw_serial;
+		current_program  = &*entry;
+	}
+	void ObserveVertex(const ShaderVertexInputInfo&                                   info,
+	                   const std::array<uint64_t, PreparedVertexBuffers::MaxBuffers>& sizes) {
+		if (retry) return;
+		VertexKey key;
+		key.count = static_cast<uint32_t>(info.buffers_num);
+		for (uint32_t i = 0; i < key.count; ++i) {
+			// Empty slots always name the null buffer, regardless of their descriptor address.
+			key.addresses[i] = sizes[i] != 0 ? info.buffers[i].addr : 0;
+			key.sizes[i]     = sizes[i];
+		}
+		vertex_repeat = vertex_valid && key == previous_vertex;
+		window.vertex_draws += key.count != 0;
+		window.vertex_repeat += key.count != 0 && vertex_repeat;
+		vertex_valid               = key.count != 0;
+		previous_vertex            = key;
+		const bool comparable      = key.count != 0 && current_program->vertex_valid;
+		vertex_repeat_same_program = comparable && key == current_program->vertex;
+		window.vertex_same_program_draws += key.count != 0;
+		window.vertex_same_program_compares += comparable;
+		window.vertex_repeat_same_program += vertex_repeat_same_program;
+		current_program->vertex_valid = key.count != 0;
+		current_program->vertex       = key;
+	}
+	void ObserveIndex(const DrawIndexBufferSource& source) {
+		if (retry) return;
+		// Converted 8-bit indices live in a temporary vector/stream allocation. Pointer identity
+		// would say nothing about their bytes or allocation lifetime, so exclude them from hits.
+		const bool     eligible = source.size != 0 && source.host_data == nullptr;
+		const IndexKey key {source.address, source.size, source.type};
+		window.index_draws += eligible;
+		index_repeat = eligible && index_valid && key == previous_index;
+		window.index_repeat += index_repeat;
+		window.host_index_draws += source.size != 0 && source.host_data != nullptr;
+		index_valid               = eligible;
+		previous_index            = key;
+		const bool comparable     = eligible && current_program->index_valid;
+		index_repeat_same_program = comparable && key == current_program->index;
+		window.index_same_program_draws += eligible;
+		window.index_same_program_compares += comparable;
+		window.index_repeat_same_program += index_repeat_same_program;
+		current_program->index_valid = eligible;
+		current_program->index       = key;
+	}
+	void Report() {
+		// At most one clock query per 1024 draws, outside the timed work.
+		if ((sequence & 1023u) != 0) return;
+		const auto now = Clock::now();
+		if (now - window_start < std::chrono::seconds {5}) return;
+		const auto  seconds = std::chrono::duration<double>(now - window_start).count();
+		std::string output  = fmt::format(
+            "vi-probe seconds={:.3f} draws={} sampled={} vertex_draws={} vertex_repeat={} "
+		     "index_draws={} index_repeat={} host_index_draws={} merge_retry_passes={} "
+		     "version=2 timing_unit=ns dirty_observation=unavailable\n",
+            seconds, window.draws, window.sampled_draws, window.vertex_draws, window.vertex_repeat,
+            window.index_draws, window.index_repeat, window.host_index_draws, window.retry_passes);
+		output += fmt::format(
+		    "vi-probe program_identity=module_id program_capacity={} program_entries={} "
+		    "program_cache_hits={} program_cache_misses={} program_cache_evictions={} "
+		    "vertex_same_program_draws={} vertex_same_program_compares={} "
+		    "vertex_repeat_same_program={} index_same_program_draws={} "
+		    "index_same_program_compares={} index_repeat_same_program={}\n",
+		    ProgramCapacity, program_count, window.program_cache_hits, window.program_cache_misses,
+		    window.program_cache_evictions, window.vertex_same_program_draws,
+		    window.vertex_same_program_compares, window.vertex_repeat_same_program,
+		    window.index_same_program_draws, window.index_same_program_compares,
+		    window.index_repeat_same_program);
+		constexpr std::array names {"vertex", "index", "vertex_retry", "index_retry"};
+		for (size_t i = 0; i < names.size(); ++i) {
+			const auto& t = window.timings[i];
+			output +=
+			    fmt::format("vi-probe kind={} sampled_calls={} active_calls={} plan_ns={} "
+			                "active_plan_ns={} obtain_ns={} slots_ns={} active_slots_ns={} "
+			                "repeat_plan_ns={} repeat_calls={} repeat_obtain_ns={} ranges={} "
+			                "stream_ranges={} "
+			                "repeat_stream_ranges={} repeat_same_program_calls={} "
+			                "repeat_same_program_plan_ns={}\n",
+			                names[i], t.calls, t.active_calls, t.plan_ns, t.active_plan_ns,
+			                t.obtain_ns, t.slots_ns, t.active_slots_ns, t.repeat_plan_ns,
+			                t.repeat_calls, t.repeat_obtain_ns, t.ranges, t.stream, t.repeat_stream,
+			                t.repeat_same_program_calls, t.repeat_same_program_plan_ns);
+		}
+		Log::WriteToConsoleAndLog(output);
+		window       = {};
+		window_start = Clock::now(); // Logging time is outside the next observation window.
+	}
+};
+
+template <bool Probe = false>
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
+	if constexpr (!Probe) {
+		if (vs_input_info.buffers_num == 0 &&
+		    Common::AbSwitch::Enabled(Common::AbSwitch::EMPTY_VERTEX_FAST_PATH)) [[unlikely]] {
+			return {};
+		}
+	}
+	VertexIndexProbe::Clock::time_point phase_start;
+	if constexpr (Probe) {
+		if (VertexIndexProbe::Get().sampled) phase_start = VertexIndexProbe::Clock::now();
+	}
 
 	// Collect the non-empty guest vertex ranges.
 	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
@@ -778,6 +1008,30 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		}
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
+	if constexpr (Probe) {
+		auto& probe = VertexIndexProbe::Get();
+		if (probe.sampled) {
+			const auto elapsed = VertexIndexProbe::Ns(phase_start, VertexIndexProbe::Clock::now());
+			auto&      t       = probe.window.timings[probe.retry ? 2 : 0];
+			++t.calls;
+			t.plan_ns += elapsed;
+			if (range_count != 0) {
+				++t.active_calls;
+				t.active_plan_ns += elapsed;
+			}
+			probe.ObserveVertex(vs_input_info, sizes);
+			if (!probe.retry && probe.vertex_repeat) {
+				++t.repeat_calls;
+				t.repeat_plan_ns += elapsed;
+			}
+			if (!probe.retry && probe.vertex_repeat_same_program) {
+				++t.repeat_same_program_calls;
+				t.repeat_same_program_plan_ns += elapsed;
+			}
+		} else {
+			probe.ObserveVertex(vs_input_info, sizes);
+		}
+	}
 
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
@@ -786,10 +1040,37 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+		if constexpr (Probe) {
+			auto& probe = VertexIndexProbe::Get();
+			if (probe.sampled) {
+				auto& t = probe.window.timings[probe.retry ? 2 : 0];
+				++t.ranges;
+				phase_start = VertexIndexProbe::Clock::now();
+			}
+		}
+		range.binding = cache.ObtainBuffer(range.base_address, size, false);
+		if constexpr (Probe) {
+			auto& probe = VertexIndexProbe::Get();
+			if (probe.sampled) {
+				auto&      t = probe.window.timings[probe.retry ? 2 : 0];
+				const auto elapsed =
+				    VertexIndexProbe::Ns(phase_start, VertexIndexProbe::Clock::now());
+				const bool stream =
+				    range.binding.first == &cache.GetUtilityBuffer(MemoryUsage::Stream);
+				t.obtain_ns += elapsed;
+				t.stream += stream;
+				if (!probe.retry && probe.vertex_repeat) {
+					t.repeat_obtain_ns += elapsed;
+					t.repeat_stream += stream;
+				}
+			}
+		}
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
+	if constexpr (Probe) {
+		if (VertexIndexProbe::Get().sampled) phase_start = VertexIndexProbe::Clock::now();
+	}
 	PreparedVertexBuffers prepared;
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
@@ -818,6 +1099,15 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		prepared.buffers[i] = range->binding.first->Handle();
 		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
+	}
+	if constexpr (Probe) {
+		auto& probe = VertexIndexProbe::Get();
+		if (probe.sampled) {
+			const auto elapsed = VertexIndexProbe::Ns(phase_start, VertexIndexProbe::Clock::now());
+			auto&      t       = probe.window.timings[probe.retry ? 2 : 0];
+			t.slots_ns += elapsed;
+			if (range_count != 0) t.active_slots_ns += elapsed;
+		}
 	}
 
 	return prepared;
@@ -1157,11 +1447,26 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	return true;
 }
 
+template <bool Probe = false>
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
 	PreparedIndexBuffer prepared;
+	if constexpr (Probe) VertexIndexProbe::Get().ObserveIndex(source);
 	if (source.size == 0) {
 		return prepared;
+	}
+	VertexIndexProbe::Clock::time_point phase_start;
+	if constexpr (Probe) {
+		auto& probe = VertexIndexProbe::Get();
+		if (probe.sampled) {
+			auto& t = probe.window.timings[probe.retry ? 3 : 1];
+			++t.calls;
+			++t.active_calls;
+			t.repeat_calls += !probe.retry && probe.index_repeat;
+			t.repeat_same_program_calls += !probe.retry && probe.index_repeat_same_program;
+			++t.ranges;
+			phase_start = VertexIndexProbe::Clock::now();
+		}
 	}
 	prepared.type = source.type;
 	if (source.host_data != nullptr) {
@@ -1173,6 +1478,22 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
+	}
+	if constexpr (Probe) {
+		auto& probe = VertexIndexProbe::Get();
+		if (probe.sampled) {
+			auto&      t       = probe.window.timings[probe.retry ? 3 : 1];
+			const auto elapsed = VertexIndexProbe::Ns(phase_start, VertexIndexProbe::Clock::now());
+			const bool stream =
+			    prepared.buffer ==
+			    buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream).Handle();
+			t.obtain_ns += elapsed;
+			t.stream += stream;
+			if (!probe.retry && probe.index_repeat) {
+				t.repeat_obtain_ns += elapsed;
+				t.repeat_stream += stream;
+			}
+		}
 	}
 	return prepared;
 }
@@ -1375,10 +1696,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	const bool            probe_vertex_index = !mesh_active && VertexIndexProbe::Enabled();
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (probe_vertex_index) [[unlikely]] {
+			VertexIndexProbe::Get().BeginDraw(state.vertex_info[0].stage.module->id);
+			vertex_bindings = AcquireVertexBuffers<true>(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer<true>(buffer, index_source);
+		} else {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer(buffer, index_source);
+		}
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
@@ -1414,8 +1742,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			RebindBuffers(*stage);
 		}
 		if (!mesh_active) {
-			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-			index_binding   = PrepareIndexBuffer(buffer, index_source);
+			if (probe_vertex_index) [[unlikely]] {
+				auto& probe = VertexIndexProbe::Get();
+				probe.retry = true;
+				++probe.window.retry_passes;
+				vertex_bindings = AcquireVertexBuffers<true>(buffer, state.vertex_info[0]);
+				index_binding   = PrepareIndexBuffer<true>(buffer, index_source);
+			} else {
+				vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+				index_binding   = PrepareIndexBuffer(buffer, index_source);
+			}
 		}
 		if (emit.indirect.address != 0) {
 			const auto size =
@@ -1425,6 +1761,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			args_buffer = buffer_cache.ObtainBuffer(emit.indirect.address, size, false);
 		}
 	}
+	if (probe_vertex_index) [[unlikely]]
+		VertexIndexProbe::Get().Report();
 
 	// Resource preparation above may synchronously finish and restart the scheduler, and so may
 	// CommitBindings (the image heap's stream copy). After it, every operation targets the current

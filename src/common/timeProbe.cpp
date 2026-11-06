@@ -72,11 +72,15 @@ struct State {
 	std::FILE*                                trace_file   = nullptr;
 	const char*                               trace_target = nullptr;
 	uint64_t                                  trace_parent = 0;
+	uint64_t                                  caller_filter = 0;
 	// KYTY_TIME_PROBE_DUMP=<caller>:<offset>:<size> (hex): at a clock read from that guest
-	// address, at most every 250 ms, the bytes at [guest r15 + offset] go to the trace.
+	// address, at most every 250 ms, the bytes at [guest register + offset] go to the trace.
 	uint64_t                              dump_caller = 0;
 	uint64_t                              dump_offset = 0;
 	uint64_t                              dump_size   = 0;
+	uint64_t                              dump_parent    = 0;
+	bool                                  dump_r14       = false;
+	bool                                  dump_stack_r14 = false;
 	std::chrono::steady_clock::time_point last_dump {};
 };
 
@@ -116,11 +120,17 @@ constexpr int GUEST_FRAMES = 6;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // Follows the guest's frame-pointer chain (guest code keeps rbp frames). A bad pointer faults
 // into the __except, so the emulator's handler must let the fault through (ScopedPassThrough).
-int WalkGuestFramesGuarded(uint64_t rbp, uint64_t stack_low, uint64_t* frames, int count) {
+int WalkGuestFramesGuarded(uint64_t rbp, uint64_t stack_low, uint64_t* frames, int count,
+                           uint64_t* stack_r14 = nullptr, uint64_t stack_parent = 0) {
 	__try {
 		while (count < GUEST_FRAMES && rbp > stack_low && rbp < stack_low + (64u << 20u) &&
 		       (rbp & 7u) == 0) {
 			frames[count++] = *reinterpret_cast<const uint64_t*>(rbp + 8);
+			if (stack_r14 != nullptr && stack_parent != 0 && frames[count - 1] == stack_parent) {
+				// Opt-in, version-specific wrapper prolog: push rbp; mov rbp,rsp; push r14.
+				// Its saved R14 names the caller's timing output, unlike the wrapper's live R14.
+				*stack_r14 = *reinterpret_cast<const uint64_t*>(rbp - 8);
+			}
 			const auto next = *reinterpret_cast<const uint64_t*>(rbp);
 			if (next <= rbp) {
 				break;
@@ -135,8 +145,9 @@ int WalkGuestFramesGuarded(uint64_t rbp, uint64_t stack_low, uint64_t* frames, i
 
 // The return addresses of the guest frames that led to the probed function, innermost first:
 // the host frames are unwound with their tables, which restores the guest's callee-saved
-// registers (rbp for the walk; r15 is returned for KYTY_TIME_PROBE_DUMP).
-int GuestFrames(uint64_t* frames, uint64_t* guest_r15 = nullptr) {
+// registers (rbp for the walk; r14/r15 can be returned for KYTY_TIME_PROBE_DUMP).
+int GuestFrames(uint64_t* frames, uint64_t* guest_r15 = nullptr, uint64_t* guest_r14 = nullptr,
+                uint64_t* stack_r14 = nullptr, uint64_t stack_parent = 0) {
 	CONTEXT context {};
 	RtlCaptureContext(&context);
 	for (int depth = 0; depth < 32; depth++) {
@@ -154,12 +165,19 @@ int GuestFrames(uint64_t* frames, uint64_t* guest_r15 = nullptr) {
 	if (guest_r15 != nullptr) {
 		*guest_r15 = context.R15;
 	}
+	if (guest_r14 != nullptr) {
+		*guest_r14 = context.R14;
+	}
 	const HostException::ScopedPassThrough pass_through;
-	return WalkGuestFramesGuarded(context.Rbp, context.Rsp, frames, 1);
+	return WalkGuestFramesGuarded(context.Rbp, context.Rsp, frames, 1, stack_r14, stack_parent);
 }
 #else
-int GuestFrames(uint64_t* /*frames*/, uint64_t* guest_r15 = nullptr) {
+int GuestFrames(uint64_t* /*frames*/, uint64_t* guest_r15 = nullptr, uint64_t* guest_r14 = nullptr,
+                uint64_t* stack_r14 = nullptr, uint64_t stack_parent = 0) {
 	(void)guest_r15;
+	(void)guest_r14;
+	(void)stack_r14;
+	(void)stack_parent;
 	return 0;
 }
 #endif
@@ -384,6 +402,9 @@ bool Enabled() noexcept {
 			return false;
 		}
 		auto&       state  = GetState();
+		if (const char* caller = std::getenv("KYTY_TIME_PROBE_CALLER"); caller != nullptr) {
+			state.caller_filter = std::strtoull(caller, nullptr, 16);
+		}
 		const char* target = std::getenv("KYTY_TIME_PROBE_TRACE");
 		if (target != nullptr && *target != '\0') {
 			state.trace_target = target;
@@ -403,6 +424,13 @@ bool Enabled() noexcept {
 				state.dump_size = std::min<uint64_t>(std::strtoull(end + 1, nullptr, 16), 0x2000);
 			}
 		}
+		if (const char* reg = std::getenv("KYTY_TIME_PROBE_DUMP_REGISTER"); reg != nullptr) {
+			state.dump_r14       = std::strcmp(reg, "r14") == 0;
+			state.dump_stack_r14 = std::strcmp(reg, "stack-r14") == 0;
+		}
+		if (const char* parent = std::getenv("KYTY_TIME_PROBE_DUMP_PARENT"); parent != nullptr) {
+			state.dump_parent = std::strtoull(parent, nullptr, 16);
+		}
 		if (state.trace_target != nullptr || state.trace_parent != 0 || state.dump_size != 0) {
 			state.trace_file = std::fopen(path, "w");
 			if (state.trace_file != nullptr) {
@@ -416,9 +444,13 @@ bool Enabled() noexcept {
 }
 
 void Record(Source source, uint64_t detail, const void* return_address) noexcept {
+	auto&      state   = GetState();
+	const auto address = reinterpret_cast<uint64_t>(return_address);
+	if (state.caller_filter != 0 && address != state.caller_filter) {
+		return;
+	}
 	auto&      table      = CurrentTable();
 	const auto ticks      = Ticks();
-	auto&      state      = GetState();
 	const bool band_stack = Band().second > 0.0 && source == Source::ProcessTimeCounter;
 	const bool find_parent =
 	    !table.traced && state.trace_parent != 0 && source == Source::ProcessTimeCounter;
@@ -431,7 +463,7 @@ void Record(Source source, uint64_t detail, const void* return_address) noexcept
 			std::fprintf(state.trace_file, "# thread %u %s\n", table.host_id, table.name.c_str());
 		}
 	}
-	Key key {reinterpret_cast<uint64_t>(return_address), detail, static_cast<uint32_t>(source)};
+	Key key {address, detail, static_cast<uint32_t>(source)};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (state.dump_size != 0 && key.address == state.dump_caller) {
 		// KYTY_TIME_PROBE_DUMP_MS: the least time between dumps (default 250 ms; 0 = every call).
@@ -442,20 +474,31 @@ void Record(Source source, uint64_t detail, const void* return_address) noexcept
 		const auto        now      = std::chrono::steady_clock::now();
 		std::lock_guard   lock(state.trace_mutex);
 		if (now - state.last_dump >= interval && state.trace_file != nullptr) {
-			state.last_dump = now;
-			uint64_t frames_unused[GUEST_FRAMES] {};
-			uint64_t object = 0;
-			GuestFrames(frames_unused, &object);
-			std::vector<uint8_t>                   bytes(state.dump_size);
-			const HostException::ScopedPassThrough pass_through;
-			if (ReadGuarded(object + state.dump_offset, bytes.data(), bytes.size())) {
-				std::fprintf(state.trace_file, "# dump %llu %llx ",
-				             static_cast<unsigned long long>(ticks),
-				             static_cast<unsigned long long>(object));
-				for (const auto byte: bytes) {
-					std::fprintf(state.trace_file, "%02x", byte);
+			uint64_t  dump_frames[GUEST_FRAMES] {};
+			uint64_t  guest_r15 = 0;
+			uint64_t  guest_r14 = 0;
+			uint64_t  stack_r14 = 0;
+			const int dump_count =
+			    GuestFrames(dump_frames, &guest_r15, &guest_r14,
+			                state.dump_stack_r14 ? &stack_r14 : nullptr, state.dump_parent);
+			const bool parent_matches =
+			    state.dump_parent == 0 || std::find(dump_frames, dump_frames + dump_count,
+			                                        state.dump_parent) != dump_frames + dump_count;
+			if (parent_matches && (!state.dump_stack_r14 || stack_r14 != 0)) {
+				state.last_dump = now;
+				const auto object =
+				    state.dump_stack_r14 ? stack_r14 : (state.dump_r14 ? guest_r14 : guest_r15);
+				std::vector<uint8_t>                   bytes(state.dump_size);
+				const HostException::ScopedPassThrough pass_through;
+				if (ReadGuarded(object + state.dump_offset, bytes.data(), bytes.size())) {
+					std::fprintf(state.trace_file, "# dump %llu %llx ",
+					             static_cast<unsigned long long>(ticks),
+					             static_cast<unsigned long long>(object));
+					for (const auto byte: bytes) {
+						std::fprintf(state.trace_file, "%02x", byte);
+					}
+					std::fprintf(state.trace_file, " thread=%u\n", table.host_id);
 				}
-				std::fputc('\n', state.trace_file);
 			}
 		}
 	}

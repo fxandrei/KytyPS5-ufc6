@@ -7,6 +7,15 @@
 // status and wait functions are counted per thread and calling guest address, and the busiest
 // entries are printed every 5 seconds. With KYTY_TIME_PROBE_TRACE=<thread name fragment>, the
 // calls of the matching threads are also written, with their times, to KYTY_TIME_PROBE.
+// KYTY_TIME_PROBE_CALLER=<hex guest return address> optionally restricts all recording to one
+// caller before thread registration, timestamps or stack walking; unset or zero keeps all callers.
+// KYTY_TIME_PROBE_DUMP=<caller>:<offset>:<size> (hex) reads guest register + offset at that caller.
+// KYTY_TIME_PROBE_DUMP_REGISTER=r14|r15 selects the base register (default r15).
+// KYTY_TIME_PROBE_DUMP_PARENT=<hex guest return address> optionally requires a matching stack
+// frame. DUMP_REGISTER=stack-r14 reads the saved R14 at [rbp-8] of the frame returning to
+// DUMP_PARENT. This opt-in mode requires the guest wrapper's push-rbp/mov-rbp-rsp/push-r14 prolog
+// to be verified.
+// Each dump ends with thread=<host thread id>, so analysis can select the same thread as its events.
 namespace Common::TimeProbe {
 
 enum class Source : uint32_t {

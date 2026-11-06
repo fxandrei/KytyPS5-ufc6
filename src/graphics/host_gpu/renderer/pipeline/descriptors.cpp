@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,7 @@
 #include <memory>
 #include <set>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -516,22 +518,10 @@ TextureInfoMemoEntry& TextureInfoMemoSlot(const ShaderTextureResource& descripto
 
 } // namespace
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+RenderExecutor::TextureResolvePlan RenderExecutor::BuildTextureResolvePlan(
+    const ShaderRecompiler::IR::ImageResource& resource,
+    const ShaderTextureResource& descriptor, bool use_info_memo) {
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -613,7 +603,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const uint32_t memo_flags = (resource.r128 ? 1u : 0u) | (reads_depth ? 2u : 0u) |
 	                            (resource.depth_compare ? 4u : 0u) | (storage ? 8u : 0u) |
 	                            (single_storage_mip ? 16u : 0u);
-	TextureInfoMemoEntry* memo = Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_INFO_MEMO)
+	TextureInfoMemoEntry* memo = use_info_memo && Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_INFO_MEMO)
 	                                 ? &TextureInfoMemoSlot(descriptor, memo_flags)
 	                                 : nullptr;
 	if (memo != nullptr && memo->valid && memo->flags == memo_flags &&
@@ -659,7 +649,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		return {.mapped = false};
 	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
@@ -677,6 +667,116 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
+
+	return {.desc = std::move(desc), .pixel_format = pixel_format, .view_format = view_format,
+	        .shader_conversion = shader_conversion};
+}
+
+bool RenderExecutor::SameTextureResolvePlan(const TextureResolvePlan &left,
+                                            const TextureResolvePlan &right) {
+	// Compare semantic fields, including all derived tiling, rather than padding bytes.
+	const auto image_key = [](const ImageInfo &info) {
+		return std::tie(
+		    info.data, info.stencil, info.metadata.range, info.metadata.kind, info.metadata.control,
+		    info.metadata.clear_word, info.metadata.compression, info.metadata.stencil_compressed,
+		    info.metadata.clear_register_valid, info.metadata.dcc_alpha_msb,
+		    info.htile_initial_clear, info.pixel_format, info.guest_format, info.type, info.extent,
+		    info.resources, info.pitch, info.bytes_per_block, info.samples, info.tile_mode,
+		    info.bgra16, info.mip_layout, info.tiling.block.family,
+		    info.tiling.block.bytes_per_element, info.tiling.block.block_size,
+		    info.tiling.block.block_width, info.tiling.block.block_height,
+		    info.tiling.block.block_depth, info.tiling.texel_width, info.tiling.texel_height,
+		    info.tiled_slice_stride, info.linear_slice_stride, info.first_tail_level);
+	};
+	return image_key(left.desc.info) == image_key(right.desc.info) &&
+	       left.desc.view_info == right.desc.view_info && left.desc.type == right.desc.type &&
+	       left.desc.heap == right.desc.heap && left.pixel_format == right.pixel_format &&
+	       left.view_format == right.view_format &&
+	       left.shader_conversion == right.shader_conversion && left.mapped == right.mapped;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource &resource,
+                                              const ShaderRecompiler::IR::DescriptorValue &value,
+                                              uint64_t module_id, uint32_t resource_index) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto &texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+
+	auto plan = [&]() -> TextureResolvePlan {
+		// Heap mapping and storage validation retain their original per-call path. Module id/slot
+		// select a bounded entry; exact resource inputs guard collisions and module-id reuse.
+		if (!resource.heap && !storage && resource_index != UINT32_MAX &&
+		    Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_PLAN_MEMO)) {
+			constexpr size_t Slots = 128;
+			if (m_texture_plan_memo.empty())
+				m_texture_plan_memo.resize(Slots);
+			const uint32_t flags = (resource.read ? 1u : 0u) | (resource.written ? 2u : 0u) |
+			                       (resource.atomic ? 4u : 0u) | (resource.atomic64 ? 8u : 0u) |
+			                       (resource.depth_compare ? 16u : 0u) |
+			                       (resource.r128 ? 32u : 0u) | (resource.heap ? 64u : 0u) |
+			                       (resource.cube ? 128u : 0u) |
+			                       (resource.unfiltered_access_only ? 256u : 0u);
+			const std::array<uint32_t, 6> key{flags,
+			                                  static_cast<uint32_t>(resource.resource_class),
+			                                  static_cast<uint32_t>(resource.numeric_class),
+			                                  static_cast<uint32_t>(resource.dimension),
+			                                  static_cast<uint32_t>(resource.mip_mode),
+			                                  static_cast<uint32_t>(resource.conversion_format)};
+			const auto hash = (module_id ^ (uint64_t{resource_index} * 0x9E3779B97F4A7C15ull));
+			auto &memo = m_texture_plan_memo[(hash ^ (hash >> 32u)) & (Slots - 1)];
+			const bool hit =
+			    memo.valid && memo.module_id == module_id &&
+			    memo.resource_index == resource_index && memo.resource_key == key &&
+			    std::memcmp(memo.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0;
+			static const bool probe = std::getenv("KYTY_PROBE_TEXTURE_PLAN") != nullptr;
+			if (probe) {
+				++m_texture_plan_probe_calls;
+				m_texture_plan_probe_hits += hit;
+				if ((m_texture_plan_probe_calls & 0xffffu) == 0u) {
+					std::printf("texture-plan-probe calls=%" PRIu64 " hits=%" PRIu64
+					            " misses=%" PRIu64 "\n",
+					            m_texture_plan_probe_calls, m_texture_plan_probe_hits,
+					            m_texture_plan_probe_calls - m_texture_plan_probe_hits);
+				}
+			}
+			if (hit) {
+				static const bool verify = std::getenv("KYTY_VERIFY_TEXTURE_PLAN") != nullptr;
+				if (verify &&
+				    !SameTextureResolvePlan(memo.plan,
+				                            BuildTextureResolvePlan(resource, descriptor, false))) {
+					EXIT("texture plan verify: mismatch module=0x%016" PRIx64 " resource=%u\n",
+					     module_id, resource_index);
+				}
+				return memo.plan;
+			}
+			auto fresh = BuildTextureResolvePlan(resource, descriptor, true);
+			memo.module_id = module_id;
+			memo.resource_index = resource_index;
+			memo.resource_key = key;
+			std::copy_n(descriptor.fields, memo.fields.size(), memo.fields.begin());
+			memo.plan = fresh;
+			memo.valid = true;
+			return fresh;
+		}
+		return BuildTextureResolvePlan(resource, descriptor, true);
+	}();
+	if (!plan.mapped)
+		return {.layout = vk::ImageLayout::eGeneral};
+	// FindImage may remap this copy. Never overwrite the memo's original requested view.
+	auto desc = std::move(plan.desc);
+	const auto shader_conversion = plan.shader_conversion;
+	const auto pixel_format = plan.pixel_format;
+	const auto view_format = plan.view_format;
 
 	auto id = texture_cache.FindImage(desc, shader_conversion);
 	if (!id) {
@@ -773,7 +873,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i],
+		                              runtime.module->id, i);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -904,7 +1005,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
 			old_image.binding = {};
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i],
+		                           prepared.runtime->module->id, i);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
@@ -970,14 +1072,121 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// A deliberately backing-only observation of the two screen-space filters seen near a stall.
+// TryReadBacking bypasses guest faults: this must never cause a download, submission or wait.
+// Recorded upload copies may not have run yet, so these bytes are NOT a GPU-verified loop bound.
+static bool TraceFilterBoundEnabled() {
+	static const bool enabled = [] {
+		const auto* path = std::getenv("KYTY_TRACE_FILTER_BOUND");
+		return path != nullptr && *path != '\0';
+	}();
+	return enabled;
+}
+
+static void TraceFilterBound(RenderContext& context, const PreparedBindings& prepared) {
+	const auto& program = prepared.runtime->module->info;
+	if (program.stage != ShaderType::Pixel ||
+	    (program.shader_hash != UINT64_C(0x26ec5a6f42265b1f) &&
+	     program.shader_hash != UINT64_C(0x6869ba5373a429b9))) {
+		return;
+	}
+	struct Trace {
+		std::FILE* file = nullptr;
+		uint32_t   rows = 0;
+		Trace() {
+			const auto* path = std::getenv("KYTY_TRACE_FILTER_BOUND");
+			if (path == nullptr || *path == '\0') return;
+			file = std::fopen(path, "w");
+			if (file == nullptr) {
+				std::fprintf(stderr, "filter-bound trace: cannot open diagnostic output\n");
+				return;
+			}
+			std::fprintf(
+			    file, "state,unix_ms,monotonic_us,tick,shader_hash,module_id,resource_index,"
+			          "descriptor_words,descriptor0,descriptor1,descriptor2,descriptor3,"
+			          "source_id,guest_base,source_size,native_buffer,native_offset,native_range,"
+			          "adjustment,shader_size,shader_index,shader_size_guard,misaligned,"
+			          "guest_word_address,source_word_in_range,cpu_backing_read_ok,"
+			          "cpu_backing_bound_u32,cpu_backing_bound_i32,gpu_dirty,gpu_dirty_begin,gpu_"
+			          "dirty_end\n");
+		}
+		~Trace() {
+			if (file != nullptr) std::fclose(file);
+		}
+	};
+	static Trace trace;
+	if (trace.file == nullptr || trace.rows >= 100000) return;
+	const auto& layout   = program.bindings;
+	const auto  resource = std::ranges::find_if(
+        program.info.buffers, [](const auto& value) { return value.descriptor_index == 0; });
+	if (resource == program.info.buffers.end() || prepared.buffer_sources.empty() ||
+	    prepared.buffers.empty() || layout.memory_offset_dword >= prepared.shader_data.size() ||
+	    layout.MemorySizeDword() >= prepared.shader_data.size()) {
+		return; // Diagnostics never turn an unsupported observation into an emulator failure.
+	}
+	const auto  resource_index = static_cast<size_t>(resource - program.info.buffers.begin());
+	const auto& snapshot       = *prepared.runtime->resources;
+	if (resource_index >= snapshot.buffers.size()) return;
+	const auto& descriptor   = snapshot.buffers[resource_index];
+	const auto& source       = prepared.buffer_sources[0];
+	const auto& native       = prepared.buffers[0];
+	const auto  adjustment   = prepared.shader_data[layout.memory_offset_dword] & 255u;
+	const auto  shader_size  = prepared.shader_data[layout.MemorySizeDword()];
+	const auto  shader_index = (adjustment >> 2u) + 6u;
+	const bool  guard        = shader_index < (shader_size >> 2u);
+	// The shader rounds the packed byte adjustment down to a dword before adding six.
+	const uint64_t relative_word   = 24u - (adjustment & 3u);
+	const bool     source_in_range = source.address != 0 && relative_word <= source.size &&
+	                             sizeof(uint32_t) <= source.size - relative_word &&
+	                             source.address <= UINT64_MAX - relative_word - sizeof(uint32_t);
+	const auto address = source_in_range ? source.address + relative_word : 0;
+	uint32_t   value   = 0;
+	const bool read_ok = guard && source_in_range &&
+	                     LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+	auto&      cache     = context.GetBufferCache();
+	const bool gpu_dirty = source_in_range && cache.HasGpuDirtyBytes(address, sizeof(value));
+	const auto dirty =
+	    source_in_range ? cache.GpuDirtyRangeAt(address) : std::pair<uint64_t, uint64_t> {};
+	const auto raw_handle = static_cast<VkBuffer>(native.buffer);
+	uint64_t   handle     = 0;
+	static_assert(sizeof(handle) == sizeof(raw_handle));
+	std::memcpy(&handle, &raw_handle, sizeof(handle));
+	using namespace std::chrono;
+	const auto unix_ms =
+	    duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+	const auto monotonic_us =
+	    duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	const auto signed_value = std::bit_cast<int32_t>(value);
+	const int  written      = std::fprintf(
+        trace.file,
+        "cpu_backing_bound_not_gpu_verified,%lld,%lld,%" PRIu64 ",%016" PRIx64 ",%016" PRIx64
+        ",%zu,%u,%08x,%08x,%08x,%08x,%u,%016" PRIx64 ",%" PRIu64 ",%016" PRIx64 ",%" PRIu64
+        ",%" PRIu64 ",%u,%u,%u,%u,%u,%016" PRIx64 ",%u,%u,%u,%" PRId32 ",%u,%016" PRIx64
+        ",%016" PRIx64 "\n",
+        static_cast<long long>(unix_ms), static_cast<long long>(monotonic_us),
+        context.GetCommandScheduler().CurrentTick(), program.shader_hash,
+        prepared.runtime->module->id, resource_index, descriptor.dword_count, descriptor.dwords[0],
+        descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], source.id.index,
+        source.address, source.size, handle, uint64_t {native.offset}, uint64_t {native.range},
+        adjustment, shader_size, shader_index, guard ? 1u : 0u, adjustment & 3u, address,
+        source_in_range ? 1u : 0u, read_ok ? 1u : 0u, value, signed_value, gpu_dirty ? 1u : 0u,
+        dirty.first, dirty.second);
+	++trace.rows;
+	// Preserve the last observation if the next draw stalls and the test kills the process.
+	if (written < 0 || std::fflush(trace.file) != 0) {
+		std::fclose(trace.file);
+		trace.file = nullptr; // Output failures disable the diagnostic, never the game.
+	}
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
-	size_t image_descriptor_count = 0;
-	size_t write_count      = 0;
+	auto                           vk_buffer              = buffer.Handle();
+	size_t                         image_descriptor_count = 0;
+	size_t                         write_count            = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	constexpr auto                 GraphicsStages =
@@ -1150,6 +1359,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
+		if (TraceFilterBoundEnabled()) [[unlikely]] {
+			TraceFilterBound(m_context, *prepared);
+		}
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);

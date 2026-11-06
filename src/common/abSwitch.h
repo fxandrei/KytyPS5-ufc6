@@ -239,6 +239,13 @@ inline constexpr uint32_t BARRIER_LITE = 51;
 // Diagnostic only, never on by default: KYTY_VERIFY_SRT_MEMO=1 re-materializes on every reuse and
 // exits on any difference.
 inline constexpr uint32_t SRT_REFRESH_MEMO = 52;
+// Experimental, default off: cache the pure pre-FindImage plan for sampled nonheap textures.
+// Dynamic image lookup, synchronization, view validation, acquisition and transitions still run.
+// KYTY_VERIFY_TEXTURE_PLAN=1 recomputes each hit without either descriptor-plan cache.
+inline constexpr uint32_t TEXTURE_PLAN_MEMO = 53;
+// Experimental, default off: return an empty vertex binding before constructing guest ranges
+// when the shader has no vertex-buffer slots. Disabled on the VI probe path; A/B with probes off.
+inline constexpr uint32_t EMPTY_VERTEX_FAST_PATH = 54;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {

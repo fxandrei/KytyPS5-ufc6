@@ -187,7 +187,9 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            uint64_t module_id = 0,
+	                                            uint32_t resource_index = UINT32_MAX);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -261,12 +263,37 @@ private:
 		TextureCache::ImageDesc desc;
 		ImageId                 image_id;
 	};
+	// AbSwitch TEXTURE_PLAN_MEMO: pure descriptor decoding only. The requested descriptor is
+	// kept before FindImage remaps its mip/layer; no native image identity or view is cached.
+	struct TextureResolvePlan {
+		TextureCache::ImageDesc desc;
+		vk::Format             pixel_format = vk::Format::eUndefined;
+		vk::Format             view_format = vk::Format::eUndefined;
+		bool                   shader_conversion = false;
+		bool                   mapped = true;
+	};
+	struct TexturePlanMemoEntry {
+		uint64_t                module_id = 0;
+		uint32_t                resource_index = UINT32_MAX;
+		std::array<uint32_t, 6> resource_key {};
+		std::array<uint32_t, 8> fields {};
+		bool                    valid = false;
+		TextureResolvePlan      plan;
+	};
+	[[nodiscard]] TextureResolvePlan BuildTextureResolvePlan(
+	    const ShaderRecompiler::IR::ImageResource& resource,
+	    const ShaderTextureResource& descriptor, bool use_info_memo);
+	[[nodiscard]] static bool SameTextureResolvePlan(const TextureResolvePlan& left,
+	                                                const TextureResolvePlan& right);
 
 	RenderContext&                        m_context;
 	// The draw state DrawIndex and DrawAuto reuse (AbSwitch EXACT_DRAW_STATE); draws do not nest.
 	DrawRenderState                       m_draw_state;
 	std::array<ColorTargetMemo, 8>        m_color_target_memo;
 	DepthTargetMemo                       m_depth_target_memo;
+	std::vector<TexturePlanMemoEntry>     m_texture_plan_memo;
+	uint64_t                              m_texture_plan_probe_calls = 0;
+	uint64_t                              m_texture_plan_probe_hits = 0;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
