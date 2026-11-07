@@ -58,10 +58,10 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
 
 	struct Submission {
-		SubmissionType            type     = SubmissionType::Graphics;
+		SubmissionType            type     = SubmissionType::Commands;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;

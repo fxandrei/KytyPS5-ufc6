@@ -29,11 +29,11 @@
 #include "libs/errno.h"
 
 #include <algorithm>
-#include <fmt/format.h>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -42,7 +42,7 @@
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
-                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+                                GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
 		if (i == output_buffer) continue;
 		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
@@ -116,10 +116,10 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	                                 ? group_x
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = descriptor.GetSize();
-	const auto elements = descriptor.NumRecords();
-	const bool covered = fill.bounded_elements != 0
-	                         ? fill.bounded_elements == elements && invocations >= elements
-	                         : invocations == elements;
+	const auto     elements    = descriptor.NumRecords();
+	const bool     covered     = fill.bounded_elements != 0
+	                                 ? fill.bounded_elements == elements && invocations >= elements
+	                                 : invocations == elements;
 	if (!covered || invocations > uint64_t {UINT32_MAX} + 1 || size == 0 || size > UINT32_MAX ||
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
@@ -135,8 +135,8 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 }
 
 bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
-                                          CommandBuffer& command, uint32_t group_x,
-                                          uint32_t group_y, uint32_t group_z, uint32_t mode) {
+                                           CommandBuffer& command, uint32_t group_x,
+                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
 	const auto& program   = input.stage.module->info;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -164,7 +164,8 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 			// final workgroup may extend beyond the selected image view.
 			if (threads == 0 || threads != fill.group_stride[axis] ||
 			    groups[axis] != (extents[axis] + threads - 1) / threads ||
-			    groups[axis] * threads > UINT32_MAX) return false;
+			    groups[axis] * threads > UINT32_MAX)
+				return false;
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
@@ -177,10 +178,11 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
 		    view.layer_count > image.backing.layers - view.base_layer ||
 		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
-		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
+		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1])
+			return false;
 		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
 		                                       1, view.base_layer, view.layer_count};
-		vk::ClearValue clear {};
+		vk::ClearValue                  clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
 		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
 		return true;
@@ -197,8 +199,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	if (!image_clear) {
 		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
 		// partial or ambiguous image backings, including pooled metadata aliases.
-		if ((descriptor.Base48() & 3u) != 0 ||
-		    !m_context.IsMapped(descriptor.Base48(), size) ||
+		if ((descriptor.Base48() & 3u) != 0 || !m_context.IsMapped(descriptor.Base48(), size) ||
 		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
 			return false;
 		}
@@ -208,18 +209,32 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
-		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
+		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64 " addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 		     image_clear ? "image clear" : "buffer fill", input.stage.module->info.shader_hash,
 		     descriptor.Base48(), size, packed_clear);
 	}
 	return true;
 }
 
+// Global loads read pages without a buffer as zero. Back the 32 KiB after each base the shader
+// loads from scalar data before the dispatch reads it.
+static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
+	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+	const auto&        flat = stage.resources->flattened_srt;
+	for (const auto [low, high]: stage.module->info.info.address_bases) {
+		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
+		for (uint64_t index = 0; index <= 2; ++index) {
+			const auto page = base + index * Page;
+			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+		}
+	}
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
-	if (input.stage.module->info.bindings.descriptor_counts[
-	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
+	if (input.stage.module->info.bindings.descriptor_counts[static_cast<size_t>(
+	        ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
 	auto& cache = context.GetBufferCache();
@@ -230,9 +245,10 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
-	auto& storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
-	const auto limit = std::min<uint64_t>(storage.Size(),
-	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	auto&      storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+	const auto limit   = std::min<uint64_t>(
+        storage.Size(),
+        context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
 	uint64_t size = sizeof(uint32_t);
 	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
@@ -243,6 +259,16 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		}
 	}
 	bindings.shared_memory = {storage.Handle(), 0, size};
+}
+
+static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
+                             const PreparedBindings&       bindings) {
+	const auto& images = input_info.stage.module->info.info.images;
+	return bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||
+	       std::ranges::any_of(images, [](const auto& image) {
+		       return image.written &&
+		              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+	       });
 }
 
 void RenderExecutor::BindComputePipeline(CommandBuffer& buffer, vk::Pipeline pipeline) {
@@ -288,9 +314,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
-	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
-	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
+	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS     = 0x41u;
+	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
 	    DISPATCH_INITIATOR_BASE_BITS | DISPATCH_INITIATOR_MODIFIER_BITS;
 
@@ -310,55 +335,43 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	input_info.workgroup_counts[0] = thread_group_x;
-	input_info.workgroup_counts[1] = thread_group_y;
-	input_info.workgroup_counts[2] = thread_group_z;
+	input_info.workgroup_counts[0]        = thread_group_x;
+	input_info.workgroup_counts[1]        = thread_group_y;
+	input_info.workgroup_counts[2]        = thread_group_z;
 	if (use_thread_dimensions) {
 		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
 		                                cs_regs.cs_regs.num_thread_z};
 		for (uint32_t axis = 0; axis < 3u; ++axis) {
-			const auto size = std::max(group_sizes[axis], 1u);
-			const auto threads = input_info.workgroup_counts[axis];
+			const auto size                   = std::max(group_sizes[axis], 1u);
+			const auto threads                = input_info.workgroup_counts[axis];
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	if (use_thread_dimensions) {
-		input_info.dispatch_threads_num[0]    = thread_group_x;
-		input_info.dispatch_threads_num[1]    = thread_group_y;
-		input_info.dispatch_threads_num[2]    = thread_group_z;
+		input_info.dispatch_threads_num[0] = thread_group_x;
+		input_info.dispatch_threads_num[1] = thread_group_y;
+		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
 	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
-	                           thread_group_z, mode))) {
+	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y, thread_group_z,
+	                           mode))) {
 		ResetBindings();
 		return;
 	}
 
 	if (use_thread_dimensions) {
-		const uint32_t old_x = thread_group_x;
-		const uint32_t old_y = thread_group_y;
-		const uint32_t old_z = thread_group_z;
-		thread_group_x       = input_info.workgroup_counts[0];
-		thread_group_y       = input_info.workgroup_counts[1];
-		thread_group_z       = input_info.workgroup_counts[2];
-
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: use-thread-dimensions %ux%ux%u / %ux%ux%u -> "
-			     "groups %ux%ux%u\n",
-			     old_x, old_y, old_z, std::max(cs_regs.cs_regs.num_thread_x, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_y, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
-			     thread_group_z);
-		}
+		thread_group_x = input_info.workgroup_counts[0];
+		thread_group_y = input_info.workgroup_counts[1];
+		thread_group_z = input_info.workgroup_counts[2];
 	}
 
 	buffer.EndRendering();
@@ -366,10 +379,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
-		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
+		std::copy(std::begin(input_info.dispatch_threads_num),
+		          std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	PreparedBindings* descriptor_stage = &bindings;
+	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -384,17 +399,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	// After CommitBindings, which can begin the next command buffer.
-	auto vk_buffer          = buffer.Handle();
-	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage);
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
+	const auto vk_buffer = buffer.Handle();
 	// Emulated LDS and GDS live in buffers every such dispatch shares, so those stay serialized.
 	const bool lds_shared = bindings.shared_memory.buffer != nullptr || program.info.uses_gds;
 	const bool chain =
@@ -402,7 +407,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool guest_ordered = Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS) &&
 	                           !Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) &&
 	                           !lds_shared;
-	if (has_storage_writes && !guest_ordered && !chain) {
+	if (HasStorageWrites(input_info, bindings) && !guest_ordered && !chain) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -413,18 +418,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 		    });
 		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " hash=0x%016" PRIx64 " tick=%" PRIu64 " completed_tick=%" PRIu64
-		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64 " hash=0x%016" PRIx64
+		     " tick=%" PRIu64 " completed_tick=%" PRIu64 " groups=%ux%ux%u mode=0x%08" PRIx32
+		     " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
 		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
 		     m_context.GetCommandScheduler().CurrentTick(),
-		     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(),
-		     thread_group_x, thread_group_y, thread_group_z, mode,
-		     input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
-		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(),
+		     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(), thread_group_x,
+		     thread_group_y, thread_group_z, mode, input_info.threads_num[0],
+		     input_info.threads_num[1], input_info.threads_num[2], program.info.buffers.size(),
+		     program.info.images.size(), sampled_images,
+		     program.info.images.size() - sampled_images, program.info.samplers.size(),
 		     program.bindings.UsesPushData()
 		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
 		         : 0u);
@@ -439,6 +443,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			const auto& image = program.info.images[i];
 			const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			const auto  max_mip = image.r128 ? r.LastLevel() : r.MaxMip();
 			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
 			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
 			     i, image.source, image.written ? "read-write" : "read-only",
@@ -451,7 +456,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
 			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
 			         ? 1u
-			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
+			         : static_cast<uint32_t>(max_mip) + 1u,
 			     static_cast<uint32_t>(r.TileMode()));
 		}
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -482,8 +487,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	scheduler.GpuCheckpoint(label);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
-	                                   std::max(input_info.threads_num[1], 1u) *
-	                                   std::max(input_info.threads_num[2], 1u);
+	                               std::max(input_info.threads_num[1], 1u) *
+	                               std::max(input_info.threads_num[2], 1u);
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
@@ -536,8 +541,8 @@ void RenderExecutor::GuestFlush() {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFlushBarriers);
 }
 
-void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_addr, uint32_t mode, bool async_compute) {
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+                                      uint32_t mode, bool async_compute) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -560,7 +565,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
+	input_info.async_compute         = async_compute;
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
@@ -569,6 +574,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
+	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
@@ -582,34 +588,27 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
-	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
-	    });
+	const auto vk_buffer  = buffer.Handle();
 	const bool lds_shared = bindings.shared_memory.buffer != nullptr || program.info.uses_gds;
 	const bool chain =
 	    Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) && !lds_shared && !async_compute;
 	const bool guest_ordered = Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_BARRIERS) &&
 	                           !Common::AbSwitch::Enabled(Common::AbSwitch::COMPUTE_CHAIN) &&
 	                           !lds_shared;
-	if (has_storage_writes && !guest_ordered && !chain) {
+	if (HasStorageWrites(input_info, bindings) && !guest_ordered && !chain) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+	        vk::PipelineStageFlagBits::eTransfer,
+	    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 	BindComputePipeline(buffer, pipeline.pipeline);
 	auto&      scheduler = m_context.GetCommandScheduler();
 	const auto gpu_timer = scheduler.BeginGpuShaderTimer();

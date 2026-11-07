@@ -90,8 +90,8 @@ CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemap
 	vk::CommandPoolCreateInfo create {};
 	create.queueFamilyIndex = graphics.queue_family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
-	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
+	               vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+	const auto result = graphics.device.createCommandPool(&create, nullptr, &m_pool);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
 }
 
@@ -116,13 +116,13 @@ size_t CommandScheduler::CommandPool::Grow() {
 vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	auto       gpu_tick = m_master.KnownGpuTick();
 	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
-		for (size_t index = begin; index < end; ++index) {
-			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
-				return index;
-			}
-		}
-		return std::nullopt;
+        for (size_t index = begin; index < end; ++index) {
+            if (gpu_tick >= m_ticks[index]) {
+                m_ticks[index] = m_master.CurrentTick();
+                return index;
+            }
+        }
+        return std::nullopt;
 	};
 
 	auto found = search(m_hint, m_ticks.size());
@@ -204,7 +204,7 @@ void CommandScheduler::Shutdown() {
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
-		        m_priority_active);
+		        m_priority_active_tick != 0);
 		m_operation_state = OperationState::Closed;
 	}
 	m_operation_available.notify_all();
@@ -220,16 +220,6 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 
 	if (m_command.IsInvalid()) {
 		BeginNext();
-	}
-}
-
-void CommandScheduler::BeginRendering(const RenderState& state) {
-	Current().BeginRendering(state);
-}
-
-void CommandScheduler::EndRendering() {
-	if (Active() && !m_command.IsInvalid()) {
-		Current().EndRendering();
 	}
 }
 
@@ -295,12 +285,6 @@ void CommandScheduler::RecordedWork() {
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
-	BeginNext();
-}
-
-void CommandScheduler::FlushAndWait() {
-	const auto tick = Submit();
-	m_master.Wait(tick);
 	BeginNext();
 }
 
@@ -382,7 +366,7 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 
 bool CommandScheduler::HasPendingPriorityOperations() {
 	std::lock_guard lock(m_operation_mutex);
-	return !m_priority_operations.empty() || m_priority_active;
+	return !m_priority_operations.empty() || m_priority_active_tick != 0;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -398,7 +382,6 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			}
 			operation = std::move(m_priority_operations.front());
 			m_priority_operations.pop();
-			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
@@ -407,7 +390,6 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active      = false;
 			m_priority_active_tick = 0;
 		}
 		m_operation_available.notify_all();
@@ -418,14 +400,15 @@ void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(
-	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
+	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
-		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
+		const bool active_before_or_at =
+		    m_priority_active_tick != 0 && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
@@ -535,8 +518,8 @@ void CommandScheduler::EndGpuMarker(uint32_t scope, std::string_view name) {
 }
 
 uint32_t CommandScheduler::MarkerId(std::string_view name) {
-	auto [it, inserted] = m_marker_ids.try_emplace(std::string(name),
-	                                               static_cast<uint32_t>(m_marker_names.size()));
+	auto [it, inserted] =
+	    m_marker_ids.try_emplace(std::string(name), static_cast<uint32_t>(m_marker_names.size()));
 	if (inserted) {
 		m_marker_names.emplace_back(name);
 		m_marker_ns.push_back(0);
@@ -588,8 +571,8 @@ void CommandScheduler::DumpGpuMarkers() {
 void CommandScheduler::StartGpuTimer() {
 	m_gpu_timer_query = AllocateGpuTimer();
 	if (m_gpu_timer_query != UINT32_MAX) {
-		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe,
-		                                  m_gpu_timer_pool, m_gpu_timer_query);
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_gpu_timer_pool,
+		                                  m_gpu_timer_query);
 	}
 }
 
@@ -635,8 +618,8 @@ void CommandScheduler::RecordRecentSubmit(uint64_t tick, uint32_t op, uint64_t s
 	}
 }
 
-std::optional<CommandScheduler::RecentSubmit> CommandScheduler::FindRecentSubmit(
-    uint64_t tick) const {
+std::optional<CommandScheduler::RecentSubmit>
+CommandScheduler::FindRecentSubmit(uint64_t tick) const {
 	std::lock_guard lock(m_recent_submit_mutex);
 	for (auto it = m_recent_submits.rbegin(); it != m_recent_submits.rend(); ++it) {
 		if (it->tick == tick) {
@@ -717,10 +700,9 @@ void CommandScheduler::ReadGpuTimers() {
 		const auto timer = m_gpu_timer_pending.front();
 		m_gpu_timer_pending.pop_front();
 		std::array<uint64_t, 2> stamps {};
-		if (m_graphics.device.getQueryPoolResults(m_gpu_timer_pool, timer.query, 2, sizeof(stamps),
-		                                          stamps.data(), sizeof(uint64_t),
-		                                          vk::QueryResultFlagBits::e64) ==
-		        vk::Result::eSuccess &&
+		if (m_graphics.device.getQueryPoolResults(
+		        m_gpu_timer_pool, timer.query, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		        vk::QueryResultFlagBits::e64) == vk::Result::eSuccess &&
 		    stamps[1] >= stamps[0]) {
 			const auto ns =
 			    static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period);
@@ -738,7 +720,8 @@ void CommandScheduler::ReadGpuTimers() {
 					const auto gap = start - m_gpu_busy_end;
 					// Gaps longer than a second are pauses (loading, the menu idle), not bubbles.
 					if (gap < 1'000'000'000) {
-						Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuIdleGapNs, gap);
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuIdleGapNs,
+						                           gap);
 					}
 				}
 				const auto from = std::max(start, m_gpu_busy_end);
@@ -757,8 +740,6 @@ void CommandScheduler::ReadGpuTimers() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	if (m_host_read_barrier) {
 		m_command.EndRendering();

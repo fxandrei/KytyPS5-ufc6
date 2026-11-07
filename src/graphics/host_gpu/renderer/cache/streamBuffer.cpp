@@ -17,6 +17,9 @@ namespace {
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 
+constexpr vk::AccessFlags MEMORY_ACCESS =
+    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+
 [[nodiscard]] VmaAllocationCreateFlags AllocationFlags(MemoryUsage usage) {
 	switch (usage) {
 		case MemoryUsage::Upload:
@@ -68,13 +71,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
-	buffer_info.size        = size;
-	buffer_info.usage       = flags;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
 
-	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -85,9 +87,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	const auto        result        = static_cast<vk::Result>(
+        vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+	                                  &allocation_info, &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -116,16 +118,10 @@ Buffer::~Buffer() {
 	}
 }
 
-vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
-	EXIT_IF(m_device_address == 0);
-	return m_device_address;
-}
-
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
-		const auto result =
-		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
+		const auto result = vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -158,9 +154,7 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 }
 
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-                      uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
-                      vk::AccessFlags destination_before, vk::AccessFlags source_after,
-                      vk::AccessFlags destination_after) {
+                      uint64_t destination_offset, uint64_t size) {
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
 		EXIT("Buffer: invalid copy range\n");
@@ -171,28 +165,22 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	}
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
-	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
-	    Barrier(destination_offset, size, destination_before, vk::AccessFlagBits::eTransferWrite),
+	    source.Barrier(source_offset, size, vk::AccessFlagBits::eMemoryWrite,
+	                   vk::AccessFlagBits::eTransferRead),
+	    Barrier(destination_offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite),
 	};
-	const auto host_access  = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
-	auto       before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_before | destination_before) & host_access)) {
-		before_stage |= vk::PipelineStageFlagBits::eHost;
-	}
 	const auto native = command.Handle();
-	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
 	const vk::BufferMemoryBarrier after[] = {
-	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
-	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
+	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, MEMORY_ACCESS),
+	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS),
 	};
-	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_after | destination_after) & host_access)) {
-		after_stage |= vk::PipelineStageFlagBits::eHost;
-	}
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
@@ -202,16 +190,13 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	}
 	auto& command = Scheduler().Current();
 	command.EndRendering();
-	const auto before =
-	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	            vk::AccessFlagBits::eTransferWrite);
+	const auto before = Barrier(offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite);
 	const auto native = command.Handle();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
 	native.fillBuffer(Handle(), offset, size, value);
-	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
-	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
@@ -219,7 +204,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+    : Buffer(graphics, scheduler, usage, 0,
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

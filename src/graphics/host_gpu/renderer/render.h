@@ -10,7 +10,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -58,25 +57,23 @@ struct DrawIndirectArgs {
 };
 
 struct DrawIndexArgs {
-	uint32_t         index_count                = 0;
-	const void*      index_addr                 = nullptr;
-	uint32_t         instance_count             = 0;
-	uint32_t         index_type_and_size        = 0;
-	int32_t          base_vertex                = 0;
-	uint32_t         first_instance             = 0;
-	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	uint32_t         render_target_slice_offset = 0;
+	uint32_t         index_count         = 0;
+	const void*      index_addr          = nullptr;
+	uint32_t         instance_count      = 0;
+	uint32_t         index_type_and_size = 0;
+	int32_t          base_vertex         = 0;
+	uint32_t         first_instance      = 0;
+	DrawOffsetSource offset_source       = DrawOffsetSource::DrawState;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
-	uint32_t         vertex_count               = 0;
-	uint32_t         instance_count             = 0;
-	uint32_t         first_vertex               = 0;
-	uint32_t         first_instance             = 0;
-	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	uint32_t         render_target_slice_offset = 0;
+	uint32_t         vertex_count   = 0;
+	uint32_t         instance_count = 0;
+	uint32_t         first_vertex   = 0;
+	uint32_t         first_instance = 0;
+	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
 	DrawIndirectArgs indirect;
 };
 
@@ -112,7 +109,7 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
@@ -122,7 +119,7 @@ public:
 	[[nodiscard]] bool     IsRendering() const noexcept { return m_rendering; }
 	[[nodiscard]] uint64_t RenderingSerial() const noexcept { return m_rendering_serial; }
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
+	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -154,8 +151,8 @@ private:
 	mutable bool        m_rendering        = false;
 	mutable uint64_t    m_rendering_serial = 0;
 	HW::Context*        m_registers        = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	HW::UserConfig*     m_user_config      = nullptr;
+	HW::Shader*         m_shaders          = nullptr;
 
 	friend class CommandScheduler;
 };
@@ -171,7 +168,8 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 	// A guest synchronization point under AbSwitch GUEST_BARRIERS: all earlier work finishes and
@@ -180,15 +178,15 @@ public:
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void                           FindBuffers(std::span<PreparedBindings* const> stages);
-	void                           RebindBuffers(PreparedBindings& bindings);
-	void                           RebindImages(PreparedBindings& bindings);
+	void FindBuffers(std::span<PreparedBindings* const> stages);
+	void RebindBuffers(PreparedBindings& bindings);
+	void RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            uint64_t module_id = 0,
+	                                            uint64_t module_id      = 0,
 	                                            uint32_t resource_index = UINT32_MAX);
 
 private:
@@ -198,26 +196,24 @@ private:
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
-		std::optional<PreparedBindings> pixel;
+		PreparedBindings                pixel;
 	};
 
-	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
-	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
-	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
-	                              bool ignore_target_mask = false, bool exact_format = false);
-	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	void               PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
+	                                           std::span<RenderColorInfo>         colors);
+	void               ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
+	                                            uint32_t render_target_slot, bool ignore_target_mask = false,
+	                                            bool exact_format = false);
+	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	                                    const DrawEmitInfo& emit, DrawRenderState& state);
 	// Binds a guest dispatch's pipeline unless the command buffer already has it bound.
 	void BindComputePipeline(CommandBuffer& buffer, vk::Pipeline pipeline);
 	// The state a draw fills: m_draw_state reset, or a fresh one in `local`.
 	[[nodiscard]] DrawRenderState& BeginDrawState(std::optional<DrawRenderState>& local,
 	                                              const DrawIndirectArgs&         indirect);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
-	                                          const DrawCallInfo& draw,
-	                                          uint32_t            render_target_slice_offset,
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, const DrawEmitInfo& emit,
@@ -230,20 +226,18 @@ private:
 	// TargetMemo in renderDraw.cpp, AbSwitch DRAW_CHAIN).
 	[[nodiscard]] bool TakeTargetMemo(CommandBuffer& buffer, DrawRenderState& state);
 	[[nodiscard]] bool TargetMemoBound(const DrawRenderState& state) const;
-	void KeepTargetMemo(CommandBuffer& buffer, const DrawRenderState& state,
-	                    const RenderState& rendering, vk::ImageAspectFlags feedback_aspects);
-	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t render_target_slice_offset);
-	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
-	                                                       uint32_t render_target_slice_offset);
-	void                      BindImage(ImageId id, bool storage);
-	void                      BindRenderTarget(ImageId id);
-	void                      ResetBindings();
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	void               KeepTargetMemo(CommandBuffer& buffer, const DrawRenderState& state,
+	                                  const RenderState& rendering, vk::ImageAspectFlags feedback_aspects);
+	[[nodiscard]] bool ResolveColorTargets(CommandBuffer& buffer);
+	[[nodiscard]] bool ConsumeMetadataColorOperation(CommandBuffer& buffer);
+	void               BindImage(ImageId id, bool storage);
+	void               BindRenderTarget(ImageId id);
+	void               ResetBindings();
+	[[nodiscard]] bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+	                                              const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
-	                                        CommandBuffer& command, uint32_t group_x,
-	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                         CommandBuffer& command, uint32_t group_x,
+	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	// AbSwitch TARGET_LOOKUP_MEMO: the last resolution of each render-target slot.
 	struct ColorTargetMemo {
@@ -267,41 +261,51 @@ private:
 	// kept before FindImage remaps its mip/layer; no native image identity or view is cached.
 	struct TextureResolvePlan {
 		TextureCache::ImageDesc desc;
-		vk::Format             pixel_format = vk::Format::eUndefined;
-		vk::Format             view_format = vk::Format::eUndefined;
-		bool                   shader_conversion = false;
-		bool                   mapped = true;
+		vk::Format              pixel_format      = vk::Format::eUndefined;
+		vk::Format              view_format       = vk::Format::eUndefined;
+		bool                    shader_conversion = false;
+		bool                    mapped            = true;
 	};
 	struct TexturePlanMemoEntry {
-		uint64_t                module_id = 0;
+		uint64_t                module_id      = 0;
 		uint32_t                resource_index = UINT32_MAX;
-		std::array<uint32_t, 6> resource_key {};
+		std::array<uint32_t, 7> resource_key {};
 		std::array<uint32_t, 8> fields {};
 		bool                    valid = false;
 		TextureResolvePlan      plan;
 	};
-	[[nodiscard]] TextureResolvePlan BuildTextureResolvePlan(
-	    const ShaderRecompiler::IR::ImageResource& resource,
-	    const ShaderTextureResource& descriptor, bool use_info_memo);
+	[[nodiscard]] TextureResolvePlan
+	BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResource& resource,
+	                        const ShaderTextureResource& descriptor, bool use_info_memo);
 	[[nodiscard]] static bool SameTextureResolvePlan(const TextureResolvePlan& left,
-	                                                const TextureResolvePlan& right);
+	                                                 const TextureResolvePlan& right);
 
-	RenderContext&                        m_context;
+	RenderContext& m_context;
 	// The draw state DrawIndex and DrawAuto reuse (AbSwitch EXACT_DRAW_STATE); draws do not nest.
-	DrawRenderState                       m_draw_state;
-	std::array<ColorTargetMemo, 8>        m_color_target_memo;
-	DepthTargetMemo                       m_depth_target_memo;
-	std::vector<TexturePlanMemoEntry>     m_texture_plan_memo;
-	uint64_t                              m_texture_plan_probe_calls = 0;
-	uint64_t                              m_texture_plan_probe_hits = 0;
+	DrawRenderState                   m_draw_state;
+	std::array<ColorTargetMemo, 8>    m_color_target_memo;
+	DepthTargetMemo                   m_depth_target_memo;
+	std::vector<TexturePlanMemoEntry> m_texture_plan_memo;
+	uint64_t                          m_texture_plan_probe_calls = 0;
+	uint64_t                          m_texture_plan_probe_hits  = 0;
+	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
+	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
+	struct MipStatsCounter {
+		uint8_t finest_level = 15; // no samples
+		bool    clamped      = false;
+		bool    unclamped    = false;
+	};
+
+	bool                                 m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
-	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
-	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
-	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<ImageId>                 m_bound_images;
+	std::vector<vk::DescriptorImageInfo> m_descriptor_images;
+	std::vector<vk::WriteDescriptorSet>  m_descriptor_writes;
+	vk::DescriptorSetLayout              m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                   m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                         m_pssr_pipeline          = nullptr;
+	std::array<MipStatsCounter, 256>     m_mip_stats {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

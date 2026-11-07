@@ -87,8 +87,8 @@ enum class Counter {
 	RecordStreamDirectCalls, // Calls that drained and ran on the caller: a missing hook.
 	RecordStreamSleeps,      // Times the consumer slept.
 	// The draw chain (AbSwitch DRAW_CHAIN).
-	DrawChainTaken,   // Draws that took the previous draw's render targets.
-	DrawChainDynKept, // ... whose dynamic state the previous draw's record covered (bit 46).
+	DrawChainTaken,    // Draws that took the previous draw's render targets.
+	DrawChainDynKept,  // ... whose dynamic state the previous draw's record covered (bit 46).
 	DrawChainPipeKept, // ... that took the previous pipeline without building its key (bit 47).
 	// Why a draw did not take the previous draw's render targets (DRAW_CHAIN on, memo rejected).
 	TargetMemoStructureMiss, // An image was registered or unregistered since the memo was kept.
@@ -98,6 +98,11 @@ enum class Counter {
 	TargetMemoSerialMiss,    // A command since changed a register the targets resolve from.
 	TargetMemoRenderingMiss, // No rendering instance is open, or a command since began another.
 	TargetMemoMaskMiss,      // Different attachment mask, slice or pixel-shader state.
+	// Overlapping host elapsed timings, including waits.
+	GpuThreadBusyNs,
+	PresentNs, // Includes image acquire and overlay preparation.
+	PresentAcquireNs,
+	OverlayNs,
 	Count
 };
 
@@ -166,6 +171,7 @@ public:
 
 class ScopedTimer final {
 public:
+	explicit ScopedTimer(Counter duration): ScopedTimer(Counter::Count, duration) {}
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
 	      m_start(Enabled() ? std::chrono::steady_clock::now()
@@ -178,7 +184,9 @@ public:
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                              std::chrono::steady_clock::now() - m_start)
 		                              .count());
-		Add(m_count);
+		if (m_count != Counter::Count) {
+			Add(m_count);
+		}
 		Add(m_duration, elapsed);
 		if (m_peak != Peak::Count) {
 			auto& peak     = Detail::g_peaks[static_cast<int>(m_peak)];

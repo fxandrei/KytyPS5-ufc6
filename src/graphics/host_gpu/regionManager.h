@@ -16,12 +16,7 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
@@ -88,9 +83,6 @@ class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
-		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
-			EXIT("invalid region tracking manager construction\n");
-		}
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
@@ -98,24 +90,18 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
-	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto [start, end] = GetPageRange(offset, size);
 		return GetBits<source>().AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
-	void ChangeState(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void ChangeState(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
-			}
-		}
-		if constexpr (source == DirtySource::Gpu && enable) {
-			if (m_cpu_dirty.AnyInRange(start, end)) {
-				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
 		auto& bits = GetBits<source>();
@@ -132,9 +118,9 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		auto&      bits         = GetBits<source>();
+	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(offset, size);
+		auto& bits              = GetBits<source>();
 		if (!bits.AnyInRange(start, end)) {
 			return;
 		}
@@ -185,12 +171,7 @@ private:
 		}
 	}
 
-	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
-		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
-		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
-			EXIT("range lies outside its tracking region\n");
-		}
-		const auto offset = vaddr - m_cpu_addr;
+	[[nodiscard]] static std::pair<size_t, size_t> GetPageRange(uint64_t offset, uint64_t size) {
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}

@@ -16,7 +16,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 
@@ -42,7 +41,6 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
-                                              uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
@@ -55,7 +53,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const bool memo_enabled =
 	    stamp != 0 && Common::AbSwitch::Enabled(Common::AbSwitch::TARGET_LOOKUP_MEMO);
 	if (memo_enabled && memo.stamp == stamp && memo.target_mask == hw.GetRenderTargetMask() &&
-	    memo.slice_offset == render_target_slice_offset &&
 	    memo.ignore_target_mask == ignore_target_mask && memo.exact_format == exact_format &&
 	    memo.generation == texture_cache.StructureGeneration()) {
 		r = memo.target;
@@ -70,7 +67,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			memo = {stamp,
 			        texture_cache.StructureGeneration(),
 			        hw.GetRenderTargetMask(),
-			        render_target_slice_offset,
+			        0,
 			        ignore_target_mask,
 			        exact_format,
 			        metadata_base_layer,
@@ -78,8 +75,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 	};
 
-	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	const auto& rt   = hw.GetRenderTarget(rt_slot);
+	auto        mask = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
@@ -93,10 +90,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
 			if (log_id < 128) {
 				LOGF("RenderColorTarget: no color output slot=%" PRIu32 " base=0x%010" PRIx64
-				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32
-				     " rt_slice_offset=%" PRIu32 "\n",
-				     rt_slot, rt.base.addr, mask, hw.GetRenderTargetMask(),
-				     render_target_slice_offset);
+				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32 "\n",
+				     rt_slot, rt.base.addr, mask, hw.GetRenderTargetMask());
 			}
 		}
 
@@ -118,19 +113,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
-	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
-		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
-		     rt.view.current_mip_level, levels);
-	}
-	static constexpr std::array image_types {Prospero::ImageType::kColor1D,
-	                                         Prospero::ImageType::kColor2D,
-	                                         Prospero::ImageType::kColor3D};
-	if (rt.attrib3.dimension >= image_types.size()) {
+	if (rt.attrib3.dimension > 2u) {
 		EXIT("unsupported render-target dimension: %u\n", rt.attrib3.dimension);
 	}
-	const auto image_type = image_types[rt.attrib3.dimension];
-	const bool is_1d      = image_type == Prospero::ImageType::kColor1D;
-	const bool volume     = image_type == Prospero::ImageType::kColor3D;
+	// 1D targets are 2D images one texel high.
+	const bool is_1d  = rt.attrib3.dimension == 0u;
+	const bool volume = rt.attrib3.dimension == 2u;
 	if (is_1d && rt.attrib2.height != 0) {
 		EXIT("1D render target has nonzero height: %u\n", rt.attrib2.height);
 	}
@@ -146,20 +134,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const uint32_t depth = volume ? rt.attrib3.depth + 1u : 1u;
 	// For volumes, CB_COLOR_VIEW bounds exported slices; ATTRIB3 defines storage depth.
 	// The host attachment contains only the selected slices that exist in this mip.
-	const uint32_t last_layer = volume
-	                                ? std::min(rt.view.last_array_slice_index,
-	                                           std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
-	                                : rt.view.last_array_slice_index;
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, last_layer, render_target_slice_offset);
-	switch (view.type) {
-		case TargetViewType::Image2D:
-		case TargetViewType::Image2DArray: break;
-		case TargetViewType::Unsupported:
-			EXIT("invalid render-target view: base=%u last=%u draw_offset=%u\n",
-			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
-			     render_target_slice_offset);
+	const uint32_t last_layer =
+	    volume ? std::min(rt.view.last_array_slice_index,
+	                      std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
+	           : rt.view.last_array_slice_index;
+	if (rt.view.base_array_slice_index > last_layer) {
+		EXIT("invalid render-target view: base=%u last=%u\n", rt.view.base_array_slice_index,
+		     last_layer);
 	}
+	const auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index, last_layer);
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic_uint log_count = 0;
 		const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
@@ -179,13 +162,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// The normal copy operation is a regular color write, not an attachment clear.
 	// Nonlinear clear values are still stored as normalized components.
 	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
-	uint32_t   width  = 0;
-	uint32_t       height       = 0;
-	bool       tile   = false;
-	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
-	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
-	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	uint32_t   width        = 0;
+	uint32_t   height       = 0;
+	bool       tile         = false;
+	const bool standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
+	const bool standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const bool texture_tile = standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
@@ -193,7 +176,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:
 		case Prospero::TileMode::kRenderTarget:
-			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
+			tile = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
 			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}
@@ -211,6 +194,19 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	height = rt.attrib2.height + 1;
 	const auto target_format =
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
+	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
+	// mip 0's padded pitch aliases mip 0's top-left texels.
+	uint32_t mip = rt.view.current_mip_level;
+	if (mip != 0 && levels == 1 && samples == 1 && !volume &&
+	    TileGetTexturePitch(target_format.guest_format, std::max(width >> mip, 1u),
+	                        rt.attrib3.tile_mode) ==
+	        TileGetTexturePitch(target_format.guest_format, width, rt.attrib3.tile_mode)) {
+		mip = 0;
+	}
+	if (mip >= levels) {
+		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
+		     rt.view.current_mip_level, levels);
+	}
 	const auto bytes_per_element = target_format.bytes_per_element;
 	if (bytes_per_element == 0) {
 		EXIT("render-target format has no valid element size\n");
@@ -240,14 +236,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	auto& desc = r.desc;
+	auto& desc             = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data            = {rt.base.addr, 0};
+	desc.info.data         = {rt.base.addr, 0};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
-	desc.info.type         = image_type;
+	desc.info.type         = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
 	desc.info.extent       = {width, height, depth};
-	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
+	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
@@ -259,13 +255,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (!desc.info.data.Valid()) {
 		EXIT("render-target backing range is invalid\n");
 	}
-	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
-	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
-	                            rt.cmask.addr != 0 &&
-	                            !rt.attrib3.write_vrs_rate_hint_to_cmask;
+	const bool has_dcc   = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+	const bool has_cmask = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
+	                       rt.cmask.addr != 0 && !rt.attrib3.write_vrs_rate_hint_to_cmask;
 	if (has_dcc || has_cmask) {
 		TileSizeAlign metadata_size {};
-		const auto layers = volume ? depth : view.image_layers;
+		const auto    layers = volume ? depth : view.image_layers;
 		if (has_dcc) {
 			(void)TileGetDccSize(width, height, layers, bytes_per_element, levels,
 			                     rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
@@ -274,27 +269,22 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
 		}
 		// DCC owns the clear when both planes are enabled.
-		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
+		desc.info.metadata.kind  = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
 		desc.info.metadata.clear_word =
 		    rt.clear_word0.word0 | (uint64_t {rt.clear_word1.word1} << 32u);
 		desc.info.metadata.clear_register_valid = true;
 	}
 	desc.view_info.format = target_format.format;
-	if (is_1d) {
-		desc.view_info.type =
-		    view.layer_count == 1 ? vk::ImageViewType::e1D : vk::ImageViewType::e1DArray;
-	} else {
-		desc.view_info.type =
-		    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
-	}
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
 	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
-	desc.view_info.base_level  = rt.view.current_mip_level;
+	desc.view_info.base_level  = mip;
 	desc.view_info.level_count = 1;
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	r.guest_mip_level          = rt.view.current_mip_level;
+	r.guest_mip_level          = mip;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;

@@ -142,17 +142,17 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
-		const bool registered = m_command_scheduler.Active() &&
-		                        (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		                         m_texture_cache.IsRegionRegistered(vaddr, size));
-		if (registered || (m_command_scheduler.Active() &&
-		                   m_command_scheduler.HasPendingPriorityOperations())) {
+		const bool registered =
+		    m_command_scheduler.Active() && (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                                     m_texture_cache.IsRegionRegistered(vaddr, size));
+		if (registered ||
+		    (m_command_scheduler.Active() && m_command_scheduler.HasPendingPriorityOperations())) {
 			if (!registered) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::UnmapWaitsUnregistered);
 			}
 			Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::UnmapWaits,
 			                                         Common::DebugCounters::Counter::UnmapWaitNs);
-			const auto tick = m_command_scheduler.CurrentTick();
+			const auto                         tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}

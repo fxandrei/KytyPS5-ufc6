@@ -42,22 +42,22 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
-	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
-	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
-	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
-	ImageHeap&          GetImageHeap() { return m_image_heap; }
-	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
-	BufferCache&        GetBufferCache() { return m_buffer_cache; }
-	TextureCache&       GetTextureCache() { return m_texture_cache; }
-	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
-	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
+	Common::Mutex&    GetMutex() { return m_mutex; }
+	CommandScheduler& GetCommandScheduler() { return m_command_scheduler; }
+	PipelineCache&    GetPipelineCache() { return m_pipeline_cache; }
+	DescriptorHeap&   GetDescriptorHeap() { return m_descriptor_heap; }
+	ImageHeap&        GetImageHeap() { return m_image_heap; }
+	SamplerCache&     GetSamplerCache() { return m_sampler_cache; }
+	BufferCache&      GetBufferCache() { return m_buffer_cache; }
+	TextureCache&     GetTextureCache() { return m_texture_cache; }
+	RenderExecutor&   GetRenderExecutor() { return m_render_executor; }
+	OcclusionQueries& GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	// See LibKernel::Memory::TryReadGpuCleanBytes.
 	[[nodiscard]] bool ReadCleanBytes(uint64_t vaddr, void* data, uint64_t size) noexcept;
 	// KYTY_TRACE_WRITES diagnostics: the GPU-dirty range under a read that has to wait for it.
-	void TraceDirtyRead(const char* what, uint64_t vaddr) noexcept;
+	void               TraceDirtyRead(const char* what, uint64_t vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
@@ -65,10 +65,10 @@ public:
 	void               PrepareBda();
 	// AbSwitch BDA_SYNC_PER_SUBMIT: the next PrepareBda synchronizes (a submission slice starts, or
 	// the command processor wrote guest memory).
-	void               RequestBdaSync() noexcept { m_bda_sync_requested = true; }
+	void RequestBdaSync() noexcept { m_bda_sync_requested = true; }
 	// The command processor wrote [vaddr, vaddr + size): see AbSwitch BDA_SYNC_WRITE_RANGES.
-	void               RequestBdaSync(uint64_t vaddr, uint64_t size);
-	void               RunGarbageCollector();
+	void RequestBdaSync(uint64_t vaddr, uint64_t size);
+	void RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -95,9 +95,9 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
-	VideoOut::VideoOutDriver* m_video_out = nullptr;
+	VideoOut::VideoOutDriver* m_video_out             = nullptr;
 	bool                      m_fault_process_pending = false;
-	bool                      m_bda_logged = false;
+	bool                      m_bda_logged            = false;
 	bool                      m_bda_sync_requested    = true;
 	RangeSet                  m_bda_written; // By the command processor (BDA_SYNC_WRITE_RANGES).
 

@@ -520,7 +520,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		auto& producer = entry->second;
 		if (inserted) {
 			Block translated;
-			Frontend::Translator translator(query, &translated, 1u,
+			Frontend::Translator translator(query, &translated, 1u, Frontend::NoLaneSpills,
 			    (options.input_info.compute->float_mode & 0x10u) == 0u,
 			    !options.input_info.compute->async_compute);
 			translator.TranslateInstruction(source.decoded.instructions[index]);
@@ -757,13 +757,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
 				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
 		}
-	}
-	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u\n",
-		     static_cast<unsigned>(options.stage));
 	}
 
 	const auto* stage        = StageName(options.stage);

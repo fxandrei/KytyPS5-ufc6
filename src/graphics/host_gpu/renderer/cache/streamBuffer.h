@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -50,8 +51,11 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
-	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
+	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
+        EXIT_IF(m_device_address == 0);
+        return m_device_address;
+	}
+	[[nodiscard]] uint64_t Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
@@ -71,14 +75,7 @@ public:
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-	              uint64_t destination_offset, uint64_t size,
-	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
+	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
@@ -97,18 +94,18 @@ private:
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
 
-	GraphicContext*               m_graphics    = nullptr;
-	CommandScheduler*             m_scheduler   = nullptr;
-	uint64_t                      m_last_gpu_write_tick = 0;
-	bool                          m_waited_for_readback = false;
-	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
-	uint64_t                      m_cpu_address = 0;
-	vk::DeviceAddress             m_device_address = 0;
-	vk::Buffer                    m_buffer     = nullptr;
-	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
-	bool                          m_coherent = false;
-	std::span<uint8_t>            m_mapped;
+	GraphicContext*    m_graphics            = nullptr;
+	CommandScheduler*  m_scheduler           = nullptr;
+	uint64_t           m_last_gpu_write_tick = 0;
+	bool               m_waited_for_readback = false;
+	MemoryUsage        m_usage               = MemoryUsage::DeviceLocal;
+	uint64_t           m_cpu_address         = 0;
+	vk::DeviceAddress  m_device_address      = 0;
+	vk::Buffer         m_buffer              = nullptr;
+	VmaAllocation      m_allocation          = nullptr;
+	uint64_t           m_size;
+	bool               m_coherent = false;
+	std::span<uint8_t> m_mapped;
 };
 
 class StreamBuffer final: public Buffer {

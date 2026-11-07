@@ -16,7 +16,6 @@
 #include <atomic>
 #include <bitset>
 #include <map>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -35,7 +34,7 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
 class TextureCache {
@@ -54,23 +53,23 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	[[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_format = false);
 	// Changes whenever an image is registered or unregistered, i.e. whenever FindImage could
 	// resolve an unchanged render-target descriptor differently (AbSwitch TARGET_LOOKUP_MEMO).
 	[[nodiscard]] uint64_t StructureGeneration() const noexcept { return m_structure_generation; }
 	// FindImage's work after the lookup, for an image that an identical earlier lookup returned
 	// while StructureGeneration was the same; desc is that lookup's (possibly remapped) descriptor.
-	void ReuseImage(ImageId id, ImageDesc& desc, uint32_t metadata_base_layer);
-	void                        UpdateImage(ImageId id);
-	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
-	                                               bool ensure_valid = true);
+	void                  ReuseImage(ImageId id, ImageDesc& desc, uint32_t metadata_base_layer);
+	void                  UpdateImage(ImageId id);
+	[[nodiscard]] ImageId FindImageFromRange(uint64_t address, uint64_t size,
+	                                         bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
-		auto& image = m_slot_images[id];
-		TouchImage(image);
-		return image;
+        auto& image = m_slot_images[id];
+        TouchImage(image);
+        return image;
 	}
 	void MarkGpuWritten(ImageId id);
 
@@ -112,20 +111,12 @@ private:
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
-	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
+	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
-		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
 		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
-			if constexpr (RETURNS_BOOL) {
-				if (func(page)) {
-					break;
-				}
-			} else {
-				func(page);
-			}
+			func(page);
 		}
 	}
 
@@ -147,23 +138,21 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
-	// Caller holds m_lock; it also serializes the per-image query epoch.
-	uint64_t                    m_structure_generation = 1;
-	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
-	                                               bool page_overlap) const;
+	uint64_t m_structure_generation = 1;
+	// Caller holds m_lock; it also serializes Image::picked.
+	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -172,31 +161,29 @@ private:
 	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
 	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
 	// render area.
-	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
-	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level, uint32_t layer,
+	                               uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
-	void PrepareImageCopy(Image& image);
-	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	void       RefreshCopySource(ImageId id);
+	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
+	void                  CopyImage(ImageId destination, ImageId source);
 	void                  CopyStencil(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
-	std::atomic<uint32_t>                             m_pending_publishes {0};
-	PageManager&                                      m_page_manager;
-	BlitHelper                                        m_blit_helper;
-	TileManager                                       m_tiler;
-	BufferCache&                                      m_buffer_cache;
-	Common::SlotVector<Image>                         m_slot_images;
-	ImagePageTable                                    m_image_page_table;
+	GraphicContext&           m_graphics;
+	CommandScheduler&         m_scheduler;
+	TrackingSpinLock          m_lock;
+	std::atomic<uint32_t>     m_pending_publishes {0};
+	PageManager&              m_page_manager;
+	BlitHelper                m_blit_helper;
+	TileManager               m_tiler;
+	BufferCache&              m_buffer_cache;
+	Common::SlotVector<Image> m_slot_images;
+	ImagePageTable            m_image_page_table;
 	// Registered images per start address (AbSwitch IMAGE_START_INDEX): FindImageFromRange and
 	// InvalidateMemoryFromGPU only care about images that start at the bound address. A bit per
 	// hashed start bucket answers most lookups, which miss, without touching the map.
@@ -212,14 +199,14 @@ private:
 	std::unordered_map<uint64_t, uint32_t> m_image_starts;
 	std::vector<uint32_t> m_start_bucket_counts = std::vector<uint32_t>(1u << START_BUCKET_BITS);
 	std::array<uint64_t, (1u << START_BUCKET_BITS) / 64u> m_start_bucket_bits {};
-	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
-	std::unordered_set<ImageId>                       m_download_images;
-	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	Common::LeastRecentlyUsedCache<ImageId, uint64_t>     m_lru_cache;
+	std::unordered_set<ImageId>                           m_download_images;
+	std::map<uint64_t, MetaDataInfo>                      m_surface_metas;
 	// The last metadata entry looked up: consecutive binds usually name the same HTile/CMASK
 	// surface, and a tree walk plus a 1 KiB node per bind showed in the profile. Nodes are stable;
 	// every erase drops the memo (ForgetMetaMemo), and it is only used with m_lock held.
-	uint64_t      m_meta_memo_address = 0;
-	MetaDataInfo* m_meta_memo         = nullptr;
+	uint64_t                    m_meta_memo_address = 0;
+	MetaDataInfo*               m_meta_memo         = nullptr;
 	[[nodiscard]] MetaDataInfo* FindMeta(uint64_t address) {
 		if (m_meta_memo != nullptr && m_meta_memo_address == address) {
 			return m_meta_memo;
@@ -234,14 +221,14 @@ private:
 			m_meta_memo = nullptr;
 		}
 	}
-	void ForgetMetaMemo() { m_meta_memo = nullptr; }
-	uint64_t                                          m_total_used_memory  = 0;
-	uint64_t                                          m_trigger_gc_memory  = 0;
-	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
-	bool             m_readback_linear_images = false;
-	bool             m_readback_tiled_images  = false;
+	void     ForgetMetaMemo() { m_meta_memo = nullptr; }
+	uint64_t m_total_used_memory      = 0;
+	uint64_t m_trigger_gc_memory      = 0;
+	uint64_t m_pressure_gc_memory     = 1536ull * 1024 * 1024;
+	uint64_t m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t m_gc_tick                = 0;
+	bool     m_readback_linear_images = false;
+	bool     m_readback_tiled_images  = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

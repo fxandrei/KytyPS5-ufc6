@@ -10,11 +10,13 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <queue>
 
@@ -38,16 +40,14 @@ public:
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
-	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
-	void           BeginRendering(const RenderState& state);
-	void           EndRendering();
-	void           Flush();
-	void           Flush(SubmitInfo& submit);
+	void Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void EndRendering() { m_command.EndRendering(); }
+	void Flush();
+	void Flush(SubmitInfo& submit);
 	// Flush for a caller that waits for this work next: with AbSwitch DIRECT_URGENT_SUBMIT the
 	// command buffer is submitted on this thread, after the queued ones, so the submission
 	// thread's wake-up does not add to the wait.
 	void           FlushUrgent();
-	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	// A compute dispatch deferred its post-dispatch ShaderAccessBarrier (AbSwitch COMPUTE_CHAIN):
@@ -55,18 +55,18 @@ public:
 	void DeferShaderAccessBarrier();
 	// Records the pending deferred barrier on the current command buffer, if any. `full` selects a
 	// GuestFlushBarrier (AbSwitch BARRIER_LITE off) instead of the narrow compute one.
-	void FlushDeferredShaderAccessBarrier(bool full);
+	void               FlushDeferredShaderAccessBarrier(bool full);
 	[[nodiscard]] bool HasDeferredShaderAccessBarrier() const noexcept {
 		return m_deferred_shader_access;
 	}
-	uint64_t       Submit(SubmitInfo submit = {});
+	uint64_t Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
-	void                      Shutdown();
-	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
-	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
+	void Shutdown();
+	void Wait(uint64_t tick);
+	void PopPendingOperations();
+	void DrainPriorityOperations();
+	void WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
@@ -121,11 +121,11 @@ public:
 	// so they do not make cached images look older than before.
 	[[nodiscard]] uint64_t AgeTick() const noexcept { return CurrentTick() - m_eager_submits; }
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
-	void                           CheckActive() const;
-	CommandBuffer&                 Current();
-	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
-	[[nodiscard]] bool             IsFree(uint64_t tick);
+	[[nodiscard]] bool     Active() const noexcept { return m_command.m_registers != nullptr; }
+	void                   CheckActive() const;
+	CommandBuffer&         Current();
+	[[nodiscard]] uint64_t CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] bool     IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
@@ -160,14 +160,14 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	void BeginNext();
-	void StartGpuTimer();
-	void EndGpuTimer(uint64_t tick);
-	void ReadGpuTimers();
+	void                   BeginNext();
+	void                   StartGpuTimer();
+	void                   EndGpuTimer(uint64_t tick);
+	void                   ReadGpuTimers();
 	void                   ReportStall(uint64_t tick);
 	void                   SetGpuCheckpoint(std::string_view name);
 	[[nodiscard]] uint32_t MarkerId(std::string_view name);
-	void PriorityOperationsThread(std::stop_token stop);
+	void                   PriorityOperationsThread(std::stop_token stop);
 	// AbSwitch QUEUED_SUBMIT: m_submit_thread submits these in order.
 	struct QueuedSubmit {
 		vk::CommandBuffer buffer;
@@ -200,14 +200,13 @@ private:
 	std::condition_variable_any  m_submit_changed;
 	std::deque<QueuedSubmit>     m_submit_queue;
 	bool                         m_submit_busy = false;
-	std::jthread                 m_submit_thread; // Started by the first queued submit.
+	std::jthread                 m_submit_thread;        // Started by the first queued submit.
 	std::atomic<uint32_t>        m_record_thread_id {0}; // The stream consumer (OWN_CORES).
 	// Deferred recording (AbSwitch RECORD_THREAD): the GPU thread's commands and submits,
 	// recorded and submitted in order by the submit thread (see CommandStream).
 	std::unique_ptr<CommandStream> m_stream;
-	bool                         m_priority_active      = false;
-	uint64_t                     m_priority_active_tick = 0;
-	OperationState               m_operation_state      = OperationState::Open;
+	uint64_t                       m_priority_active_tick = 0; // 0 while none runs
+	OperationState                 m_operation_state      = OperationState::Open;
 
 	// Diagnostics while the counters are on: GPU execution time of each command buffer, from
 	// timestamps at its start and end, read once its tick completes (Counter::GpuBusyNs).
@@ -226,8 +225,7 @@ private:
 		uint32_t op        = 0; // CommandBufferDebugOp
 		uint64_t submit_id = 0;
 	};
-	void                                      RecordRecentSubmit(uint64_t tick, uint32_t op,
-	                                                             uint64_t submit_id);
+	void RecordRecentSubmit(uint64_t tick, uint32_t op, uint64_t submit_id);
 	[[nodiscard]] std::optional<RecentSubmit> FindRecentSubmit(uint64_t tick) const;
 	mutable std::mutex                        m_recent_submit_mutex;
 	std::deque<RecentSubmit>                  m_recent_submits;
@@ -242,8 +240,8 @@ private:
 	std::vector<std::string>                  m_marker_names;
 	std::vector<uint64_t>                     m_marker_ns;
 	std::vector<uint64_t>                     m_marker_counts;
-	uint64_t                                  m_marker_dump_ms = 0;
-	uint64_t                                  m_gpu_busy_end   = 0; // ns on the GPU clock
+	uint64_t                                  m_marker_dump_ms        = 0;
+	uint64_t                                  m_gpu_busy_end          = 0; // ns on the GPU clock
 	uint32_t                                  m_recorded_since_submit = 0;
 	uint64_t                                  m_eager_submits         = 0;
 	bool                                      m_graphics_checkpoints  = false;
