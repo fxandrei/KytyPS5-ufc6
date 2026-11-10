@@ -849,13 +849,6 @@ static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectO
 	return true;
 }
 
-void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-                                    uint32_t draw_initiator, bool indexed) {
-	const auto args_size =
-	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
-}
-
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
@@ -1058,7 +1051,8 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
-                                  uint64_t data, uint32_t interrupt_context_id) {
+                                  uint64_t data, uint32_t interrupt_context_id,
+                                  bool gl2_writeback) {
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1080,6 +1074,10 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 	// An end-of-pipe event follows all earlier work of the queue.
 	m_renderer.GetRenderExecutor().GuestFlush();
+	// A GL2 writeback makes GPU writes CPU-visible even without a signal.
+	if (gl2_writeback) {
+		WriteBackImages();
+	}
 	if (data_sel == 0 && !interrupt) {
 		return;
 	}
@@ -1153,6 +1151,14 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 			    });
 		}
+	}
+}
+
+void CommandProcessor::WriteBackImages() {
+	// GPU-written images are copied back without holding any signal: a held signal exposes the host
+	// GPU's speed. Guest accesses to them wait for the copies.
+	if (m_renderer.GetTextureCache().WriteBackImages()) {
+		GetScheduler().Flush();
 	}
 }
 

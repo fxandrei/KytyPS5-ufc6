@@ -1292,7 +1292,7 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 }
 
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}
@@ -2155,10 +2155,6 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
-		}
-	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
 			memory.resource = image_remap[memory.resource];
 		}
 	}

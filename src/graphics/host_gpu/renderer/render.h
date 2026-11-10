@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -236,8 +237,17 @@ private:
 	[[nodiscard]] bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                              const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
-	                                         CommandBuffer& command, uint32_t group_x,
-	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                                  Dlss::Inputs& inputs);
+
+	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
+	struct DlssContext {
+		uint64_t       context;
+		Dlss::Creation creation;
+		Dlss::Feature* feature;
+	};
 
 	// AbSwitch TARGET_LOOKUP_MEMO: the last resolution of each render-target slot.
 	struct ColorTargetMemo {
@@ -299,13 +309,14 @@ private:
 	bool                                 m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
-	std::vector<ImageId>                 m_bound_images;
-	std::vector<vk::DescriptorImageInfo> m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>  m_descriptor_writes;
-	vk::DescriptorSetLayout              m_pssr_descriptor_layout = nullptr;
-	vk::PipelineLayout                   m_pssr_pipeline_layout   = nullptr;
-	vk::Pipeline                         m_pssr_pipeline          = nullptr;
-	std::array<MipStatsCounter, 256>     m_mip_stats {};
+	std::vector<ImageId>                  m_bound_images;
+	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
+	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<DlssContext>              m_dlss_contexts;
+	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
