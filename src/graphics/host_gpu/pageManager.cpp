@@ -10,9 +10,9 @@
 #include <atomic>
 #include <bit>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -275,17 +275,15 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 PageAccessLookup* PageManager::AccessLookup() noexcept {
 	static PageAccessLookup lookup = [] {
 		PageAccessLookup result;
-		Impl::PageState  watched {};
-		watched.AddDelta<1, true>(0);
-		std::memcpy(&result.access_mask, &watched, sizeof(result.access_mask));
-		const auto region   = std::make_unique<Impl::Region>();
+		// Read watchers are a full counter: every nonzero count prevents guest reads.
+		result.access_mask = UINT8_MAX;
 		result.region_count = REGION_COUNT;
 		result.region_shift = static_cast<uint32_t>(std::countr_zero(REGION_SIZE));
 		result.page_shift   = static_cast<uint32_t>(std::countr_zero(PAGE_SIZE));
 		result.page_mask    = static_cast<uint32_t>(REGION_PAGES - 1);
-		result.pages_offset =
-		    static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(region->pages.data()) -
-		                          reinterpret_cast<const uint8_t*>(region.get()));
+		result.pages_offset = static_cast<uint32_t>(offsetof(Impl::Region, pages) +
+		                                            offsetof(Impl::PageState, access_watchers));
+		result.page_stride = static_cast<uint32_t>(sizeof(Impl::PageState));
 		return result;
 	}();
 	static_assert(sizeof(std::atomic<Impl::Region*>) == sizeof(Impl::Region*));

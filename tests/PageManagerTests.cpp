@@ -483,6 +483,68 @@ void TestRegionEndpointBatching() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// Read the same byte and mask as the SRT walker, without depending on PageState's layout.
+void TestAccessLookup() {
+  const auto *lookup = PageManager::AccessLookup();
+  Check(lookup->regions == nullptr, "access lookup retained a destroyed manager");
+  {
+    PageManager manager;
+    constexpr auto page_size = TRACKER_PAGE_SIZE;
+    constexpr auto region_size = TRACKER_REGION_SIZE;
+    constexpr auto page_count = region_size / page_size;
+    auto *memory = Allocate(region_size * 2);
+    const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+    const auto region_base =
+        (allocation_base + region_size - 1) & ~(region_size - 1);
+    Check(region_base + region_size <= allocation_base + region_size * 2,
+          "test allocation does not contain a complete tracking region");
+    const auto ReadWatchers = [&](uint64_t address) {
+      const auto region_index = address >> lookup->region_shift;
+      Check(lookup->regions != nullptr && region_index < lookup->region_count,
+            "access lookup has no live region table for the address");
+      uintptr_t region = 0;
+      const auto *regions = static_cast<const uint8_t *>(lookup->regions);
+      std::memcpy(&region, regions + region_index * sizeof(region), sizeof(region));
+      if (region == 0) {
+        return uint8_t{0};
+      }
+      const auto page_index = (address >> lookup->page_shift) & lookup->page_mask;
+      const auto *state = reinterpret_cast<const uint8_t *>(region) +
+                          lookup->pages_offset + page_index * lookup->page_stride;
+      return static_cast<uint8_t>(*state & lookup->access_mask);
+    };
+    const auto CheckWatchers = [&](uint8_t expected) {
+      for (uint64_t page = 0; page < page_count; ++page) {
+        const auto count = page % 2 == 0 ? expected : uint8_t{0};
+        Check(ReadWatchers(region_base + page * page_size) == count &&
+                  ReadWatchers(region_base + (page + 1) * page_size - 1) == count,
+              "access lookup confused adjacent pages or lost read-watcher counts");
+      }
+    };
+    CheckWatchers(0);
+    // Every odd page remains write-only watched, so reading a write counter or a neighbor's
+    // state cannot pass as a read-watched page. Include the first and last pages of the region.
+    manager.UpdatePageWatchers<true>(region_base, region_size);
+    CheckWatchers(0);
+    RegionBits reads;
+    for (uint64_t page = 0; page < page_count; page += 2) {
+      reads.Set(page);
+    }
+    manager.UpdatePageWatchersForRegion<true, true>(region_base, reads);
+    CheckWatchers(1);
+    manager.UpdatePageWatchersForRegion<true, true>(region_base, reads);
+    CheckWatchers(2);
+    manager.UpdatePageWatchersForRegion<false, true>(region_base, reads);
+    CheckWatchers(1);
+    manager.UpdatePageWatchersForRegion<false, true>(region_base, reads);
+    CheckWatchers(0);
+    manager.UpdatePageWatchers<false>(region_base, region_size);
+    CheckWatchers(0);
+    Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  }
+  Check(lookup->regions == nullptr, "access lookup did not clear the region table");
+}
+
 void TestReadWriteWatcherInteractions() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -699,6 +761,7 @@ int main(int argc, char **argv) {
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
+  TestAccessLookup();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
   TestFatalPaths();

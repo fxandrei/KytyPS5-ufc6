@@ -9,7 +9,10 @@
 inline void SetUnixWriteTime(const std::filesystem::path& path, int64_t unix_ns) {
 	const std::chrono::sys_time<std::chrono::nanoseconds> time {std::chrono::nanoseconds(unix_ns)};
 #ifdef _MSVC_STL_VERSION // no file_clock::from_sys
-	const auto file_time = std::chrono::clock_cast<std::chrono::file_clock>(time);
+	// Use the file clock's 100 ns unit before adding the 1601 epoch offset.
+	// That offset cannot fit in a signed 64-bit nanosecond duration.
+	const auto file_time = std::chrono::clock_cast<std::chrono::file_clock>(
+	    std::chrono::floor<std::chrono::file_clock::duration>(time));
 #else
 	const auto file_time = std::chrono::file_clock::from_sys(time);
 #endif

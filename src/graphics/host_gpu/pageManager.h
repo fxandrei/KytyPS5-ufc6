@@ -11,7 +11,8 @@ namespace Libs::Graphics {
 enum class PageFaultAccess { Read, Write, Execute };
 
 // Where generated code finds whether a page faults on reads (it has an access watcher): the byte
-// at regions[address >> region_shift] + pages_offset + ((address >> page_shift) & page_mask),
+// at regions[address >> region_shift] + pages_offset +
+// (((address >> page_shift) & page_mask) * page_stride),
 // tested with access_mask, when the region pointer is not null and the index is in range.
 // Code reads `regions` when it runs: it is null until a PageManager exists.
 struct PageAccessLookup {
@@ -21,6 +22,7 @@ struct PageAccessLookup {
 	uint32_t page_shift          = 0;
 	uint32_t page_mask           = 0;
 	uint32_t pages_offset        = 0;
+	uint32_t page_stride         = 1;
 	uint8_t  access_mask         = 0;
 };
 

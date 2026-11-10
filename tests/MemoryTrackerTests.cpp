@@ -1101,10 +1101,14 @@ void CheckDeathCase(const char *name) {
 }
 
 void TestFatalPaths() {
-  for (const char *name : {"gpu-dirty-explicit-cpu", "reentrant-upload",
-                           "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
+  CheckDeathCase("gpu-dirty-explicit-cpu");
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+  // Lock ownership diagnostics are compiled only in debug builds.
+  for (const char *name : {"reentrant-upload", "recursive-tracking-lock",
+                           "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
+#endif
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

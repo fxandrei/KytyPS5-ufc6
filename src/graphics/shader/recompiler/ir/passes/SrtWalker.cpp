@@ -231,7 +231,8 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.mov(code.rcx, code.r10);
 	code.shr(code.rcx, static_cast<int>(lookup->page_shift));
 	code.and_(code.ecx, lookup->page_mask);
-	code.test(code.byte[code.r11 + code.rcx + lookup->pages_offset], lookup->access_mask);
+	const auto page = code.rcx * static_cast<int>(lookup->page_stride);
+	code.test(code.byte[code.r11 + page + lookup->pages_offset], lookup->access_mask);
 	code.jnz(slow, Near);
 	code.L(load);
 	code.mov(code.eax, code.dword[code.r10]);

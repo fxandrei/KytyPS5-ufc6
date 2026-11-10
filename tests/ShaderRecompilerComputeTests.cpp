@@ -1,6 +1,7 @@
 #define SPV_ENABLE_UTILITY_CODE
 
 #include "SrtWalkerTestMemory.h"
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -5259,28 +5260,36 @@ public:
       cache.FillBuffer(base + ring_fault_second_offset,
                        sizeof(ring_fault_second_value), ring_fault_second_value,
                        false);
-      Require(name, "fault-ring wrapped batch",
-              resources.HandleFault(PageFaultAccess::Read,
-                                    base + ring_fault_first_offset),
-              "fault readback could not wrap a live download-ring tick");
-      // All four writes fall in the fault's window and share one wrapped batch.
-      uint64_t expected_packing_offset = 4 * 64;
-      uint64_t expected_packing_alignment = 1;
-      if (!download.IsCoherent()) {
-        Require(name, "fault-ring atom policy",
-                StreamBufferTestAccess::NormalizeReservation(
-                    false,
-                    m_runtime_context.physical_device_properties.limits
-                        .nonCoherentAtomSize,
-                    expected_packing_offset, expected_packing_alignment),
-                "failed to calculate non-coherent fault-ring stride");
+      {
+        // This probe verifies staging-ring reservations; direct BAR readback bypasses them.
+        const auto saved_mask = Common::AbSwitch::Mask();
+        Common::AbSwitch::g_mask.store(
+            saved_mask & ~Common::AbSwitch::Bit(Common::AbSwitch::DIRECT_READBACK),
+            std::memory_order_relaxed);
+        Require(name, "fault-ring wrapped batch",
+                resources.HandleFault(PageFaultAccess::Read,
+                                      base + ring_fault_first_offset),
+                "fault readback could not wrap a live download-ring tick");
+        // All four writes fall in the fault's window and share one wrapped batch.
+        uint64_t expected_packing_offset = 4 * 64;
+        uint64_t expected_packing_alignment = 1;
+        if (!download.IsCoherent()) {
+          Require(name, "fault-ring atom policy",
+                  StreamBufferTestAccess::NormalizeReservation(
+                      false,
+                      m_runtime_context.physical_device_properties.limits
+                          .nonCoherentAtomSize,
+                      expected_packing_offset, expected_packing_alignment),
+                  "failed to calculate non-coherent fault-ring stride");
+        }
+        auto [packing_probe, packing_offset] = download.Map(1, 1, false);
+        Require(name, "adjacent download reservation stride",
+                packing_probe != nullptr &&
+                    packing_offset == expected_packing_offset,
+                "adjacent fault downloads did not reserve an atom-safe stride");
+        download.Commit();
+        Common::AbSwitch::g_mask.store(saved_mask, std::memory_order_relaxed);
       }
-      auto [packing_probe, packing_offset] = download.Map(1, 1, false);
-      Require(name, "adjacent download reservation stride",
-              packing_probe != nullptr &&
-                  packing_offset == expected_packing_offset,
-              "adjacent fault downloads did not reserve an atom-safe stride");
-      download.Commit();
       uint32_t first_page_backing = 0;
       uint32_t second_page_backing = 0;
       uint32_t ring_fault_first_backing = 0;
@@ -6841,6 +6850,8 @@ public:
       scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer,
                                               1, &copy);
     };
+    // Each manual preparation models the start of a new guest submission slice.
+    context.RequestBdaSync();
     context.PrepareBda();
     Require(name, "mapped intersection",
             !cache.IsRegionCpuModified(base, page) &&
@@ -6853,6 +6864,7 @@ public:
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
     words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.RequestBdaSync();
     context.PrepareBda();
     snapshot(16, 2);
     snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
@@ -6861,17 +6873,20 @@ public:
             "one-byte invalidation did not upload and consume its whole page");
 
     context.MapMemory(base + page, page);
+    context.RequestBdaSync();
     context.PrepareBda();
     snapshot(page, 4);
     Require(name, "new mapping", !cache.IsRegionCpuModified(base + page, page),
             "mapping into an existing buffer did not queue its dirty pages");
     context.UnmapMemory(base + 2 * page, page);
     words[2 * page / sizeof(u32)] = 0xfedcba98u;
+    context.RequestBdaSync();
     context.PrepareBda();
     Require(name, "unmapped dirty page",
             cache.IsRegionCpuModified(base + 2 * page, page),
             "BDA synchronization consumed dirtiness outside mapped memory");
     context.MapMemory(base + 2 * page, page);
+    context.RequestBdaSync();
     context.PrepareBda();
     snapshot(2 * page, 5);
 
@@ -6901,6 +6916,7 @@ public:
     Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
             "garbage collection kept the clean buffer");
     (void)cache.FindBuffer(base, 3 * page);
+    context.RequestBdaSync();
     context.PrepareBda();
     Require(
         name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
@@ -10827,7 +10843,7 @@ public:
       TileSizeAlign pooled_stencil_size{};
       TileSizeAlign pooled_htile_size{};
       Require(name, "pooled depth/stencil footprint",
-              TileGetDepthSize(32, 32, 0, Prospero::DepthFormat::kZ32F,
+              TileGetDepthSize(32, 32, Prospero::DepthFormat::kZ32F,
                                Prospero::StencilFormat::k8UInt, true,
                                pooled_stencil_size, pooled_htile_size,
                                pooled_depth_size, 0) &&
