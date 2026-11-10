@@ -680,7 +680,7 @@ bool RenderExecutor::SameTextureResolvePlan(const TextureResolvePlan& left,
 	// Compare semantic fields, including all derived tiling, rather than padding bytes.
 	const auto image_key = [](const ImageInfo& info) {
 		return std::tie(
-		    info.data, info.stencil, info.metadata.range, info.metadata.kind, info.metadata.control,
+		    info.data, info.stencil, info.metadata.range, info.metadata.kind,
 		    info.metadata.clear_word, info.metadata.compression, info.metadata.stencil_compressed,
 		    info.metadata.clear_register_valid, info.metadata.dcc_alpha_msb,
 		    info.htile_initial_clear, info.pixel_format, info.guest_format, info.type, info.extent,

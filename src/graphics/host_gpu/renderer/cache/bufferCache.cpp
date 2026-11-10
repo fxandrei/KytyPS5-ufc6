@@ -402,7 +402,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	}
 	// A host-visible type on a large device-local heap means a resizable BAR; a small (256 MiB) BAR
 	// heap could not hold the guest buffers.
-	const auto& memory = m_graphics.GetPhysicalDeviceMemoryProperties();
+	const auto& memory = m_graphics.physical_device_memory_properties;
 	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
 		const auto flags = memory.memoryTypes[i].propertyFlags;
 		const auto heap  = memory.memoryHeaps[memory.memoryTypes[i].heapIndex];
