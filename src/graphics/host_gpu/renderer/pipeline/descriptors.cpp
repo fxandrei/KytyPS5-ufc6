@@ -517,6 +517,7 @@ struct TextureInfoMemoEntry {
 	uint32_t  fields[8] = {};
 	uint32_t  flags     = 0;
 	uint32_t  view_base = 0;
+	uint32_t  view_levels = 0;
 	bool      valid     = false;
 	ImageInfo info;
 };
@@ -553,10 +554,11 @@ RenderExecutor::BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResourc
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
-	const auto view_levels = multisampled || single_storage_mip
-	                             ? 1u
-	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
-	auto       levels     = multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
+	auto view_levels = multisampled || single_storage_mip
+	                       ? 1u
+	                       : static_cast<uint32_t>(last_level - base_level) + 1u;
+	auto levels =
+	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
@@ -618,7 +620,8 @@ RenderExecutor::BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResourc
 	// Everything below that decides desc.info besides the descriptor's own bits.
 	const uint32_t memo_flags = (resource.r128 ? 1u : 0u) | (reads_depth ? 2u : 0u) |
 	                            (resource.depth_compare ? 4u : 0u) | (storage ? 8u : 0u) |
-	                            (single_storage_mip ? 16u : 0u);
+	                            (single_storage_mip ? 16u : 0u) |
+	                            (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic ? 32u : 0u);
 	TextureInfoMemoEntry* memo =
 	    use_info_memo && Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_INFO_MEMO)
 	        ? &TextureInfoMemoSlot(descriptor, memo_flags)
@@ -627,6 +630,7 @@ RenderExecutor::BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResourc
 	    std::memcmp(memo->fields, descriptor.fields, sizeof(memo->fields)) == 0) {
 		desc.info = memo->info;
 		view_base = memo->view_base;
+		view_levels = memo->view_levels;
 	} else {
 		desc.info.data         = {address, 0};
 		desc.info.pixel_format = pixel_format;
@@ -645,10 +649,19 @@ RenderExecutor::BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResourc
 			if (!ResolveTextureMipView(desc.info, physical_levels,
 			                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 			                           view_base)) {
-				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-				     "extent=%ux%ux%u tile=%u\n",
-				     base_level, last_level, max_mip, width, height, depth,
-				     static_cast<uint32_t>(tile));
+				// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
+				// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
+				if (base_level >= physical_levels ||
+				    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+					EXIT("unsupported texture mip view changes physical layout: base=%u last=%u "
+					     "max=%u extent=%ux%ux%u tile=%u\n",
+					     base_level, last_level, max_mip, width, height, depth,
+					     static_cast<uint32_t>(tile));
+				}
+				view_levels                = physical_levels - base_level;
+				desc.info.resources.levels = physical_levels;
+				desc.info.data.size        = 0;
+				desc.info.UpdateSize();
 			}
 		} else {
 			desc.info.UpdateSize();
@@ -657,6 +670,7 @@ RenderExecutor::BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResourc
 			std::memcpy(memo->fields, descriptor.fields, sizeof(memo->fields));
 			memo->flags     = memo_flags;
 			memo->view_base = view_base;
+			memo->view_levels = view_levels;
 			memo->info      = desc.info;
 			memo->valid     = true;
 		}

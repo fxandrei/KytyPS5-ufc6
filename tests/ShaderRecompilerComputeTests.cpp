@@ -12962,10 +12962,15 @@ public:
               "a native metadata overwrite did not clear only its requested "
               "volume slice");
 
-      for (const uint32_t base_slice : {0u, 7u}) {
+      // A volume view exports every slice it selects, even past MIP0_DEPTH.
+      auto attrib3 = registers.GetRenderTarget(0).attrib3;
+      for (const auto [mip0_depth, base_slice] :
+           {std::pair{0u, 0u}, std::pair{31u, 7u}}) {
         RenderExecutorTestAccess::ResetBindings(executor);
+        attrib3.depth = mip0_depth;
+        registers.SetColorAttrib3(0, attrib3);
         registers.SetColorView(0, {.base_array_slice_index = base_slice,
-                                   .last_array_slice_index = 32});
+                                   .last_array_slice_index = 31});
         RenderColorInfo volume_color{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
             executor, scheduler.Current(), volume_color, 0);
@@ -12973,7 +12978,7 @@ public:
             RenderExecutorTestAccess::AcquireRenderTargets(
                 executor, scheduler.Current(), &volume_color, 1, no_depth);
         Require(
-            name, "3D export bound exceeds depth",
+            name, "3D export bounds",
             volume_color.image_id == color.image_id &&
                 volume_color.desc.info.extent == vk::Extent3D{32, 32, 32} &&
                 volume_color.desc.info.data.size == color_size &&
@@ -12981,10 +12986,8 @@ public:
                     vk::ImageViewType::e2DArray &&
                 volume_color.desc.view_info.base_layer == base_slice &&
                 volume_color.desc.view_info.layer_count == 32 - base_slice &&
-                volume_rendering.num_layers == 32 - base_slice &&
-                registers.GetRenderTarget(0).view.last_array_slice_index == 32,
-            "3D export bounds changed the backing or exceeded its attachment "
-            "depth");
+                volume_rendering.num_layers == 32 - base_slice,
+            "3D export bounds changed the backing or dropped selected slices");
         scheduler.Current().BeginRendering(volume_rendering);
         scheduler.Current().EndRendering();
       }
@@ -18460,6 +18463,32 @@ public:
           (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, tail);
         });
 #endif
+      }
+      {
+        // PPSA28180 samples a 512x32 R32 Standard256B chain, which ends at 1x1
+        // in mip 9, with LAST_LEVEL 10; the extra level has no storage.
+        constexpr uint64_t address = base + 0x200000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc1400000u,
+                             0x0007c07fu,
+                             0x90190facu,
+                             0,
+                             0x00700090u,
+                             0,
+                             0};
+        descriptor.dword_count = 8;
+        const auto chain = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        descriptor.dwords[3] += 1u << 16u;
+        const auto past = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        Require(name, "LAST_LEVEL past a complete chain",
+                past.image_id == chain.image_id &&
+                    past.desc.info.data.size == chain.desc.info.data.size &&
+                    past.desc.view_info.level_count == 10,
+                "a view past MAX_MIP of a complete chain changed its stored "
+                "layout");
       }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
