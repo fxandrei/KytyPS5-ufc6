@@ -194,42 +194,21 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
-	if (!m_bda_logged) {
-		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		m_bda_logged = true;
-	}
-	m_fault_process_pending = true;
-	if (Common::AbSwitch::Enabled(Common::AbSwitch::BDA_SYNC_PER_SUBMIT) &&
-	    !std::exchange(m_bda_sync_requested, false)) {
-		if (!m_bda_written.Empty()) {
-			std::shared_lock lock(m_mapped_ranges_mutex);
-			std::exchange(m_bda_written, {}).ForEach([this](uint64_t begin, uint64_t end) {
-				m_mapped_ranges.ForEachInRange(
-				    begin, end - begin, [this](uint64_t start, uint64_t finish) {
-					    m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
-				    });
-			});
-		}
-		return;
-	}
-	m_bda_sync_requested = false;
-	m_bda_written        = {};
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.TakeBdaSync().ForEach([this](uint64_t begin, uint64_t end) {
-		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
-		});
-	});
+    if (!m_bda_logged) {
+        Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+        m_bda_logged = true;
+    }
+    m_fault_process_pending = true;
+    m_bda_sync_requested = false;
+    m_bda_written = {};
+    std::shared_lock lock(m_mapped_ranges_mutex);
+    m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 }
 
 void RenderContext::RequestBdaSync(uint64_t vaddr, uint64_t size) {
-	if (!Common::AbSwitch::Enabled(Common::AbSwitch::BDA_SYNC_WRITE_RANGES)) {
-		RequestBdaSync();
-		return;
-	}
-	if (size != 0 && GuestRange {vaddr, size}.Valid()) {
-		m_bda_written.Add(vaddr, size);
-	}
+    if (size != 0 && GuestRange {vaddr, size}.Valid()) {
+        m_buffer_cache.QueueBdaSync(vaddr, size, true);
+    }
 }
 
 void RenderContext::RunGarbageCollector() {

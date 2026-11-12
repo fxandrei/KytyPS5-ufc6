@@ -4,10 +4,10 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -208,7 +208,7 @@ private:
 	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                    const DrawEmitInfo& emit, DrawRenderState& state);
+	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	// Binds a guest dispatch's pipeline unless the command buffer already has it bound.
 	void BindComputePipeline(CommandBuffer& buffer, vk::Pipeline pipeline);
 	// The state a draw fills: m_draw_state reset, or a fresh one in `local`.
@@ -242,11 +242,11 @@ private:
 	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
 	                                  Dlss::Inputs& inputs);
 
-	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
-	struct DlssContext {
-		uint64_t       context;
-		Dlss::Creation creation;
-		Dlss::Feature* feature;
+	// A null feature is one the upscaler refused or failed.
+	struct UpscalerContext {
+		uint64_t                           context;
+		Dlss::Creation                     creation;
+		std::unique_ptr<Upscaler::Feature> feature;
 	};
 
 	// AbSwitch TARGET_LOOKUP_MEMO: the last resolution of each render-target slot.
@@ -308,6 +308,8 @@ private:
 
 	bool                                 m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
+	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.
+	DrawTargets                           m_targets;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
@@ -315,7 +317,7 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
-	std::vector<DlssContext>              m_dlss_contexts;
+	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;

@@ -34,6 +34,9 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Tags the BDA page-table entries of pages a DMA shader accessed; an access to another page
+	// records a fault.
+	static constexpr vk::DeviceAddress BDA_ACCESSED = 1;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -95,16 +98,18 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Tags fault-scan pages as DMA-accessed and queues them; creates buffers for unbacked ones.
+	void MarkDmaAccess(const RangeSet& pages);
+	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
+	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Every GPU write recorded since the last call now carries the current tick: a draw's or
 	// dispatch's written bindings are marked during its preparation, and a flush there moves the
 	// command into a later command buffer. Called right after each draw or dispatch is recorded.
 	void RetagGpuWrites();
 	// Bumped whenever JoinOverlap merges a buffer away (and deletes it).
 	[[nodiscard]] uint64_t MergeCount() const { return m_merge_count; }
-	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
 
 private:
@@ -119,6 +124,12 @@ private:
 		uint64_t            begin;
 		uint64_t            end;
 		bool                has_stream_leap;
+	};
+
+	// Copies [previous upload's end, end) go to `buffer`.
+	struct BufferUpload {
+		Buffer* buffer;
+		size_t  end;
 	};
 
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
@@ -140,8 +151,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
+	                  uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -166,6 +177,8 @@ private:
 	// (AbSwitch DIRECT_READBACK reads them in place).
 	MemoryUsage                                       m_guest_usage = MemoryUsage::DeviceLocal;
 	RangeSet                                          m_bda_sync;
+	// Pages DMA shaders accessed, guarded by m_bda_sync_mutex.
+	RangeSet                                          m_dma_accessed;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
