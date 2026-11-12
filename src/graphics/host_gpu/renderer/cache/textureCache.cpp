@@ -315,13 +315,12 @@ void TextureCache::DeleteImage(ImageId id) {
 		// non-depth replacement still drops it. Entries another surface rebound are its own.
 		const auto surface  = image.info.data.address;
 		bool       retained = false;
-		for (const auto other: FindImagesInRegion(surface, image.info.data.size)) {
-			const auto& owner = m_slot_images[other];
+		ForEachImageInRegion(surface, image.info.data.size, [&](ImageId other, Image& owner) {
 			retained |= other != id && owner.registered && !owner.depth_id &&
 			            owner.info.IsDepth() &&
 			            owner.info.metadata.kind == ImageMetadataKind::Htile &&
 			            owner.info.data.address == surface;
-		}
+		});
 		if (!retained) {
 			ForgetMetaMemo();
 			std::erase_if(m_surface_metas, [&](const auto& metadata) {

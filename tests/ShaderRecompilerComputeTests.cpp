@@ -18489,6 +18489,13 @@ public:
                     past.desc.view_info.level_count == 10,
                 "a view past MAX_MIP of a complete chain changed its stored "
                 "layout");
+        const auto repeated = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        Require(name, "repeated LAST_LEVEL past a complete chain",
+                repeated.image_id == past.image_id &&
+                    repeated.desc.view_info.level_count == 10 &&
+                    repeated.desc.view_info.base_level == past.desc.view_info.base_level,
+                "reusing the texture layout memo restored an unclamped mip view");
       }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,

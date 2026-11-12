@@ -240,13 +240,6 @@ private:
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
 	uint64_t m_structure_generation = 1;
-	// Collect first: callers may unregister images while processing the result.
-	[[nodiscard]] Common::SmallVector<ImageId, 8>
-	FindImagesInRegion(uint64_t address, uint64_t size) {
-		Common::SmallVector<ImageId, 8> images;
-		ForEachImageInRegion(address, size, [&](ImageId id, Image&) { images.push_back(id); });
-		return images;
-	}
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
