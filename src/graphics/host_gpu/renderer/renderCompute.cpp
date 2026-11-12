@@ -568,7 +568,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.async_compute         = async_compute;
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
-	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect: program");
+		if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
@@ -578,6 +581,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("DispatchIndirect: BDA upload");
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
@@ -586,8 +590,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	const auto [args_buffer, args_offset] = [&] {
+		KYTY_PROFILER_BLOCK("DispatchIndirect: argument buffer");
+		return m_context.GetBufferCache().ObtainBuffer(
+		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	}();
 	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

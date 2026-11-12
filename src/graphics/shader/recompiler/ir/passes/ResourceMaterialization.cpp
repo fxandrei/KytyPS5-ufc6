@@ -1,6 +1,10 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#if defined(TRACY_ENABLE)
+// Standalone IR tests do not link the emulator's profiling runtime.
+#include "common/profiler.h"
+#endif
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -1627,7 +1631,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+	bool walked;
+	{
+#if defined(TRACY_ENABLE)
+		KYTY_PROFILER_BLOCK("SRT: walk");
+#endif
+		walked = WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
+	}
+	if (!walked) {
 		if (memo != nullptr) {
 			memo->valid  = false;
 			memo->reused = false;
@@ -1635,6 +1646,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
+	// Includes indirect workgroup reads and memo validation as well as descriptor decoding.
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("SRT: post-walk");
+#endif
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	std::array<uint32_t, 3> workgroup_counts {};
