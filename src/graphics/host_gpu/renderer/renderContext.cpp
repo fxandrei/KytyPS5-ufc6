@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/profiler.h"
 
 #include "common/abSwitch.h"
 #include "common/assert.h"
@@ -118,6 +119,7 @@ bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 	if (tick == 0) {
 		return false;
 	}
+	KYTY_PROFILER_BLOCK("Readback: pending image publication");
 	// The GPU thread can fault inside a draw, so it submits without running deferred operations.
 	if (GuestGpu::IsGpuThread()) {
 		m_command_scheduler.Wait(tick);

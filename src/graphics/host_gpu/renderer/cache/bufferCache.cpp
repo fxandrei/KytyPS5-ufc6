@@ -275,6 +275,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("Readback: buffer download");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -306,6 +307,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    Common::AbSwitch::Enabled(Common::AbSwitch::READBACK_COPY_WHEN_FLUSHING);
 		if (!buffer.Mapped().empty() && write_tick != 0 && !copy_instead &&
 		    Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_READBACK)) {
+			{
+			KYTY_PROFILER_BLOCK("Readback: direct wait and priority completion");
 			if (write_tick >= m_scheduler.CurrentTick()) {
 				m_scheduler.FlushUrgent(); // The writes are still being recorded.
 			}
@@ -314,6 +317,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			}
 			m_scheduler.Wait(write_tick);
 			m_scheduler.WaitPriorityOperations(write_tick);
+			}
+			KYTY_PROFILER_BLOCK("Readback: BAR copy and backing publication");
 			const auto* mapped = buffer.Mapped().data();
 			for (const auto& copy: copies) {
 				ReadWriteCombined(mapped + copy.srcOffset, copy.size,
@@ -371,11 +376,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
+		{
+		KYTY_PROFILER_BLOCK("Readback: staging wait and priority completion");
 		if (Common::AbSwitch::Enabled(Common::AbSwitch::READBACK_COPY_WHEN_FLUSHING)) {
 			m_scheduler.FlushUrgent(); // Waited for next: submit on this thread.
 		}
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
+		}
+		KYTY_PROFILER_BLOCK("Readback: staging publication");
 		publish();
 	}
 	return true;
