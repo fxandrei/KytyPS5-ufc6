@@ -4,6 +4,10 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#if defined(TRACY_ENABLE)
+// Standalone walker tests do not link the profiling runtime.
+#include "common/profiler.h"
+#endif
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
@@ -178,6 +182,9 @@ uint8_t g_srt_load_check = 0;
 // fault path of Loader's exception handler (clean bytes from the backing store, else the GPU's
 // bytes), and zero where that path skips the load.
 uint32_t SrtWalkerReadGuestDword(uint64_t address) noexcept {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("SRT: guarded guest read");
+#endif
 	using Counter  = Common::DebugCounters::Counter;
 	namespace Mem  = Libs::LibKernel::Memory;
 	uint32_t value = 0;
@@ -188,6 +195,9 @@ uint32_t SrtWalkerReadGuestDword(uint64_t address) noexcept {
 		return value;
 	}
 	Mem::TraceGpuDirtyRead("srt", address);
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("SRT: GPU dirty readback");
+#endif
 	uint32_t   before      = 0;
 	const bool have_before = Mem::TryReadBacking(address, &before, sizeof(before));
 	if (!Mem::HandleGpuFault(PageFaultAccess::Read, address) ||
