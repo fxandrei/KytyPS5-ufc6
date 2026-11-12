@@ -1197,9 +1197,9 @@ static bool ResolvePrimitiveRestart(const CommandBuffer&         buffer,
 }
 
 DrawRenderState& RenderExecutor::BeginDrawState(std::optional<DrawRenderState>& local,
-                                                const DrawIndirectArgs&         indirect) {
+                                                const DrawIndirectArgs& indirect, bool tessellation) {
 	if (Common::AbSwitch::Enabled(Common::AbSwitch::EXACT_DRAW_STATE)) {
-		m_draw_state.Reset(indirect.offsets, indirect.address != 0);
+		m_draw_state.Reset(indirect.offsets, indirect.address != 0, tessellation);
 		return m_draw_state;
 	}
 	auto& fresh            = local.emplace();
@@ -2021,7 +2021,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	hw_check(buffer);
 
 	std::optional<DrawRenderState> local_state;
-	DrawRenderState&               state = BeginDrawState(local_state, args.indirect);
+	DrawRenderState& state = BeginDrawState(local_state, args.indirect,
+	                                       ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -2118,7 +2119,8 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const DrawCallInfo draw {false, args.vertex_count, args.instance_count, args.first_instance};
 
 	std::optional<DrawRenderState> local_state;
-	DrawRenderState&               state = BeginDrawState(local_state, args.indirect);
+	DrawRenderState& state = BeginDrawState(local_state, args.indirect,
+	                                       ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;

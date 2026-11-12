@@ -157,13 +157,20 @@ struct DrawRenderState {
 
 	// Readies reused shader/draw state for the next draw (AbSwitch EXACT_DRAW_STATE).
 	// Targets are held separately by RenderExecutor and resolved or restored for each draw.
-	void Reset(ShaderIndirectOffsets offsets, bool indirect) {
+	void Reset(ShaderIndirectOffsets offsets, bool indirect, bool tessellation) {
 		mrt_mask                 = 0;
 		topology                 = vk::PrimitiveTopology::ePointList;
 		primitive_restart_enable = false;
 		ps_active                = false;
-		for (auto& stage: vertex_info) {
-			stage.stage = {};
+		// PrepareProgram now relies on caller initialization, including indirect-draw and mesh
+		// metadata. Reset every active stage, not just its resolved module pointer.
+		vertex_info[0] = {};
+		for (uint32_t i = 1; i < vertex_info.size(); ++i) {
+			if (tessellation) {
+				vertex_info[i] = {};
+			} else {
+				vertex_info[i].stage = {};
+			}
 		}
 		ps_input_info    = {};
 		indirect_offsets = offsets;

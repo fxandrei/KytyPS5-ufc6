@@ -213,7 +213,7 @@ private:
 	void BindComputePipeline(CommandBuffer& buffer, vk::Pipeline pipeline);
 	// The state a draw fills: m_draw_state reset, or a fresh one in `local`.
 	[[nodiscard]] DrawRenderState& BeginDrawState(std::optional<DrawRenderState>& local,
-	                                              const DrawIndirectArgs&         indirect);
+	                                              const DrawIndirectArgs& indirect, bool tessellation);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
