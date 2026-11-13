@@ -1612,6 +1612,7 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  std::optional<u32> expected_fault_mask;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -22023,6 +22024,11 @@ public:
         expected_fault = 1u << (BufferCache::PageIndex(mapping.guest_base) & 31u);
       }
     }
+    if (test.expected_fault_mask) {
+      Require(test.name, "fault check", fault_address.has_value(),
+              "an expected fault mask requires a bitmap address");
+      expected_fault = *test.expected_fault_mask;
+    }
     if (fault_address) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
       fault_result = CreateHostBuffer(
@@ -22045,8 +22051,10 @@ public:
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
     if (fault_address) {
-      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
-              "an access recorded a suppressed or accessed page, or missed an unaccessed one");
+      const auto actual_fault = ReadBuffer(test.name, fault_result, 1)[0];
+      Require(test.name, "fault check", actual_fault == expected_fault,
+              fmt::format("fault bitmap expected {:08x}, got {:08x}",
+                          expected_fault, actual_fault));
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -42551,6 +42559,42 @@ TestCase GlobalLoadRecordsUnaccessedPage() {
   return test;
 }
 
+// Each lane touches a different page represented by the same fault bitmap word.
+// All 32 bits must survive concurrent recording, even though the loads themselves
+// access disjoint locations and do not require guest memory synchronization.
+TestCase GlobalLoadsRecordConcurrentPages() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 PageDwords = BufferCache::CACHING_PAGESIZE / sizeof(u32);
+  static_assert((BufferCache::PageIndex(GuestBase) & 31u) == 0);
+
+  TestCase test;
+  test.name = "GlobalLoadsRecordConcurrentPages";
+  AppendSMovLiteral(&test.code, 0, static_cast<u32>(GuestBase));
+  AppendSMovLiteral(&test.code, 1, static_cast<u32>(GuestBase >> 32u));
+  test.code.push_back(EncodeVop2(0x1a, 20, InlineU32(14), 0));
+  test.code.push_back(EncodeFlat0(0x0c, 2, 0));
+  test.code.push_back(EncodeFlat1(1, 0, 0, 20));
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 1, 0, 0);
+  AppendEnd(&test.code);
+  test.initial.resize(32 * PageDwords);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.initial[lane * PageDwords] = 0x12340000u + lane;
+    test.expected.push_back(0x12340000u + lane);
+  }
+  test.bda_mappings = {{GuestBase, 0, false}};
+  test.expected_fault_mask = 0xffffffffu;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_MOV_B32, O::V_LSHLREV_B32, O::FLAT_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   using O = ShaderOpcode;
 
@@ -53825,6 +53869,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(GlobalLoadRecordsUnaccessedPage);
+  AddCase(GlobalLoadsRecordConcurrentPages);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -61614,6 +61659,12 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, ScalarSextMasks(bits, 64));
     }
     RunCase(&vulkan, ScalarSextConstantsAndAliases());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-fault-record-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());
+    RunCase(&vulkan, GlobalLoadsRecordConcurrentPages());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
