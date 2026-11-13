@@ -58184,6 +58184,26 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
           "stencil-only writes did not retain read-only depth");
+  RenderAttachment mixed;
+  mixed.image_layout = depth_attachment_layout(attachment);
+  Require("DynamicRenderingState", "sampled depth with writable stencil stores",
+          mixed.DepthStencilStoreOp(vk::ImageAspectFlagBits::eDepth) ==
+                  vk::AttachmentStoreOp::eNone &&
+              mixed.DepthStencilStoreOp(vk::ImageAspectFlagBits::eStencil) ==
+                  vk::AttachmentStoreOp::eStore,
+          "saving writable stencil also wrote the sampled read-only depth aspect");
+  mixed.image_layout = vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+  Require("DynamicRenderingState", "writable depth with sampled stencil stores",
+          mixed.DepthStencilStoreOp(vk::ImageAspectFlagBits::eDepth) ==
+                  vk::AttachmentStoreOp::eStore &&
+              mixed.DepthStencilStoreOp(vk::ImageAspectFlagBits::eStencil) ==
+                  vk::AttachmentStoreOp::eNone,
+          "saving writable depth also wrote the read-only stencil aspect");
+  mixed.stencil_clear = true;
+  Require("DynamicRenderingState", "load-clear preservation",
+          mixed.DepthStencilStoreOp(vk::ImageAspectFlagBits::eStencil) ==
+              vk::AttachmentStoreOp::eStore,
+          "an attachment load clear was discarded by a NONE store");
   attachment.depth_write_enable = true;
   Require("DynamicRenderingState", "writable depth/stencil layout",
           depth_attachment_layout(attachment) ==

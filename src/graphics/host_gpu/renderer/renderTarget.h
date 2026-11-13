@@ -19,6 +19,21 @@ struct RenderAttachment {
 	bool                    has_stencil   = false;
 	bool                    stencil_clear = false;
 
+	[[nodiscard]] vk::AttachmentStoreOp DepthStencilStoreOp(vk::ImageAspectFlagBits aspect) const {
+		const bool depth = aspect == vk::ImageAspectFlagBits::eDepth;
+		const bool clear = depth ? depth_clear : stencil_clear;
+		const bool read_only =
+		    image_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+		    image_layout == vk::ImageLayout::eReadOnlyOptimal ||
+		    (depth && (image_layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+		               image_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal)) ||
+		    (!depth && (image_layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+		                image_layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal));
+		// STORE writes even when tests did not. NONE preserves an untouched aspect without
+		// racing a shader that samples it; DONT_CARE could discard its previous contents.
+		return read_only && !clear ? vk::AttachmentStoreOp::eNone : vk::AttachmentStoreOp::eStore;
+	}
+
 	bool operator==(const RenderAttachment&) const = default;
 };
 
