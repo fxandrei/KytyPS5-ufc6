@@ -771,6 +771,10 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 			r.enable_validation_layers = false;
 		}
 	}
+	if (Config::VulkanValidationEnabled()) {
+		Log::WriteToConsoleAndLog(fmt::format("Vulkan validation: requested=true enabled={}\n",
+		                                    r.enable_validation_layers));
+	}
 }
 
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(

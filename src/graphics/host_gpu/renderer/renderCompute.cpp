@@ -134,6 +134,36 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+static void TraceByteStorageFallback(const char* path, const ShaderComputeInputInfo& input,
+                                    uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
+	static const bool enabled = std::getenv("KYTY_TRACE_STENCIL_STORAGE") != nullptr;
+	if (!enabled) return;
+	const auto& program = input.stage.module->info;
+	const auto& resources = *input.stage.resources;
+	for (size_t i = 0; i < std::min(program.info.images.size(), resources.images.size()); ++i) {
+		const auto& resource = program.info.images[i];
+		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+		if (!resource.written ||
+		    resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Storage ||
+		    descriptor.Format() != Prospero::BufferFormat::k8UInt) continue;
+		const auto& fill = resources.uniform_fill;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Byte storage fallback: path={} shader=0x{:016x} module={} resource={} "
+		    "address=0x{:016x} dispatch={}x{}x{} mode=0x{:x} threads={}x{}x{} "
+		    "thread_dimensions={} fill_kind={} fill_value={} stride={}x{}x{} "
+		    "specialization_reads={} type={} extent={}x{} layers={}+{} mip={}..{} "
+		    "meta={} write_compress={} swizzle_x={}\n",
+		    path, program.shader_hash, input.stage.module->id, i, descriptor.Base40(),
+		    x, y, z, mode, input.threads_num[0], input.threads_num[1], input.threads_num[2],
+		    input.dispatch_thread_dimensions, static_cast<uint32_t>(fill.kind), fill.value,
+		    fill.group_stride[0], fill.group_stride[1], fill.group_stride[2],
+		    resources.specialization_reads.size(), static_cast<uint32_t>(descriptor.Type()),
+		    descriptor.Width5() + 1u, descriptor.Height5() + 1u, descriptor.BaseArray5(),
+		    descriptor.Depth() + 1u, descriptor.BaseLevel(), descriptor.LastLevel(),
+		    descriptor.MetaCompress(), descriptor.WriteCompress(), descriptor.DstSelX()));
+	}
+}
+
 bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
                                            CommandBuffer& command, uint32_t group_x,
                                            uint32_t group_y, uint32_t group_z, uint32_t mode) {
@@ -373,6 +403,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		thread_group_y = input_info.workgroup_counts[1];
 		thread_group_z = input_info.workgroup_counts[2];
 	}
+	TraceByteStorageFallback("direct", input_info, thread_group_x, thread_group_y,
+	                         thread_group_z, mode);
 
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
@@ -572,6 +604,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		KYTY_PROFILER_BLOCK("DispatchIndirect: program");
 		if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	}
+	TraceByteStorageFallback("indirect-unresolved", input_info, args.x, args.y, args.z, mode);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;

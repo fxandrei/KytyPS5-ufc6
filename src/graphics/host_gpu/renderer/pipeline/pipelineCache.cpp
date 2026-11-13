@@ -38,6 +38,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 
@@ -419,6 +420,63 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto       entry = m_program_cache.find(m_lookup_key);
 	const auto bind  = [&](const ShaderModule& module) {
+        // Diagnostic only: compare a retained shader against the same live inputs compiled
+        // without the store. This deliberately does extra work and is not a benchmark mode.
+        static const bool verify_store = std::getenv("KYTY_VERIFY_SHADER_STORE") != nullptr;
+        static std::unordered_set<uint64_t> verified;
+        if (verify_store && entry->second.call_source == nullptr && verified.insert(module.id).second) {
+            auto verify_options = options;
+            auto verify_input = input_info;
+            if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+                verify_options.input_info.vertex = &verify_input;
+            } else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+                verify_options.input_info.pixel = &verify_input;
+            } else {
+                verify_options.input_info.compute = &verify_input;
+            }
+            verify_options.shader_hash = params.hash;
+            verify_options.user_data = user_data;
+            verify_options.back_code = params.back_code;
+            auto translated = ShaderRecompiler::TranslateProgram(params.code, verify_options);
+            auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+            const auto plan_equal = ShaderRecompiler::IR::SaveResourcePlan(plan) ==
+                ShaderRecompiler::IR::SaveResourcePlan(entry->second.resource_plan);
+            ShaderRecompiler::IR::ResourceSnapshot resources;
+            ShaderRecompiler::IR::ResourceSpecialization specialization;
+            EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization));
+            const auto& cached = entry->second.resources;
+            const bool resources_equal = resources.buffers == cached.buffers &&
+                resources.images == cached.images && resources.samplers == cached.samplers &&
+                resources.flattened_srt == cached.flattened_srt && resources.user_data == cached.user_data &&
+                resources.specialization_reads == cached.specialization_reads && resources.uniform_fill == cached.uniform_fill;
+            const auto profile = SpirvProfile(m_graphics);
+            verify_options.profile = &profile;
+            auto result = ShaderRecompiler::CompileProgram(std::move(translated), verify_options,
+                                                           specialization, push_data_cursor);
+            const auto info = std::move(result.program).TakeCompiledInfo();
+            ShaderRecompiler::IR::Writer fresh_info, cached_info;
+            ShaderRecompiler::IR::IoAll(fresh_info, info);
+            ShaderRecompiler::IR::IoAll(cached_info, module.info);
+            bool auxiliary_equal = true;
+            if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+                if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) {
+                    auxiliary_equal = VertexInputFormats(verify_input, info) == module.vertex_formats;
+                } else if (options.stage == ShaderType::Mesh) {
+                    auxiliary_equal = verify_input.indirect_draw == module.mesh_task;
+                }
+            } else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+                if (verify_input.parameter_mode == ShaderPixelParameterMode::Rectangle) {
+                    ShaderRecompiler::IR::Writer fresh_rect, cached_rect;
+                    ShaderRecompiler::IR::IoAll(fresh_rect, RectListParameters(verify_input, info));
+                    ShaderRecompiler::IR::IoAll(cached_rect, module.rect_parameters);
+                    auxiliary_equal = fresh_rect.bytes == cached_rect.bytes;
+                }
+            }
+            PipelineCacheLog("Shader store verify: stage={} hash={:016x} id={:016x} plan={} resources={} specialization={} info={} auxiliary={} spirv={:016x}",
+                ShaderRecompiler::StageName(options.stage), params.hash, module.id, plan_equal,
+                resources_equal, specialization == module.specialization, fresh_info.bytes == cached_info.bytes,
+                auxiliary_equal, XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)));
+        }
         input_info.stage = {.module = &module, .resources = &entry->second.resources};
         module.info.bindings.AdvancePushData(push_data_cursor);
         return &module;

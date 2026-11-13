@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
@@ -290,6 +291,18 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	if (is_storage && !(image.usage & vk::ImageUsageFlagBits::eStorage)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Invalid storage view diagnostic: guest=0x{:016x} stencil=0x{:016x} "
+		    "image_format={} requested_format={} normalized_format={} aspect=0x{:x} "
+		    "image_usage=0x{:x} mip={}+{} layer={}+{} extent={}x{}x{}\n",
+		    info.data.address, info.stencil.address, static_cast<int>(image.format),
+		    static_cast<int>(view_info.format), static_cast<int>(normalized.format),
+		    static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect),
+		    static_cast<vk::ImageUsageFlags::MaskType>(image.usage), normalized.base_level,
+		    normalized.level_count, normalized.base_layer, normalized.layer_count,
+		    image.extent.width, image.extent.height, image.extent.depth));
+	}
 	if (last_view_index < views.size() && views[last_view_index].info == normalized) {
 		return views[last_view_index].view;
 	}

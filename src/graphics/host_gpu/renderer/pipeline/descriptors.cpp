@@ -833,6 +833,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+		if (storage) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Storage stencil association diagnostic: requested=0x{:016x}+0x{:x} "
+			    "owner=0x{:016x} image_format={} view_format={} module={} resource={}\n",
+			    desc.info.data.address, desc.info.data.size, image->info.data.address,
+			    static_cast<int>(image->info.pixel_format), static_cast<int>(view_format),
+			    module_id, resource_index));
+		}
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");

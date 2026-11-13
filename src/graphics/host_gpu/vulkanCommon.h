@@ -41,7 +41,8 @@ vk::Pipeline     CreateComputePipeline(vk::Device device, std::span<const uint32
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if ((!Config::GraphicsDebugDumpEnabled() && !Config::VulkanValidationEnabled()) ||
+	    device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

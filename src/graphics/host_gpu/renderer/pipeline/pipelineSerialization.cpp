@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <ranges>
 #include <xxhash.h>
@@ -169,8 +170,20 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	}
 	// A damaged record ends the store; the records before it stay.
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	if (std::getenv("KYTY_SHADER_STORE_LAZY_PIPELINES") != nullptr) {
+		m_graphics_pipelines.clear();
+		Log::WriteToConsoleAndLog("Shader cache diagnostic: loaded modules; pipelines created on demand\n");
+		return;
+	}
+	if (std::getenv("KYTY_SHADER_STORE_LAZY_GRAPHICS") != nullptr) {
+		m_graphics_pipelines.clear();
+	}
 
 	const auto modules = MapModules();
+	Log::WriteToConsoleAndLog(fmt::format("Shader cache diagnostic: heap modules={} heap layout ready={}\n",
+	    std::ranges::count_if(modules, [](const auto& entry) {
+	        return entry.second != nullptr && entry.second->info.info.uses_image_heap;
+	    }), m_graphics.image_heap_layout != nullptr));
 	std::vector<Common::UniqueFunction<void>> jobs;
 	jobs.reserve(m_graphics_pipelines.size() + modules.size());
 	for (auto& node: m_graphics_pipelines) {
@@ -180,13 +193,18 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	}
 	// A compute pipeline depends only on its module.
 	for (const auto* module: modules | std::views::values) {
-		if (module != nullptr && module->info.stage == ShaderType::Compute) {
+		if (module != nullptr && module->info.stage == ShaderType::Compute &&
+		    std::getenv("KYTY_SHADER_STORE_LAZY_COMPUTE") == nullptr) {
 			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
 				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
 			});
 		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	if (std::getenv("KYTY_SHADER_STORE_SERIAL_PIPELINES") != nullptr) {
+		for (auto& job: jobs) job();
+	} else {
+		Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	}
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
@@ -244,6 +262,10 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
+			if (std::getenv("KYTY_VERIFY_SHADER_STORE") != nullptr) {
+				Log::WriteToConsoleAndLog(fmt::format("Shader store loaded: id={:016x} spirv={:016x}\n",
+				    module.id, XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))));
+			}
 			program->second.modules.push_back(std::move(module));
 			break;
 		}

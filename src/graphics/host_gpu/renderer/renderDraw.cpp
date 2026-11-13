@@ -561,7 +561,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not.
+		static const bool trace_depth_store = std::getenv("KYTY_TRACE_DEPTH_STORE") != nullptr;
+		static uint32_t traced_depth_stores = 0;
+		if (trace_depth_store && sampled_aspects && traced_depth_stores++ < 1024u) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Depth store diagnostic: layout={} writes={} sampled={} feedback={} clears={} "
+			    "depth_test={} depth_write={} stencil_test={}\n",
+			    vk::to_string(layout), static_cast<uint32_t>(draw_writes),
+			    static_cast<uint32_t>(sampled_aspects), static_cast<uint32_t>(feedback_aspects),
+			    static_cast<uint32_t>(depth.load_clear_aspects), depth.depth_test_enable,
+			    depth.depth_write_enable, depth.stencil_test_enable));
+		}
+		// Conservatively include potential attachment clears and stores in access tracking.
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		image.binding.attachment_layout = layout;
