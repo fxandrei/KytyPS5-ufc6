@@ -5064,6 +5064,115 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Focused compatibility case: a general R8 read/write storage descriptor
+  // aliases an existing stencil plane. It must acquire a storage-capable image
+  // containing the current GPU stencil bytes. Writeback, preserved depth and
+  // partial-write/lifetime cases still need coverage before alias support ships.
+  void CheckStencilStorageAlias() {
+    constexpr const char *name = "StencilStorageAlias";
+    constexpr uintptr_t base = 0x0000000258000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t stencil_address = base + 0x20000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x10000, 0, &direct_offset) == 0, "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base), "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      TileSizeAlign stencil_layout{};
+      TileGetTextureTotalSize(Prospero::BufferFormat::k8UInt, 1, 1, 1, 1,
+                              Prospero::TileMode::kLinear, false, stencil_layout);
+      TextureCache::ImageDesc depth{};
+      depth.type = TextureCache::BindingType::DepthTarget;
+      depth.info.data = {base, 0x10000};
+      depth.info.stencil = {stencil_address, stencil_layout.size};
+      depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      depth.info.guest_format = Prospero::BufferFormat::k32Float;
+      depth.info.type = Prospero::ImageType::kColor2D;
+      depth.info.extent = {1, 1, 1};
+      depth.info.resources = {1, 1};
+      depth.info.pitch = 1;
+      depth.info.bytes_per_block = 4;
+      depth.info.samples = 1;
+      depth.info.tile_mode = Prospero::TileMode::kLinear;
+      depth.info.UpdateSize();
+      depth.view_info.format = depth.info.pixel_format;
+      depth.view_info.type = vk::ImageViewType::e2D;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = cache.FindImage(depth);
+      (void)cache.FindDepthTarget(depth_id, depth);
+      vk::ClearValue initial{};
+      initial.depthStencil = vk::ClearDepthStencilValue{0.625f, 0x91};
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+           0, 1, 0, 1}, initial);
+      ShaderRecompiler::IR::DescriptorValue descriptor{};
+      descriptor.dword_count = 8;
+      const uint64_t encoded_address = stencil_address >> 8u;
+      descriptor.dwords[0] = static_cast<uint32_t>(encoded_address);
+      descriptor.dwords[1] = static_cast<uint32_t>(encoded_address >> 32u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u);
+      descriptor.dwords[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.mip_count = 1;
+      resource.read = resource.written = true;
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          context.GetRenderExecutor(), resource, descriptor);
+      auto &native = cache.GetImage(binding.image_id);
+      // Fail before creating the invalid Vulkan view on the old implementation.
+      Require(name, "storage image usage",
+              static_cast<bool>(native.backing.usage & vk::ImageUsageFlagBits::eStorage),
+              "general R8 storage alias resolved to a depth/stencil image without STORAGE usage");
+      Require(name, "storage view", cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+              "stencil storage alias could not acquire a legal native view");
+      auto readback = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferImageCopy copy{};
+      copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+      copy.imageExtent = {1, 1, 1};
+      native.Download(std::span(&copy, 1), readback.buffer, 0, 4);
+      const vk::MemoryBarrier ready{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                    .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+          {}, 1, &ready, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      Require(name, "GPU stencil preserved", (ReadBuffer(name, readback, 1)[0] & 0xffu) == 0x91,
+              "storage acquisition used stale CPU bytes instead of current GPU stencil");
+      DestroyBuffer(&readback);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct mapping release failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0, "direct allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -62374,6 +62483,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     vulkan.CheckCubeFaceStorage();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-storage-alias-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStencilStorageAlias();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-copy-bounds-only") == 0) {
