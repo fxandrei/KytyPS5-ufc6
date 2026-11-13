@@ -351,9 +351,10 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	if (source_type == destination_type) {
 		source_layers = destination_layers = std::min(source_layers, destination_layers);
 	} else if (source_type == vk::ImageType::e2D) {
-		source_layers = depth;
+		// A volume may contain more slices than the array it is copied to/from.
+		source_layers = std::min(source_layers, depth);
 	} else {
-		destination_layers = depth;
+		destination_layers = std::min(destination_layers, depth);
 	}
 	return {source_layers, destination_layers};
 }

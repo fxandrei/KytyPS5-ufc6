@@ -253,6 +253,10 @@ struct StreamBufferTestAccess {
 };
 
 struct ImageTestAccess {
+  static std::pair<uint32_t, uint32_t>
+  CopyLayers(const Image &source, const Image &destination, uint32_t depth) {
+    return Image::SanitizeCopyLayers(source, destination, depth);
+  }
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
@@ -4989,6 +4993,75 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckImageCopySliceBounds() {
+    EnsureRuntimeContext();
+    constexpr const char *name = "ImageCopySliceBounds";
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    ImageInfo array_info{};
+    array_info.pixel_format = vk::Format::eR32Uint;
+    array_info.guest_format = Prospero::BufferFormat::k32UInt;
+    array_info.type = Prospero::ImageType::kColor2D;
+    array_info.extent = {1, 1, 1};
+    array_info.resources = {1, 2};
+    array_info.pitch = 1;
+    array_info.bytes_per_block = sizeof(u32);
+    array_info.UpdateSize();
+    array_info.data = {};
+    auto volume_info = array_info;
+    volume_info.type = Prospero::ImageType::kColor3D;
+    volume_info.extent.depth = 32;
+    volume_info.resources.layers = 1;
+    volume_info.UpdateSize();
+    volume_info.data = {};
+    Libs::Graphics::Image array(m_runtime_context, scheduler, array_info);
+    Libs::Graphics::Image volume(m_runtime_context, scheduler, volume_info);
+    // Reject the old invalid command before submitting it to a real GPU.
+    Require(name, "volume to smaller array bounds",
+            ImageTestAccess::CopyLayers(volume, array, 32).second == 2,
+            "32 volume slices would overflow a two-layer destination");
+    Require(name, "smaller array to volume bounds",
+            ImageTestAccess::CopyLayers(array, volume, 32).first == 2,
+            "32 volume slices would read beyond a two-layer source");
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    std::vector<u32> expected(32);
+    for (u32 i = 0; i < expected.size(); ++i) expected[i] = 0x12340000u + i;
+    auto upload = CreateHostBuffer(name, 128, vk::BufferUsageFlagBits::eTransferSrc, expected);
+    auto array_readback = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
+    auto volume_readback = CreateHostBuffer(name, 128, vk::BufferUsageFlagBits::eTransferDst, {});
+    vk::BufferImageCopy volume_copy{};
+    volume_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    volume_copy.imageExtent = {1, 1, 32};
+    volume.Upload(std::span(&volume_copy, 1), upload.buffer, 0, 128);
+    array.CopyImage(volume);
+    auto array_copy = volume_copy;
+    array_copy.imageSubresource.layerCount = 2;
+    array_copy.imageExtent.depth = 1;
+    array.Download(std::span(&array_copy, 1), array_readback.buffer, 0, 8);
+    const std::vector<u32> replacement{0xaabbccddu, 0x11223344u};
+    auto replacement_upload = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferSrc, replacement);
+    array.Upload(std::span(&array_copy, 1), replacement_upload.buffer, 0, 8);
+    volume.CopyImage(array);
+    volume.Download(std::span(&volume_copy, 1), volume_readback.buffer, 0, 128);
+    const vk::MemoryBarrier host_read{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eHostRead};
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 1, &host_read, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "volume prefix copied", ReadBuffer(name, array_readback, 2) ==
+                std::vector<u32>(expected.begin(), expected.begin() + 2),
+            "volume-to-array copy lost an available slice");
+    std::copy(replacement.begin(), replacement.end(), expected.begin());
+    Require(name, "volume tail preserved", ReadBuffer(name, volume_readback, 32) == expected,
+            "array-to-volume copy changed slices beyond the source array");
+    for (auto *buffer : {&upload, &replacement_upload, &array_readback, &volume_readback}) DestroyBuffer(buffer);
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -62303,6 +62376,11 @@ int main(int argc, char **argv) {
     vulkan.CheckCubeFaceStorage();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-copy-bounds-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageCopySliceBounds();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
@@ -62591,6 +62669,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
+  vulkan.CheckImageCopySliceBounds();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
