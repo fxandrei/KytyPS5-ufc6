@@ -4852,6 +4852,19 @@ public:
             "dynamic view identity omitted mapping, format, mip, layer, type, "
             "or storage usage");
 
+    // A compatible sampled view can have fewer format capabilities than its
+    // color-attachment backing. Its native usage must not inherit unsupported bits.
+    if (m_runtime_context.GetFormatProperties(vk::Format::eE5B9G9R9UfloatPack32)
+            .optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage) {
+      auto shared_exponent_info = sampled;
+      shared_exponent_info.format = vk::Format::eE5B9G9R9UfloatPack32;
+      const auto shared_exponent = color.FindView(shared_exponent_info);
+      Require(name, "sampled shared-exponent view",
+              shared_exponent != nullptr && shared_exponent != first &&
+                  color.FindView(shared_exponent_info) == shared_exponent,
+              "compatible sampled-only format did not create and reuse its view");
+    }
+
     auto video_out_info = color_info;
     video_out_info.pixel_format = vk::Format::eA2R10G10B10UnormPack32;
     video_out_info.guest_format = Prospero::BufferFormat::k10_10_10_2UNorm;
@@ -26250,8 +26263,7 @@ private:
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
-        vmaDestroyAllocator(m_runtime_context.allocator);
-        m_runtime_context.allocator = nullptr;
+        m_runtime_context.DestroyAllocator();
       }
       if (m_command_pool != nullptr) {
         m_device.destroyCommandPool(m_command_pool, nullptr);

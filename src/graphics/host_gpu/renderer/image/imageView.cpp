@@ -333,6 +333,18 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
 	}
+	if ((usage.usage & vk::ImageUsageFlagBits::eColorAttachment) &&
+	    !(m_graphics.GetFormatProperties(normalized.format).optimalTilingFeatures &
+	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+		if (view_info.usage & vk::ImageUsageFlagBits::eColorAttachment) {
+			EXIT("unsupported color attachment view: image_format=%d view_format=%d\n",
+			     static_cast<int>(image.format), static_cast<int>(normalized.format));
+		}
+		// A mutable backing can render through one format and only sample through another.
+		// Preserve the shared non-storage view where possible, without inheriting unsupported
+		// attachment usage (for example, an RGB9E5 sampled view of an R32_UINT backing).
+		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
