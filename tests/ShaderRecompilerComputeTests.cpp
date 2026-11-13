@@ -700,6 +700,23 @@ struct PipelineCacheTestAccess {
     cache.StoreLayout(key, layout);
   }
 
+  static void StoreModule(PipelineCache &cache,
+                          ShaderRecompiler::IR::ResourcePlan plan,
+                          const ShaderModule &module,
+                          const std::vector<uint32_t> &spirv) {
+    PipelineCache::Program program{.resource_plan = std::move(plan)};
+    const PipelineCache::ProgramKey key{.stage = module.info.stage,
+                                        .hash = module.info.shader_hash};
+    cache.StoreModule(key, program, module, spirv);
+  }
+
+  static bool HasHeapComputePipeline(const PipelineCache &cache, uint64_t id) {
+    const auto found = cache.m_compute_pipelines.find(id);
+    return found != cache.m_compute_pipelines.end() &&
+           found->second.pipeline && found->second.pipeline_layout &&
+           found->second.uses_image_heap;
+  }
+
   // Holds the store thread until Save(), which destroying the cache also calls.
   static void HoldStoreUntilExit(PipelineCache &cache) {
     cache.m_store.Post([stop = cache.m_store.m_thread.get_stop_token()] {
@@ -54447,6 +54464,38 @@ void CheckShaderStore(VulkanHarness &vulkan) {
     cache.Save();
     Require(name, "driver cache at exit", std::filesystem::exists(driver_cache),
             "Save() returned before the changed driver cache was written");
+  }
+  // An unused extra descriptor set is a valid Vulkan pipeline interface. Requiring
+  // the resident heap here isolates its construction-time dependency from sampling.
+  const auto heap_store = store.parent_path() / "HEAP00000.shaders";
+  constexpr uint64_t heap_module_id = 0xf00d1234u;
+  {
+    RenderContext context(vulkan.RuntimeContext(), heap_store);
+    ShaderComputeInputInfo input;
+    for (auto &threads : input.threads_num)
+      threads = 1;
+    input.host_subgroup_size = vulkan.RuntimeContext().SupportsComputeWave64() ? 64u : 32u;
+    std::vector<u32> code;
+    AppendEnd(&code);
+    const auto profile = SpirvProfile(vulkan.RuntimeContext());
+    const ShaderRecompiler::CompileOptions options{
+        .stage = ShaderType::Compute, .shader_hash = heap_module_id,
+        .dump_ir = false, .profile = &profile, .input_info = {.compute = &input}};
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, {});
+    ShaderModule module{.id = heap_module_id,
+                        .info = std::move(compiled.program).TakeCompiledInfo()};
+    module.info.info.uses_image_heap = true;
+    PipelineCacheTestAccess::StoreModule(context.GetPipelineCache(), std::move(plan),
+                                         module, compiled.spirv);
+  }
+  {
+    RenderContext context(vulkan.RuntimeContext(), heap_store);
+    Require(name, "resident heap warm restart",
+            PipelineCacheTestAccess::HasHeapComputePipeline(context.GetPipelineCache(),
+                                                             heap_module_id),
+            "stored pipeline was not created with its resident heap layout");
   }
   std::filesystem::remove_all(store.parent_path());
   Require(name, "release",
