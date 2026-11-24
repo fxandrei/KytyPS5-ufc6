@@ -29,10 +29,13 @@ black bands/white regions under memory pressure; no performance claim is valid f
 Unmapped-buffer 4K and1080p controls failed in Vulkan semaphore waits before combat. No backend
 change is adopted. The previous Nov23 ~39FPS native4K/no-crowd observation is a different control.
 
-Release preparation: `ufc6-v20261124-preview.1` at
+Published prerelease: `ufc6-v20261124-preview.1` at
 https://github.com/fxandrei/KytyPS5-ufc6/releases/tag/ufc6-v20261124-preview.1 .
-The owner requested publication; final remote state is recorded in the GitHub release and the detailed
-local handoff. Remaining priority: isolate native4K corruption/pressure and the unmapped fatal waits,
+Publication verified at18:58 local: draft=false, prerelease=true, seven uploaded assets with matching
+GitHub SHA256 digests. The Windows ZIP was downloaded again and matched. Source tag `b77fcc4ce`
+contains the tested code plus release documentation; the published executable is
+`E18849D86669EC1F51D6060F9B2E871B8A940E3A79BC1C3B12DF2F79B5C9F8A6`.
+Final package and detailed evidence remain in the release and local handoff. Remaining priority: isolate native4K corruption/pressure and the unmapped fatal waits,
 then obtain a clean, warm, fight-only CPU/GPU profile. Replay/long-session stability and60FPS remain
 unverified. The Accelerated clock is not a wall-clock physics test.
 

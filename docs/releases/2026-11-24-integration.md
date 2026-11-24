@@ -39,3 +39,18 @@ Validation checkpoint before live control:
 - Final artifact hashes, package verification and publication state are supplied with the release at
   https://github.com/fxandrei/KytyPS5-ufc6/releases/tag/ufc6-v20261124-preview.1 . Native 4K correctness,
   allocator pressure and fatal waits take priority over further performance changes.
+
+Publication completed and verified on2026-11-24 at18:58 Europe/Bucharest. The prerelease is published
+(draft=false) at https://github.com/fxandrei/KytyPS5-ufc6/releases/tag/ufc6-v20261124-preview.1 .
+The annotated tag resolves to `b77fcc4ce905915a1923bd7a8ea79468ac073efd`; post-publication source edits
+only record this result. The normal latest release remains `ufc6-v20261031`.
+
+- Published emulator SHA256: `E18849D86669EC1F51D6060F9B2E871B8A940E3A79BC1C3B12DF2F79B5C9F8A6`.
+- Windows ZIP SHA256: `234123683762D3CEF79380FDD7168CA79C7D5D366EF04B81181246F4DDF6A24B`.
+- Source ZIP SHA256: `BCFC4C6ED94EADF94A13195AC5149F227C6E9030DD5F435B32EC60427BC2962F`.
+- Seven release asset sizes/digests matched the local files. The Windows ZIP was downloaded again and
+  matched its checksum. Archive CRC/file manifest,31 PE dependency sets and extracted clean-PATH
+  `kyty_emulator --help` pass. Source archive:9193 tracked files and15 pinned submodules. No user uploads.
+- The final build has exact Fork/repository/tag provenance. No experimental deployment replaced the
+  user's installed emulator. All own game processes are closed. Cache invalidation after this metadata
+  rebuild is expected; do not stamp old cache headers to bypass the compatibility check.
