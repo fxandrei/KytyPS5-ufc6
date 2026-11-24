@@ -241,9 +241,9 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
     {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
-    {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
-    {0xfcu, Opcode::V_CMPX_NLE_F16},       {0xfdu, Opcode::V_CMPX_NEQ_F16},
-    {0xfeu, Opcode::V_CMPX_NLT_F16},
+    {0xdeu, Opcode::V_CMPX_GE_F16},        {0xf9u, Opcode::V_CMPX_NGE_F16},
+    {0xfbu, Opcode::V_CMPX_NGT_F16},       {0xfcu, Opcode::V_CMPX_NLE_F16},
+    {0xfdu, Opcode::V_CMPX_NEQ_F16},       {0xfeu, Opcode::V_CMPX_NLT_F16},
 };
 
 constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
@@ -286,6 +286,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x358u, Opcode::V_MED3_I16},
     {0x359u, Opcode::V_MED3_U16},
     {0x15du, Opcode::V_SAD_U32},
+    {0x171u, Opcode::V_MSAD_U8},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
     {0x12fu, Opcode::V_CVT_PKRTZ_F16_F32},
@@ -313,6 +314,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x314u, Opcode::V_LSHLREV_B16},
     {0x319u, Opcode::V_SUBREV_I32},
     {0x340u, Opcode::V_MAD_U16},
+    {0x344u, Opcode::V_PERM_B32},
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},
@@ -917,6 +919,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMPX_LE_F16:
 		case Opcode::V_CMPX_GT_F16:
 		case Opcode::V_CMPX_GE_F16:
+		case Opcode::V_CMPX_NGE_F16:
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:
@@ -1557,6 +1560,7 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_LE_F16:
 		case Opcode::V_CMPX_GT_F16:
 		case Opcode::V_CMPX_GE_F16:
+		case Opcode::V_CMPX_NGE_F16:
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:

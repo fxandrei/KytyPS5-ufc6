@@ -1,5 +1,43 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+# Spatial audio renders synchronously to memory. SDL owns playback.
+function(kyty_add_openal)
+	set(LIBTYPE STATIC)
+	set(ALSOFT_UTILS OFF)
+	set(ALSOFT_EXAMPLES OFF)
+	set(ALSOFT_INSTALL OFF)
+	set(ALSOFT_ENABLE_MODULES OFF)
+	# Clang cannot infer nonblocking on libstdc++ 16 std::variant::emplace.
+	set(HAVE_WFUNCTION_EFFECTS OFF)
+	set(ALSOFT_EAX OFF)
+	set(ALSOFT_RTKIT OFF)
+	foreach(backend PIPEWIRE PULSEAUDIO ALSA OSS SOLARIS SNDIO WASAPI DSOUND WINMM JACK
+	                COREAUDIO OBOE OPENSL PORTAUDIO WAVE)
+		set(ALSOFT_BACKEND_${backend} OFF)
+	endforeach()
+	if(MSVC)
+		string(APPEND CMAKE_CXX_FLAGS " /EHsc /GR")
+	else()
+		string(APPEND CMAKE_CXX_FLAGS " -fexceptions -frtti")
+	endif()
+	# OpenAL builds its private copy of fmt.
+	get_directory_property(kyty_includes INCLUDE_DIRECTORIES)
+	set_directory_properties(PROPERTIES INCLUDE_DIRECTORIES "")
+	add_subdirectory(openal-soft EXCLUDE_FROM_ALL)
+	if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+		foreach(alsoft_target IN ITEMS OpenAL alsoft.common)
+			if(TARGET ${alsoft_target})
+				target_compile_options(${alsoft_target} PRIVATE
+					"$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/openal_msvc_compat.h>")
+			endif()
+		endforeach()
+	endif()
+	set_directory_properties(PROPERTIES INCLUDE_DIRECTORIES "${kyty_includes}")
+endfunction()
+kyty_add_openal()
+install(FILES openal-soft/COPYING openal-soft/BSD-3Clause openal-soft/LICENSE-pffft
+	DESTINATION licenses/openal-soft)
+
 add_subdirectory(cpuinfo)
 
 include(FetchContent)
@@ -167,15 +205,11 @@ else()
 	target_compile_options(imgui PRIVATE -w)
 endif()
 
-set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
 set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
 set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Headers" CACHE PATH "" FORCE)
-add_subdirectory(SPIRV-Tools)
-
-add_library(spirv-tools ALIAS SPIRV-Tools-static)
-add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
+add_subdirectory(SPIRV-Tools EXCLUDE_FROM_ALL)
 
 add_subdirectory(xxHash/build/cmake)
 

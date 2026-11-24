@@ -209,12 +209,11 @@ private:
 		PreparedBindings                pixel;
 	};
 
-	void               PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                                           std::span<RenderColorInfo>         colors);
-	void               ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
-	                                            uint32_t render_target_slot, bool ignore_target_mask = false,
-	                                            bool exact_format = false);
-	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages, DrawTargets& targets);
+	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
+	                              uint32_t render_target_slot, bool ignore_target_mask = false,
+	                              bool exact_format = false);
+	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
@@ -297,6 +296,7 @@ private:
 		TextureResolvePlan      plan;
 		ImageId                 found_id;             // AbSwitch TEXTURE_IMAGE_MEMO
 		uint64_t                found_generation = 0; // 0: no reusable image
+		ResolveStamp            found_stamp;
 	};
 	[[nodiscard]] TextureResolvePlan
 	BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResource& resource,

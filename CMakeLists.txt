@@ -335,7 +335,17 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
+# Keep the renderer's OpenAL headers and compile definitions private.
+set(spatial_renderer_src
+	"${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audio3d.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audioSpeakerArray.cpp"
+)
+list(REMOVE_ITEM kyty_emulator_src ${spatial_renderer_src})
+add_library(kyty_spatial_audio STATIC ${spatial_renderer_src})
+target_link_libraries(kyty_spatial_audio PRIVATE common OpenAL::OpenAL)
+
+set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static kyty_spatial_audio imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -346,7 +356,6 @@ endif()
 set(inc_headers
 	${KYTY_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
-	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/xxHash
@@ -397,6 +406,7 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
+	"${KYTY_TESTS_DIR}/SrtWalkerTestStubs.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -508,11 +518,11 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
-target_link_libraries(audio_out2_port_tests common fmt::fmt)
+target_link_libraries(audio_out2_port_tests common fmt::fmt kyty_spatial_audio)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
-target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
+target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static kyty_spatial_audio)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
 
 add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
@@ -532,11 +542,12 @@ target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
-target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus kyty_spatial_audio)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padVr.cpp"
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
@@ -590,8 +601,39 @@ add_executable(rtc_tests EXCLUDE_FROM_ALL
 target_link_libraries(rtc_tests common kyty_test_gtest)
 target_include_directories(rtc_tests PRIVATE ${inc_headers})
 
+add_executable(playgo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayGoTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
+target_include_directories(playgo_tests PRIVATE ${inc_headers})
+
+add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VrTracker2Tests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libVrTracker2.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
+target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
+
+add_executable(font_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FontTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libFont.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(font_tests common SDL3::SDL3-static FFmpeg::ffmpeg kyty_test_gtest)
+target_include_directories(font_tests PRIVATE ${inc_headers})
+target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
+
+add_executable(splash_animation_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SplashAnimationTests.cpp")
+target_link_libraries(splash_animation_tests kyty_test_gtest)
+target_include_directories(splash_animation_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/descriptors.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
@@ -649,6 +691,21 @@ target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
 target_link_libraries(net_resolver_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(agc_tests "${KYTY_TESTS_DIR}/AgcTests.cpp")
+target_link_libraries(agc_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(kernel_thread_tests "${KYTY_TESTS_DIR}/KernelThreadTests.cpp")
+target_link_libraries(kernel_thread_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
+target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(video_dec2_tests "${KYTY_TESTS_DIR}/VideoDec2Tests.cpp")
+target_link_libraries(video_dec2_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(user_service_tests "${KYTY_TESTS_DIR}/UserServiceTests.cpp")
+target_link_libraries(user_service_tests kyty_test_gtest)
+
 add_executable(dlss_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DlssTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/dlss.cpp")
@@ -677,7 +734,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
-target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
+target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
@@ -718,6 +775,7 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME kernel_module_info COMMAND $<TARGET_FILE:kernel_module_info_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
@@ -735,6 +793,9 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
+	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
+	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
+	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -858,6 +919,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
+		playgo_tests
+		vr_tracker2_tests
+		user_service_tests
 	)
 endif()
 
@@ -980,6 +1044,14 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+if(WIN32)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/packaging/Run-UFC6.ps1"
+              "${CMAKE_CURRENT_SOURCE_DIR}/packaging/README-UFC6.txt"
+              "${CMAKE_CURRENT_SOURCE_DIR}/packaging/SOURCES.txt"
+              "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/scripts/patches/ufc6-realtime-25ms.json"
+        DESTINATION patches)
+endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 

@@ -454,9 +454,85 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+void TestSystemState() {
+	Libs::Audio::AudioOut::AudioOutSystemState state;
+	std::memset(&state, 0xab, sizeof(state));
+	Check(Libs::Audio::AudioOut::AudioOutGetSystemState(&state) == OK && state.loudness == -70.0f &&
+	          state.reserved8[0] == 0 && state.reserved64[2] == 0,
+	      "system state is not a -70 loudness with zeroed reserved fields");
+}
+
+void TestPortState() {
+	namespace AudioOut = Libs::Audio::AudioOut;
+	Fixture f;
+	Libs::Audio::Initialize();
+	const auto check = [](int type, uint32_t param, uint16_t output, uint8_t channel, int16_t volume,
+	                      const char* message) {
+		const int port = AudioOut::AudioOutOpen(1000, type, 0, 256, 48000, param);
+		AudioOut::AudioOutPortState state {};
+		Check(AudioOut::AudioOutGetPortState(port, &state) == OK && state.output == output &&
+		          state.channel == channel && state.volume == volume,
+		      message);
+		AudioOut::AudioOutClose(port);
+	};
+	check(0, 4, 1, 2, -1, "main port is not on the primary output");
+	check(2, 4, 1, 2, -1, "voice port did not follow the main output");
+	check(3, 4, 0, 0, -1, "personal port played without headphones");
+	check(3, 4 | 0x20000, 1, 2, -1, "mixed personal port is not on the primary output");
+	check(4, 4, 4, 1, 127, "pad speaker port is not on the controller");
+	check(10, 4, 4, 2, -1, "vibration port is not on the controller");
+	check(127, 4, 1, 2, -1, "aux port is not on the primary output");
+	Config::ConfigOptions options;
+	options.audio_output = Config::AudioOutput::Headphones;
+	Config::Load(options);
+	check(0, 4, 0x40, 2, -1, "main port is not on headphones");
+	check(3, 4, 0x40, 2, -1, "personal port is not on headphones");
+	Libs::Audio::Shutdown();
+}
+void TestAudio3dObjectPlayback() {
+	using namespace Libs::Audio::Audio3d;
+	Config::Load(Config::ConfigOptions {});
+	Libs::Audio::Initialize();
+	Audio3dOpenParameters params;
+	Audio3dGetDefaultOpenParameters(&params);
+	params.max_objects = 1;
+	params.queue_depth = 1;
+	uint32_t port, object, spare;
+	Check(Audio3dInitialize(0) == 0 && Audio3dPortOpen(255, &params, &port) == 0, "Audio3d open failed");
+	Check(Audio3dObjectReserve(port, &object) == 0 && Audio3dObjectReserve(port, &spare) < 0,
+	      "Audio3d object limit ignored");
+	std::array<int16_t, 128> samples;
+	samples.fill(8192);
+	const Audio3dPcm pcm {0, samples.data(), samples.size()};
+	const float gain = 1;
+	const std::array pos {4.f, 0.f, 0.f};
+	const Audio3dAttribute attrs[] {{1, 0, &pcm, sizeof(pcm)}, {3, 0, &pos, sizeof(pos)}, {5, 0, &gain, sizeof(gain)}};
+	Check(Audio3dObjectSetAttributes(port, object, std::size(attrs), attrs) == 0, "Audio3d attributes failed");
+	samples.fill(0);
+	Check(Audio3dObjectUnreserve(port, object) == 0 && Audio3dObjectSetAttribute(port, object, 5, &gain, sizeof(gain)) < 0,
+	      "unreserved object remained accessible");
+	Check(Audio3dPortAdvance(port) == 0 && Audio3dPortAdvance(port) < 0, "Audio3d advance overfilled the queue");
+	uint32_t level, available;
+	Check(Audio3dPortGetQueueLevel(port, &level, &available) == 0 && level == 1 && available == 0, "wrong ready queue level");
+	Check(Audio3dPortPush(port, 1) == 0 && streams.size() == 1, "Audio3d push failed");
+	const auto& stream = *streams.front();
+	Check(stream.spec.channels == 2 && stream.pcm.size() == 256 * 2 * sizeof(float), "wrong SDL object grain");
+	std::array<float, 512> out;
+	std::memcpy(out.data(), stream.pcm.data(), stream.pcm.size());
+	Check(out[129] > 0.1f && std::abs(out[128]) < out[129] / 2 && out[511] == 0, "wrong PCM ownership, position or padding");
+	Check(Audio3dObjectReserve(port, &spare) == 0 && spare != object, "Audio3d slot reuse failed");
+	Check(Audio3dPortAdvance(port) == 0 && Audio3dPortPush(port, 1) == 0, "empty grain failed");
+	std::memcpy(out.data(), stream.pcm.data(), stream.pcm.size());
+	Check(std::all_of(out.begin(), out.end(), [](float s) { return std::abs(s) < 1e-6f; }),
+	      "Audio3d replayed the previous grain after unreserve");
+	Check(Audio3dPortClose(port) == 0 && streams.empty() && Audio3dPortAdvance(port) < 0, "Audio3d close leaked output");
+	Libs::Audio::Shutdown();
+}
 } // namespace
 
 int main() {
+	Config::Initialize();
 	TestPrimingAndSteadyCadence();
 	TestUnderrunAndStalledQueueRecovery();
 	TestFallbackClockAndLongGap();
@@ -468,6 +544,9 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestSystemState();
+	TestPortState();
+	TestAudio3dObjectPlayback();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

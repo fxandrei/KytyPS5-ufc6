@@ -25,15 +25,17 @@ struct Profile {
 	// DS_INC/DS_DEC with an all-ones limit run as one native atomic add or subtract
 	// (KYTY_GDS_FIX=1, A/B experiment; off emits the compare-exchange loop for every limit).
 	bool inc_dec_add = false;
+	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
+	bool ray_query = false;
 };
 
 inline constexpr Profile DefaultProfile {};
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t       push_data_start_dword = 0,
-                                  const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+                                  IR::PushData::Window push_data       = {},
+                                  const Profile&       profile         = DefaultProfile,
+                                  bool                 emit_debug_info = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

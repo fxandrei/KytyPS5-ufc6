@@ -7,10 +7,9 @@
 namespace Loader::X64InstructionEmulator {
 
 [[nodiscard]] bool TryEmulate(void* native_context);
-// Completes a faulting load into EAX as a zero read and resumes after it.
+// Completes a faulting load into EAX with `value` and resumes after it.
+void CompleteLoad(void* native_context, size_t length, uint32_t value);
 void SkipLoad(void* native_context, size_t length);
-// Completes a faulting 32-bit load into EAX with `value` (zero-extended) and resumes after it.
-void CompleteLoad(void* native_context, uint32_t value, size_t length);
 [[nodiscard]] uint64_t ReadGpr(void* native_context, uint8_t index);
 
 } // namespace Loader::X64InstructionEmulator

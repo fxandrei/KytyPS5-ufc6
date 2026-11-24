@@ -15,6 +15,8 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
+#include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/eventQueue.h"
 
 #include <memory>
@@ -42,16 +44,18 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&    GetMutex() { return m_mutex; }
-	CommandScheduler& GetCommandScheduler() { return m_command_scheduler; }
-	PipelineCache&    GetPipelineCache() { return m_pipeline_cache; }
-	DescriptorHeap&   GetDescriptorHeap() { return m_descriptor_heap; }
-	ImageHeap&        GetImageHeap() { return m_image_heap; }
-	SamplerCache&     GetSamplerCache() { return m_sampler_cache; }
-	BufferCache&      GetBufferCache() { return m_buffer_cache; }
-	TextureCache&     GetTextureCache() { return m_texture_cache; }
-	RenderExecutor&   GetRenderExecutor() { return m_render_executor; }
-	OcclusionQueries& GetOcclusionQueries() { return m_occlusion_queries; }
+	Common::Mutex&      GetMutex() { return m_mutex; }
+	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
+	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
+	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
+	ImageHeap&          GetImageHeap() { return m_image_heap; }
+	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
+	BufferCache&        GetBufferCache() { return m_buffer_cache; }
+	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	ResolveCache&       GetResolveCache() { return m_resolve_cache; }
+	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
+	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	// See LibKernel::Memory::TryReadGpuCleanBytes.
@@ -91,6 +95,7 @@ private:
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
+	ResolveCache              m_resolve_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
 	// Loading cached pipelines may require the resident heap's descriptor set layout.
@@ -104,6 +109,8 @@ private:
 	bool                      m_bda_logged            = false;
 	bool                      m_bda_sync_requested    = true;
 	RangeSet                  m_bda_written; // By the command processor (BDA_SYNC_WRITE_RANGES).
+
+	std::unique_ptr<RayTracing> m_ray_tracing;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

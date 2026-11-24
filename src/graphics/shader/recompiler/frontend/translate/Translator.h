@@ -32,9 +32,9 @@ inline constexpr LaneSpills NoLaneSpills {};
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           const LaneSpills& lane_spills, bool flush_f32_inputs, bool graphics_compute)
+	           const LaneSpills& lane_spills, uint8_t float_mode)
 	    : program(program), ir(block), current_vector_limit(vector_limit), lane_spills(lane_spills),
-	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
+	      float_mode(float_mode) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -64,7 +64,7 @@ private:
 	IR::U32                ReadU32(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
-	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane);
+	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool flush_denorms = false);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
 	IR::F32 ReadMixF32(const Decoder::Operand& operand);
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
@@ -212,6 +212,7 @@ private:
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
+	void V_MSAD_U8(const Decoder::Instruction& inst);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	void S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
@@ -228,6 +229,7 @@ private:
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
+	void    V_PERM_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
@@ -278,8 +280,7 @@ private:
 	uint32_t          current_pc           = 0;
 	uint32_t          current_vector_limit = 1;
 	const LaneSpills& lane_spills;
-	bool              flush_f32_inputs;
-	bool              graphics_compute;
+	uint8_t           float_mode;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

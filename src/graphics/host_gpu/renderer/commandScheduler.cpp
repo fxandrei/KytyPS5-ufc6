@@ -669,8 +669,7 @@ void CommandScheduler::PopPendingOperations() {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty() || !IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
 			operation = std::move(m_pending_operations.front());

@@ -93,6 +93,7 @@ struct PipelineVertexInputState {
 	struct Attribute {
 		uint32_t offset  = 0;
 		uint8_t  binding = 0;
+		uint8_t  format  = 0; // Guest buffer format.
 	};
 
 	std::array<Binding, ShaderVertexInputInfo::RES_MAX>   bindings {};
@@ -125,8 +126,6 @@ struct ShaderModule {
 	ShaderRecompiler::IR::CompiledShaderInfo     info;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint32_t>                        function_code;
-	// VS or LS: the host format of each vertex input attribute.
-	std::vector<vk::Format>                      vertex_formats;
 	// Rectangle-list PS: the parameters it reads.
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
@@ -298,13 +297,13 @@ private:
 		// SRT materialization memo and the last module a search found (AbSwitch SRT_REFRESH_MEMO).
 		ShaderRecompiler::IR::MaterializationMemo memo;
 		uint32_t                                 last_module      = UINT32_MAX;
-		uint32_t                                 last_push_cursor = UINT32_MAX;
+		uint64_t                                 last_push_cursor = UINT64_MAX;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         ShaderRecompiler::IR::PushData::Window  push_data);
 	};
 
 	struct ProgramKey {
@@ -388,7 +387,7 @@ private:
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	                               ShaderRecompiler::IR::PushData::Window& push_data);
 	// The register part of GetGraphicsPrograms, shared by the serial path (Pure = false, which
 	// always returns true) and PrepareGraphicsPrograms (Pure = true, `prep` non-null).
 	template <bool Pure>
@@ -399,14 +398,14 @@ private:
 	// resources materialized into `resources`. Null with `refusal` set otherwise.
 	template <typename InputInfo>
 	const ShaderModule* GetProgramPure(const ShaderParams& params, InputInfo& input_info,
-	                                   uint32_t&                                     push_data_cursor,
+	                                   ShaderRecompiler::IR::PushData::Window& push_data,
 	                                   ShaderRecompiler::IR::ResourceSnapshot&       resources,
 	                                   ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                                   DrawPrepRefusal&                              refusal);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
-	                            ShaderRecompiler::CompileOptions  options,
-	                            ShaderRecompiler::TranslateResult translated,
-	                            uint32_t                          push_data_cursor);
+	                            ShaderRecompiler::CompileOptions       options,
+	                            ShaderRecompiler::TranslateResult      translated,
+	                            ShaderRecompiler::IR::PushData::Window push_data);
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();

@@ -38,7 +38,7 @@ struct Presenter::Frame {
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
-	bool          hdr          = false;
+	uint32_t      source_flags = 0;
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
@@ -214,12 +214,12 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	// A flipped surface is layer 0 of the cached image holding it, which can be an array.
 	vk::ImageCopy copy {};
-	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
-	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = copy.srcSubresource;
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
-	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }
@@ -418,6 +418,10 @@ void Swapchain::Create() {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
 	}
+	// A minimized window's surface has no area; presentation creates the swapchain once it has one.
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		return;
+	}
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -568,7 +572,7 @@ void Swapchain::Recreate(bool surface_lost) {
 
 bool Swapchain::NeedsResize() const {
 	Common::LockGuard lock(m_window.mutex);
-	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
+	return m_handle == nullptr || m_window_extent.width != m_window.graphic_ctx.screen_width ||
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
@@ -736,11 +740,9 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
 	// The main bus ignores alpha.
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
-	                       (frame.hdr ? 4u : 0u) |
-	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
-	                       (layer.bus == 0 ? 16u : 0u) | extra_flags;
-	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(flags),
-	                      &flags);
+	                       frame.source_flags | (layer.bus == 0 ? 16u : 0u) | extra_flags;
+	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
+	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = m_image_views[m_image_index];
@@ -771,7 +773,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	if (GpuCheckpointsEnabled()) {
 		MarkGpuCheckpoint(vk_command, "present");
 	}
-	const bool convert_source = source != nullptr && source->hdr && !m_hdr_active;
+	const bool convert_source = source != nullptr && VideoOutSourceNeedsDraw(source->source_flags, m_hdr_active);
 	const bool draw_overlay   = overlay.frame != nullptr;
 
 	const auto* aspect_source = source != nullptr ? source : overlay.frame;
@@ -780,7 +782,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                                : vk::Rect2D {{0, 0}, m_extent};
 	// Upscale a smaller non-HDR source instead of bilinear blitting it; HDR/PQ sources keep the
 	// existing HDR10-to-SDR conversion path.
-	const bool upscale_source = FsrUpscaleEnabled() && source != nullptr && !source->hdr &&
+	const bool upscale_source = FsrUpscaleEnabled() && source != nullptr && (source->source_flags & 4u) == 0u &&
 	                            !convert_source &&
 	                            (source->image.extent.width < game_rect.extent.width ||
 	                             source->image.extent.height < game_rect.extent.height);
@@ -964,8 +966,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
-                                          bool headset) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info,
+                                          uint64_t video_out_format, bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -974,9 +976,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
 		default: break;
 	}
-	auto* frame  = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	frame->hdr   = hdr;
-	frame->blank = false;
+	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
+	frame->source_flags = VideoOutSourceFlags(video_out_format);
+	frame->blank        = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -997,10 +999,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
-	auto  format = m_impl->frames.GetFormat();
-	auto* frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->hdr   = false;
-	frame->blank = true;
+	auto              format = m_impl->frames.GetFormat();
+	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
+	frame->source_flags = 0;
+	frame->blank        = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1078,13 +1080,16 @@ void Presenter::Impl::Present() {
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
 	const auto* main_frame = layers[0].frame;
-	const bool  hdr_changed =
-	    main_frame != nullptr && !main_frame->blank && swapchain.SetHdr(main_frame->hdr);
+	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
+	                         swapchain.SetHdr((main_frame->source_flags & 4u) != 0);
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		if (swapchain.ImageCount() == 0) {
+			return;
+		}
 		auto status = [&] {
 			ScopedTimer acquire_time(Counter::PresentAcquireNs);
 			return swapchain.AcquireNextImage(present_scheduler);

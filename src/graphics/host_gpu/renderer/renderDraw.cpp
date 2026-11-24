@@ -520,11 +520,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	if (depth.image_id) {
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		const bool  meta_clear =
+		const auto  aspects    = depth.desc.view_info.aspect;
+		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.load_clear_aspects = {};
-		if (depth.depth_clear_enable || meta_clear)
+		if (depth.depth_clear_enable || (meta_clear && (aspects & vk::ImageAspectFlagBits::eDepth)))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
 		// Apply pending clears to compressed stencil as well as depth.
 		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
@@ -586,7 +587,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
-		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
 		attachment.image_layout   = layout;
@@ -722,10 +722,11 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 }
 
 struct VertexBufferRange {
-	uint64_t                     base_address  = 0;
-	uint64_t                     requested_end = 0;
-	uint64_t                     acquired_end  = 0;
-	std::pair<Buffer*, uint64_t> binding;
+	uint64_t base_address;
+	uint64_t requested_end;
+	uint64_t acquired_end;
+	Buffer*  buffer;
+	uint64_t offset;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
@@ -733,9 +734,10 @@ struct VertexBufferRange {
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	std::array<vk::Buffer, MaxBuffers>     buffers {};
-	std::array<vk::DeviceSize, MaxBuffers> offsets {};
-	std::array<vk::DeviceSize, MaxBuffers> sizes {};
+	// Filled only up to count.
+	std::array<vk::Buffer, MaxBuffers>     buffers;
+	std::array<vk::DeviceSize, MaxBuffers> offsets;
+	std::array<vk::DeviceSize, MaxBuffers> sizes;
 	uint32_t                               count = 0;
 };
 
@@ -959,14 +961,14 @@ struct VertexIndexProbe {
 };
 
 template <bool Probe = false>
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
+static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
+                                 PreparedVertexBuffers& prepared) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 	if constexpr (!Probe) {
 		if (vs_input_info.buffers_num == 0 &&
 		    Common::AbSwitch::Enabled(Common::AbSwitch::EMPTY_VERTEX_FAST_PATH)) [[unlikely]] {
-			return {};
+			return;
 		}
 	}
 	VertexIndexProbe::Clock::time_point phase_start;
@@ -975,8 +977,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	}
 
 	// Collect the non-empty guest vertex ranges.
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges;
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
@@ -989,7 +991,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     vertex.addr, size);
 		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size};
+		ranges[range_count++] = {.base_address = vertex.addr, .requested_end = vertex.addr + size};
 	}
 
 	std::sort(ranges.begin(), ranges.begin() + range_count,
@@ -997,18 +999,16 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		          return left.base_address < right.base_address;
 	          });
 
-	// Merge overlapping or touching ranges before acquiring host buffers.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
-	uint32_t                                                      merged_count = 0;
+	// Merge overlapping or touching ranges in place before acquiring host buffers.
+	uint32_t merged_count = 0;
 	for (uint32_t i = 0; i < range_count; i++) {
 		const auto& range = ranges[i];
-		if (merged_count != 0 &&
-		    merged_ranges[merged_count - 1].requested_end >= range.base_address) {
-			merged_ranges[merged_count - 1].requested_end =
-			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
+		if (merged_count != 0 && ranges[merged_count - 1].requested_end >= range.base_address) {
+			auto& merged         = ranges[merged_count - 1];
+			merged.requested_end = std::max(merged.requested_end, range.requested_end);
 			continue;
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
+		ranges[merged_count++] = range;
 	}
 	if constexpr (Probe) {
 		auto& probe = VertexIndexProbe::Get();
@@ -1034,10 +1034,10 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			probe.ObserveVertex(vs_input_info, sizes);
 		}
 	}
+	const auto merged_ranges = std::span(ranges).first(merged_count);
 
 	auto& cache = buffer.GetContext().GetBufferCache();
-	for (uint32_t i = 0; i < merged_count; i++) {
-		auto& range = merged_ranges[i];
+	for (auto& range: merged_ranges) {
 		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
@@ -1050,7 +1050,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 				phase_start = VertexIndexProbe::Clock::now();
 			}
 		}
-		range.binding = cache.ObtainBuffer(range.base_address, size, false);
+		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
 		if constexpr (Probe) {
 			auto& probe = VertexIndexProbe::Get();
 			if (probe.sampled) {
@@ -1058,7 +1058,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 				const auto elapsed =
 				    VertexIndexProbe::Ns(phase_start, VertexIndexProbe::Clock::now());
 				const bool stream =
-				    range.binding.first == &cache.GetUtilityBuffer(MemoryUsage::Stream);
+				    range.buffer == &cache.GetUtilityBuffer(MemoryUsage::Stream);
 				t.obtain_ns += elapsed;
 				t.stream += stream;
 				if (!probe.retry && probe.vertex_repeat) {
@@ -1073,7 +1073,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	if constexpr (Probe) {
 		if (VertexIndexProbe::Get().sampled) phase_start = VertexIndexProbe::Clock::now();
 	}
-	PreparedVertexBuffers prepared;
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
@@ -1085,21 +1084,20 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			}
 			prepared.buffers[i] = null_buffer;
 			prepared.offsets[i] = 0;
+			prepared.sizes[i]   = 0;
 			continue;
 		}
 
-		const auto range = std::find_if(merged_ranges.begin(), merged_ranges.begin() + merged_count,
-		                                [&](const VertexBufferRange& value) {
-			                                return vertex.addr >= value.base_address &&
-			                                       vertex.addr < value.acquired_end;
-		                                });
-		if (range == merged_ranges.begin() + merged_count) {
+		const auto range = std::ranges::find_if(merged_ranges, [&](const VertexBufferRange& value) {
+			return vertex.addr >= value.base_address && vertex.addr < value.acquired_end;
+		});
+		if (range == merged_ranges.end()) {
 			EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
 			     vertex.addr);
 		}
 
-		prepared.buffers[i] = range->binding.first->Handle();
-		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
+		prepared.buffers[i] = range->buffer->Handle();
+		prepared.offsets[i] = range->offset + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
 	}
 	if constexpr (Probe) {
@@ -1112,7 +1110,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		}
 	}
 
-	return prepared;
 }
 
 static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
@@ -1843,7 +1840,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto stages       = std::span {descriptor_stages.data(), stage_count};
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto       merges       = buffer_cache.MergeCount();
-	PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
+	PrepareGraphicsBindings(stages, m_targets);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	vk::DeviceAddress     mesh_indices = 0;
@@ -1851,10 +1848,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		if (probe_vertex_index) [[unlikely]] {
 			VertexIndexProbe::Get().BeginDraw(state.vertex_info[0].stage.module->id);
-			vertex_bindings = AcquireVertexBuffers<true>(buffer, state.vertex_info[0]);
+			AcquireVertexBuffers<true>(buffer, state.vertex_info[0], vertex_bindings);
 			index_binding   = PrepareIndexBuffer<true>(buffer, index_source);
 		} else {
-			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+			AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_bindings);
 			index_binding   = PrepareIndexBuffer(buffer, index_source);
 		}
 	} else if (draw.indexed) {
@@ -1897,10 +1894,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				auto& probe = VertexIndexProbe::Get();
 				probe.retry = true;
 				++probe.window.retry_passes;
-				vertex_bindings = AcquireVertexBuffers<true>(buffer, state.vertex_info[0]);
+				AcquireVertexBuffers<true>(buffer, state.vertex_info[0], vertex_bindings);
 				index_binding   = PrepareIndexBuffer<true>(buffer, index_source);
 			} else {
-				vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+				AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_bindings);
 				index_binding   = PrepareIndexBuffer(buffer, index_source);
 			}
 		} else if (draw.indexed) {

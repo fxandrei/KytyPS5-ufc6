@@ -32,7 +32,7 @@ namespace {
 [[nodiscard]] vk::ImageCreateFlags
 ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::ImageUsageFlags usage) {
 	vk::ImageCreateFlags flags {};
-	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
+	if (!info.IsDepth()) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
 		if (info.IsBlock() && graphics.supports_block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
@@ -78,7 +78,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}
-	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
+	if (info.IsDepth()) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
 		if (graphics.attachment_feedback_loop_enabled &&
 		    (usage & vk::ImageUsageFlagBits::eSampled)) {
@@ -105,20 +105,6 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 }
 
 } // namespace
-
-vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
-	switch (format) {
-		case vk::Format::eD16Unorm:
-		case vk::Format::eX8D24UnormPack32:
-		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
-		case vk::Format::eS8Uint: return vk::ImageAspectFlagBits::eStencil;
-		case vk::Format::eD16UnormS8Uint:
-		case vk::Format::eD24UnormS8Uint:
-		case vk::Format::eD32SfloatS8Uint:
-			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-		default: return vk::ImageAspectFlagBits::eColor;
-	}
-}
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
@@ -169,7 +155,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 					barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 					barrier.image                           = backing.image;
-					barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
+					barrier.subresourceRange.aspectMask     = ImageAspectMask(backing.format);
 					barrier.subresourceRange.baseMipLevel   = level;
 					barrier.subresourceRange.levelCount     = 1;
 					barrier.subresourceRange.baseArrayLayer = layer;
@@ -203,7 +189,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 		barrier.image                           = backing.image;
-		barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
+		barrier.subresourceRange.aspectMask     = ImageAspectMask(backing.format);
 		barrier.subresourceRange.baseMipLevel   = 0;
 		barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
 		barrier.subresourceRange.baseArrayLayer = 0;
@@ -293,8 +279,6 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
@@ -362,8 +346,8 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 void Image::CopyImage(Image& source, bool stencil) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	EXIT_IF(stencil &&
-	        (!(FullAspectMask(source.backing.format) & vk::ImageAspectFlagBits::eStencil) ||
-	         !(FullAspectMask(backing.format) & vk::ImageAspectFlagBits::eStencil)));
+	           (!(ImageAspectMask(source.backing.format) & vk::ImageAspectFlagBits::eStencil) ||
+	            !(ImageAspectMask(backing.format) & vk::ImageAspectFlagBits::eStencil)));
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	uint32_t       base_depth = source.backing.extent.depth;
@@ -374,10 +358,10 @@ void Image::CopyImage(Image& source, bool stencil) {
 	}
 	const auto source_aspect =
 	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
-	            : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	            : DataAspect(source.backing.format);
 	const auto destination_aspect =
 	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
-	            : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	            : DataAspect(backing.format);
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
@@ -415,8 +399,6 @@ void Image::CopyImage(Image& source, bool stencil) {
 	ImageCheckpoint(command, "copy", info);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, levels, copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
@@ -492,10 +474,10 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto transfer_aspect = [stencil](vk::Format format) {
-		const auto aspects = FullAspectMask(format);
+		const auto aspects = ImageAspectMask(format);
 		return stencil && (aspects & vk::ImageAspectFlagBits::eStencil)
 		           ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eStencil}
-		           : aspects & ~vk::ImageAspectFlagBits::eStencil;
+		           : DataAspect(format);
 	};
 	const auto source_aspect = transfer_aspect(source.backing.format);
 	const auto destination_aspect = transfer_aspect(backing.format);
@@ -505,11 +487,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 		        (destination_aspect != vk::ImageAspectFlagBits::eStencil &&
 		         backing.format != vk::Format::eR8Uint));
 	}
-	const auto     source_bytes      = stencil ? 1u : DepthAspectTransferBytes(source.backing.format) != 0
-	                                       ? DepthAspectTransferBytes(source.backing.format)
+	const auto     source_bytes      = stencil ? 1u : DepthStencilTransferBytes(source.backing.format) != 0
+	                                       ? DepthStencilTransferBytes(source.backing.format)
 	                                       : source.info.bytes_per_block;
-	const auto     destination_bytes = stencil ? 1u : DepthAspectTransferBytes(backing.format) != 0
-	                                       ? DepthAspectTransferBytes(backing.format)
+	const auto     destination_bytes = stencil ? 1u : DepthStencilTransferBytes(backing.format) != 0
+	                                       ? DepthStencilTransferBytes(backing.format)
 	                                       : info.bytes_per_block;
 	const uint32_t source_block      = source.info.IsBlock() ? 4u : 1u;
 	const uint32_t destination_block = info.IsBlock() ? 4u : 1u;
@@ -615,8 +597,12 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	barrier.size = buffer.Size();
 	command.pipelineBarrier2(dependency);
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	if (stencil) {
+		// The storage-stencil bridge exposes this image through a GENERAL descriptor.
+		// Ordinary image copies retain their transfer state for the next binding to resolve.
+		Transit(vk::ImageLayout::eGeneral,
+		        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	}
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
@@ -628,8 +614,8 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
 	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
-	const auto aspects                             = FullAspectMask(source.backing.format);
-	EXIT_IF(aspects != FullAspectMask(backing.format));
+	const auto aspects                             = ImageAspectMask(source.backing.format);
+	EXIT_IF(aspects != ImageAspectMask(backing.format));
 	std::array<vk::ImageCopy, 2> copies {};
 	uint32_t                     copy_count = 0;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
@@ -649,8 +635,6 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	ImageCheckpoint(command, "copy", info);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 namespace ImageOps {
@@ -796,7 +780,7 @@ void Image::CreateBacking() {
 }
 
 uint64_t Image::HashGuestEdges() const {
-	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
+	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes;
 	const auto                                 range = info.data;
 	const uint64_t                             head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));

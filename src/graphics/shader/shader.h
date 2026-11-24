@@ -33,6 +33,9 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
+// MODE bit 6 enables FP16 and FP64 input denormals independently of output flushing.
+constexpr bool ShaderFlushF16Inputs(uint8_t float_mode) { return (float_mode & 0x40u) == 0; }
+
 struct ShaderModule;
 
 struct ShaderStageRuntime {
@@ -80,13 +83,14 @@ struct ShaderWorkgroupInputInfo {
 };
 
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
-	uint32_t input_primitive      = 0;
-	uint32_t primitives_per_group = 0;
-	uint32_t vertices_per_group   = 0;
-	uint32_t max_vertices         = 0;
-	uint32_t max_primitives       = 0;
-	uint32_t provoking_vertex     = 0;
-	bool     fast_launch          = false;
+	uint32_t input_primitive       = 0;
+	uint32_t output_primitive_size = 3;
+	uint32_t primitives_per_group  = 0;
+	uint32_t vertices_per_group    = 0;
+	uint32_t max_vertices          = 0;
+	uint32_t max_primitives        = 0;
+	uint32_t provoking_vertex      = 0;
+	bool     fast_launch           = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -147,6 +151,7 @@ struct ShaderVertexInputInfo {
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
+	uint8_t                 float_mode          = 0xc0;
 	uint32_t                scratch_size_dwords = 0;
 	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
 	uint32_t                lds_size_dwords     = 0;
@@ -185,6 +190,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;
+	uint8_t                                        float_mode                   = 0xc0;
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;

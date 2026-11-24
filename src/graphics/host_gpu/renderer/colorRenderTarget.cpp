@@ -46,6 +46,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
+	const auto& rt = hw.GetRenderTarget(rt_slot);
+	// Prefer the upstream result: it also tracks guest clear-key windows and image ownership.
+	if (rt.base.addr != 0 &&
+	    (ignore_target_mask || render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot) != 0) &&
+	    m_context.GetResolveCache().FindColor(rt_slot, rt, exact_format, r)) {
+		BindRenderTarget(r.image_id);
+		return;
+	}
+
 	// Unchanged slot registers and image set resolve to the same descriptor and image.
 	auto&      texture_cache = m_context.GetTextureCache();
 	auto&      memo          = m_color_target_memo[rt_slot];
@@ -54,12 +63,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	    stamp != 0 && Common::AbSwitch::Enabled(Common::AbSwitch::TARGET_LOOKUP_MEMO);
 	if (memo_enabled && memo.stamp == stamp && memo.target_mask == hw.GetRenderTargetMask() &&
 	    memo.ignore_target_mask == ignore_target_mask && memo.exact_format == exact_format &&
-	    memo.generation == texture_cache.StructureGeneration()) {
+	    memo.generation == texture_cache.StructureGeneration() &&
+	    m_context.GetResolveCache().Reuse(memo.target.image_id, memo.target.desc.stamp)) {
 		r = memo.target;
 		if (r.image_id) {
 			texture_cache.ReuseImage(r.image_id, r.desc, memo.metadata_base_layer);
 			BindRenderTarget(r.image_id);
 		}
+		m_context.GetResolveCache().SetColor(rt_slot, rt, exact_format, r);
 		return;
 	}
 	const auto remember = [&](uint32_t metadata_base_layer) {
@@ -75,7 +86,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 	};
 
-	const auto& rt   = hw.GetRenderTarget(rt_slot);
 	auto        mask = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
@@ -183,7 +193,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const uint32_t width  = rt.attrib2.width + 1;
 	const uint32_t height = rt.attrib2.height + 1;
 	const auto target_format =
-	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
+	    TextureGetRenderTargetFormat(m_context.GetGraphics(), rt.info.format, rt.info.channel_type,
+	                                 rt.info.channel_order);
 	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
 	// mip 0's padded pitch aliases mip 0's top-left texels.
 	uint32_t mip = rt.view.current_mip_level;
@@ -278,6 +289,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 	remember(view.base_layer);
+	m_context.GetResolveCache().SetColor(rt_slot, rt, exact_format, r);
 }
 
 } // namespace Libs::Graphics

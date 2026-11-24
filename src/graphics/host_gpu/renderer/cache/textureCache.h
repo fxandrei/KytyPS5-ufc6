@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/resolveStamp.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -33,6 +34,7 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class ResolveCache;
 class TextureCache;
 struct TextureCacheTestAccess;
 
@@ -51,10 +53,12 @@ public:
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
 		bool          heap = false; // PS5: resolved for a resident image heap.
+		// PS5: set by FindImage.
+		ResolveStamp stamp;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	             BufferCache& buffer_cache);
+	             BufferCache& buffer_cache, ResolveCache& resolve_cache);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
@@ -123,6 +127,7 @@ private:
 		// Guest depth surface last bound with this HTile. One surface can use several HTile
 		// allocations, such as depth-only and depth-stencil variants.
 		uint64_t depth_address = 0;
+		ImageId owner; // Native owner; a grown replacement can retain pending HTile clears.
 	};
 
 	struct OverlapResult {
@@ -295,6 +300,7 @@ private:
 	BlitHelper                m_blit_helper;
 	TileManager               m_tiler;
 	BufferCache&              m_buffer_cache;
+	ResolveCache&             m_resolve_cache;
 	std::unique_ptr<Buffer>   m_stencil_scratch;
 	Common::SlotVector<Image> m_slot_images;
 	ImagePageTable            m_image_page_table;
@@ -351,6 +357,7 @@ private:
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend class ImageHeap;
+	friend class ResolveCache;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);

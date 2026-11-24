@@ -31,4 +31,14 @@ bool TryReadGpuCleanBytes(uint64_t /*vaddr*/, void* /*data*/, uint64_t /*size*/)
 
 void TraceGpuDirtyRead(const char* /*what*/, uint64_t /*vaddr*/) noexcept {}
 
+uint64_t GuestMapEpoch() noexcept { return 0; }
+
+bool GpuWriteInFlightAt(uint64_t /*vaddr*/) noexcept { return false; }
+
+bool SrtDirtyStatsEnabled() noexcept { return false; }
+
+SrtDirtyCover SrtDirtyCoverAt(uint64_t /*vaddr*/) noexcept { return {}; }
+
+void NoteSrtDirtyRead(const SrtDirtyCover& /*cover*/, const SrtDirtyRead& /*read*/) noexcept {}
+
 } // namespace Libs::LibKernel::Memory

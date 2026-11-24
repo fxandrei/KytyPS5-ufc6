@@ -204,6 +204,8 @@ struct VideoOutConfig {
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
+	// The flip and wait packets name a buffer by its label.
+	std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
 };
 
 class FlipQueue {
@@ -273,6 +275,7 @@ public:
 	int             Open(int bus_type, int index);
 	bool            Close(int handle);
 	VideoOutConfig* Get(int handle);
+	VideoOutConfig* GetByLabel(const uint64_t* label);
 	int             SetFlipMaster(int slave_handle, int master_handle);
 
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
@@ -737,6 +740,19 @@ VideoOutConfig* VideoOutDriver::Impl::Get(int handle) {
 	return IsOpenedLocked(handle) ? m_video_out_ctx + handle : nullptr;
 }
 
+VideoOutConfig* VideoOutDriver::Impl::GetByLabel(const uint64_t* label) {
+	Common::LockGuard lock(m_mutex);
+
+	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+		const auto& labels = m_video_out_ctx[handle].labels;
+		if (IsOpenedLocked(handle) && label >= labels.data() &&
+		    label < labels.data() + labels.size()) {
+			return m_video_out_ctx + handle;
+		}
+	}
+	return nullptr;
+}
+
 int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
 	Common::LockGuard lock(m_mutex);
 	if (!IsOpenedLocked(slave_handle) || !IsOpenedLocked(master_handle)) {
@@ -977,7 +993,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	Graphics::ImageInfo source_info;
 	bool                current             = false;
 	bool                premultiplied_alpha = false;
-	bool                hdr                 = false;
+	uint64_t            video_out_format    = 0;
 	bool                headset             = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
@@ -992,7 +1008,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			}
 			const auto& group   = cfg->groups[surface.group_index];
 			source_info         = group.ImageInfo(surface);
-			hdr                 = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
+			video_out_format    = group.attribute.pixel_format;
 			premultiplied_alpha = (group.attribute.option &
 			                       VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
 		}
@@ -1012,7 +1028,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(m_width, m_height,
 		                                       index == VIDEO_OUT_BUFFER_INDEX_BLACK, &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, video_out_format, headset);
 		if (headset) {
 			g_headset_mirror = true;
 		}
@@ -1578,12 +1594,21 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-bool VideoOutDriver::IsSafeForRendering(int handle, int index) {
-	auto* ctx = m_impl->Get(handle);
+bool VideoOutDriver::IsSafeForRendering(const uint64_t* label) {
+	auto* ctx = m_impl->GetByLabel(label);
 	EXIT_IF(ctx == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index);
+	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, static_cast<int>(label - ctx->labels.data()));
+}
+
+uint64_t* VideoOutGetBufferLabels(int handle, int* bus) {
+	auto* ctx = DriverState().Get(handle);
+	if (ctx == nullptr) {
+		return nullptr;
+	}
+
+	*bus = ctx->bus;
+	return ctx->labels.data();
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
@@ -1602,18 +1627,6 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 	ctx->mutex.Lock();
 	*status = ctx->flip_status;
 	ctx->mutex.Unlock();
-
-	LOGF("\t count = %" PRIu64 "\n"
-	     "\t processTime = %" PRIu64 "\n"
-	     "\t processTimeCounter = %" PRIu64 "\n"
-	     "\t submitProcessTimeCounter = %" PRIu64 "\n"
-	     "\t flipArg = %" PRId64 "\n"
-	     "\t gcQueueNum = %d\n"
-	     "\t flipPendingNum = %d\n"
-	     "\t currentBuffer = %d\n",
-	     status->count, status->processTime, status->processTimeCounter,
-	     status->submitProcessTimeCounter, status->flipArg, status->gcQueueNum,
-	     status->flipPendingNum, status->currentBuffer);
 
 	return OK;
 }
@@ -1654,11 +1667,6 @@ KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* stat
 	ctx->mutex.Lock();
 	*status = ctx->vblank_status;
 	ctx->mutex.Unlock();
-
-	LOGF("\t count = %" PRIu64 "\n"
-	     "\t processTime = %" PRIu64 "\n"
-	     "\t processTimeCounter = %" PRIu64 "\n",
-	     status->count, status->processTime, status->processTimeCounter);
 
 	return OK;
 }
@@ -1750,11 +1758,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
+	int32_t attribute  = 0x20000000; // Without a param file, HDR stays allowed.
 	int32_t attribute3 = 0;
+	Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute);
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
-	int32_t    attribute   = 0;
-	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
-	                         (attribute & 0x20000000) != 0;
+	const bool hdr_allowed = (attribute & 0x20000000) != 0;
 	// A title sizes its output, and the range of its dynamic resolution, from this status. A screen
 	// smaller than 4K reports 1080p, also to titles whose param.json does not enable resolution
 	// detection: UFC 6 then renders its main menu with about a third less GPU work.

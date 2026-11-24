@@ -44,6 +44,13 @@ struct ImageSubresources {
 	auto     operator<=>(const ImageSubresources&) const = default;
 };
 
+// The level and first layer of a container that a single-level image occupies, or -1.
+struct ImageSubresource {
+	int32_t mip                                       = -1;
+	int32_t layer                                     = -1;
+	bool    operator==(const ImageSubresource&) const = default;
+};
+
 struct ImageSubresourceRange {
 	uint32_t base_level                                      = 0;
 	uint32_t level_count                                     = 1;
@@ -52,22 +59,39 @@ struct ImageSubresourceRange {
 	auto     operator<=>(const ImageSubresourceRange&) const = default;
 };
 
-struct ImageMipInfo {
-	// Guest mip chains run backwards within each layer or volume block-slice.
-	// Tail levels share an offset and use tail_x/tail_y within that block.
-	uint64_t offset                                 = 0;
-	uint64_t size                                   = 0;
-	// Padded dimensions in storage elements (compressed blocks for BC formats).
-	uint32_t pitch                                  = 0;
-	uint32_t height                                 = 0;
-	uint64_t linear_offset                          = 0;
-	uint64_t linear_size                            = 0; // Per transfer slice.
-	uint32_t linear_pitch                           = 0; // Storage elements.
-	uint32_t tail_x                                 = 0;
-	uint32_t tail_y                                 = 0;
-	uint32_t surface_z                              = 0;
-	auto     operator<=>(const ImageMipInfo&) const = default;
+// Transfer layout of detiled or guest-linear texels; tiled colors pack it mip-major.
+struct ImageLinearLayout {
+	struct Mip {
+		uint64_t offset = 0;
+		uint64_t size   = 0; // Per transfer slice.
+		uint32_t pitch  = 0; // Addressable elements.
+	};
+	std::array<Mip, 16> mips {};
+	// Nonzero for guest-linear and depth-plane transfers.
+	uint64_t slice_stride = 0;
 };
+
+[[nodiscard]] inline constexpr vk::ImageAspectFlags ImageAspectMask(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eX8D24UnormPack32:
+		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
+		case vk::Format::eS8Uint: return vk::ImageAspectFlagBits::eStencil;
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		default: return vk::ImageAspectFlagBits::eColor;
+	}
+}
+
+// The primary guest range of a combined image contains depth. Stencil has its own range.
+[[nodiscard]] inline constexpr vk::ImageAspectFlagBits DataAspect(vk::Format format) noexcept {
+	const auto aspects = ImageAspectMask(format);
+	if (aspects & vk::ImageAspectFlagBits::eDepth) return vk::ImageAspectFlagBits::eDepth;
+	return aspects == vk::ImageAspectFlagBits::eStencil ? vk::ImageAspectFlagBits::eStencil
+	                                                    : vk::ImageAspectFlagBits::eColor;
+}
 
 struct ImageInfo {
 	GuestRange                   data;
@@ -84,15 +108,15 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
-	std::array<ImageMipInfo, 16> mip_layout {};
-	TileTextureBlockLayout       tiling;
-	uint64_t                     tiled_slice_stride = 0;
-	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
-	uint64_t linear_slice_stride = 0;
-	uint32_t first_tail_level    = 16;
+	// Records of levels [0, resources.levels); an array image's level sizes span every layer.
+	std::array<TileMipLayout, 16> mip_layout {};
+	TileTextureBlockLayout        tiling;
+	uint64_t                      tiled_slice_stride = 0;
+	uint32_t                      first_tail_level   = 16;
 
 	void                                           UpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
+	[[nodiscard]] ImageLinearLayout                LinearLayout() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
@@ -109,6 +133,9 @@ struct ImageInfo {
 		}
 	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
+	[[nodiscard]] constexpr bool HasSeparateStencil() const noexcept {
+		return HasStencil() && pixel_format != vk::Format::eS8Uint;
+	}
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
 	}
@@ -132,18 +159,7 @@ struct ImageInfo {
 		       bytes_per_block == other.bytes_per_block &&
 		       GetColorTransform() == other.GetColorTransform();
 	}
-	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
-		if (container.resources.levels > container.mip_layout.size()) {
-			return -1;
-		}
-		for (uint32_t level = 0; level < container.resources.levels; level++) {
-			if (SliceOf(container, static_cast<int32_t>(level)) >= 0) {
-				return static_cast<int32_t>(level);
-			}
-		}
-		return -1;
-	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
+	[[nodiscard]] ImageSubresource SubresourceOf(const ImageInfo& container) const noexcept;
 };
 
 struct ImageViewInfo {
@@ -169,7 +185,12 @@ struct DepthFormatPolicy {
 	std::array<vk::Format, 3> stencil_attachment_formats;
 };
 
-inline constexpr std::array<DepthFormatPolicy, 2> DEPTH_FORMAT_POLICIES {{
+inline constexpr std::array<DepthFormatPolicy, 3> DEPTH_FORMAT_POLICIES {{
+    {Prospero::DepthFormat::kInvalid,
+     Prospero::BufferFormat::k8UInt,
+     1,
+     vk::Format::eUndefined,
+     {vk::Format::eS8Uint, vk::Format::eUndefined, vk::Format::eUndefined}},
     {Prospero::DepthFormat::kZ16,
      Prospero::BufferFormat::k16UNorm,
      2,
@@ -234,10 +255,11 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 }
 
 inline bool ImageInfo::IsDepth() const noexcept {
-	return DepthAspectTransferFormat(pixel_format) != vk::Format::eUndefined;
+	return ImageAspectMask(pixel_format) != vk::ImageAspectFlagBits::eColor;
 }
 
-[[nodiscard]] inline constexpr uint32_t DepthAspectTransferBytes(vk::Format format) noexcept {
+[[nodiscard]] inline constexpr uint32_t DepthStencilTransferBytes(vk::Format format) noexcept {
+	if (format == vk::Format::eS8Uint) return 1;
 	switch (DepthAspectTransferFormat(format)) {
 		case vk::Format::eD16Unorm: return 2;
 		case vk::Format::eX8D24UnormPack32:
@@ -248,7 +270,8 @@ inline bool ImageInfo::IsDepth() const noexcept {
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
 	const auto* policy = FindGuestDepthFormatPolicy(info.guest_format);
-	return policy != nullptr && info.bytes_per_block == policy->bytes_per_element &&
+	return policy != nullptr && info.pixel_format != vk::Format::eUndefined &&
+	       info.bytes_per_block == policy->bytes_per_element &&
 	       (info.HasStencil() ? IsStencilAttachmentFormat(*policy, info.pixel_format)
 	                          : info.pixel_format == policy->depth_attachment_format);
 }
@@ -257,7 +280,7 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	if (!IsSupportedDepthTargetFormat(info)) {
 		return false;
 	}
-	const auto transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
+	const auto transfer_bytes = DepthStencilTransferBytes(info.pixel_format);
 	return transfer_bytes == info.bytes_per_block ||
 	       (info.bytes_per_block == sizeof(uint16_t) && transfer_bytes == sizeof(uint32_t));
 }
@@ -273,7 +296,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
-	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+	if (metadata_address == 0 || (metadata_address & 0xffu) != 0) {
 		return VideoOutCompression::Unsupported;
 	}
 	switch (dcc_control) {
@@ -311,6 +334,25 @@ inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT210
 		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return true;
 		default: return false;
 	}
+}
+
+// Overlay shader source flags of a VideoOut buffer: PQ (4) and linear (8).
+[[nodiscard]] constexpr uint32_t VideoOutSourceFlags(uint64_t format) {
+	const uint32_t pq = IsHdrVideoOutPixelFormat(format) ? 4u : 0u;
+	switch (format) {
+		case 0x8100000622000000ull:
+		case 0x8100000600000000ull:
+		case 0xc001000622000000ull:
+		case 0xc001000600000000ull:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return pq | 8u;
+		default: return pq;
+	}
+}
+
+// Linear sources, and PQ sources on an SDR target, are drawn through the overlay shader.
+[[nodiscard]] constexpr bool VideoOutSourceNeedsDraw(uint32_t source_flags, bool hdr_target) {
+	return (source_flags & 8u) != 0 || ((source_flags & 4u) != 0 && !hdr_target);
 }
 
 inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{

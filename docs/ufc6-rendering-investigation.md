@@ -1,6 +1,28 @@
 # UFC 6 rendering investigation
 
-## Current entry point, 2026-11-23
+## Current entry point, 2026-11-24
+
+The owner authorized refresh of all known repositories, push to the personal fork and a published
+experimental release. Upstream `b446af9d2` is integrated with the local snapshot `8d40d8b2a` preserved.
+Exact reviewed tips are in `docs/releases/2026-11-24-repositories.json`; integration notes are in
+`docs/releases/2026-11-24-integration.md`. Detailed evidence remains in
+`D:/Projects/kyty-dev/handoff/2026-11-24/HANDOFF.txt` and the logs beside it.
+
+Emulator/launcher and the selected test targets build. Eight isolated GPU functional controls pass:
+resolve cache, native indirect dispatch, stencil storage aliases, bounded image copies, GDS with both
+allocation modes, BDA with diagnostic host visibility and ordered dispatch. Integration fixes preserve
+actual resolve stamps, let upstream color results take precedence, restore the ordinary image-copy
+end-layout contract and allow S8 plane records to move between depth owners. A redundant indirect
+argument barrier is superseded by the upstream writer dependencies. No FPS gain is inferred.
+
+Eleven CPU/resource/kernel CTests passed during integration. The full GPU suite still stops at the
+previously recorded adjacent-download-stride assertion. The filesystem suite stops in an upstream
+Linux `/proc` waiter helper on Windows; its separate network mode fails the initial NP callback state
+assertion. Those paths remain unverified. No Vulkan-validation pass: RTSS remains active.
+Live merged-source control and release publication are still pending. Known watchdog/corruption,
+replay and BAR menu issues require a prerelease. No 60 FPS combat claim.
+
+## Previous entry point, 2026-11-23
 
 **Final checkpoint22:06:** read `D:\Projects\kyty-dev\handoff\2026-11-23\RESULTS_2205.md`. The fixed-corner host-barrier A/B was neutral (13pairs,1.000715 ratio, near60FPS in both phases). BAR allocation still reproduced slowdown/watchdog with per-shader timers absent and direct BAR reads disabled. Unmapped allocation reached observed clean UFC APEX combat and KO/results, but also printed a pre-fight guest watchdog. The bounded active-fight interval gives59 compilation-free samples, mean39.21/median39.28FPS at3840x2160 depth; no60FPS combat or accepted improvement. Next is a new fight-only CPU profile with the now-populated cache, plus a separate allocation/residency diagnosis. All own test/monitor processes are closed. Final upstream fetch is4e9065450 (POSIX rename export, reviewed), still not merged. Earlier entries below retain chronology and methodological caveats.
 

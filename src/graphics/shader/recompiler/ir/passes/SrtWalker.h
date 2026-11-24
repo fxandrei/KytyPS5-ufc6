@@ -80,7 +80,7 @@ bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
-// The exception handler completes such a load as a zero read.
+// The exception handler completes such a load from the backing, else as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 // AbSwitch SRT_PREWALK_MEMO support (GPU thread): unknown optional loads of the last walk; loads the
 // exception handler completed as zero (counted since start, see NoteSrtWalkerSkippedLoad); and the

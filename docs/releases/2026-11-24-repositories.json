@@ -1,0 +1,88 @@
+[
+  {
+    "name": "upstream",
+    "ref": "refs/remotes/origin/main",
+    "sha": "b446af9d26e000b5dd93ecfc8bf5403ad500e9fd",
+    "date": "2026-11-24T15:33:24+01:00",
+    "title": "graphics: render stencil-only targets and preserve shared stencil contents"
+  },
+  {
+    "name": "personal",
+    "ref": "refs/remotes/fork/ufc6-perf",
+    "sha": "fbc7cde9f246a8614f36cc03da7d284f310b7139",
+    "date": "2026-10-31T18:13:14+02:00",
+    "title": "ufc6: document the Catmull-Rom upscale and release ufc6-v20261031d"
+  },
+  {
+    "name": "chenxiao",
+    "ref": "refs/remotes/chenxiao/experiment/perf-40fps-20260926",
+    "sha": "216ce7f16795fd1a2d83fd011585989152982725",
+    "date": "2026-11-22T14:09:05+09:00",
+    "title": "Release notes: mode 4 in the launchers (PR #377), mode 4 with frame generation (#378), the weave (PR #358), freed write-back byte gate (PR #379), Linux page marks (PR #376), Russian launcher (PR #381)"
+  },
+  {
+    "name": "todojuegos",
+    "ref": "refs/remotes/todojuegos/experiment/perf-40fps-20260926",
+    "sha": "1e4e213bb5a97b9f34f540ad1d3a1c9fc490ad44",
+    "date": "2026-11-23T04:46:03+01:00",
+    "title": "DemonsSoulsPC-20261123-1: nota de version (la release sale la primera en la lista de GitHub)"
+  },
+  {
+    "name": "yumlevi",
+    "ref": "refs/remotes/yumlevi/saros-port",
+    "sha": "e7d658cd646bc91906c9f9052a1cd65dd9575808",
+    "date": "2026-11-18T09:56:44-07:00",
+    "title": "The driver gets 64 GB of address space below 1 TB with DLSS or frame generation"
+  },
+  {
+    "name": "astrohybrid",
+    "ref": "refs/remotes/astrohybrid/main",
+    "sha": "51ae284c3bf3c91ad4b1e531565be245c18ac0f3",
+    "date": "2026-11-24T03:47:50Z",
+    "title": "Release AstroHybrid 1.2.22: integrate dual-GPU fix (#206), Close Game fix (#204), RTX 30 FG override (#198)"
+  },
+  {
+    "name": "senaxx",
+    "ref": "refs/remotes/senaxx-review/main",
+    "sha": "ec6c3f18460d6b101bce61b51ca04dfef22ddaba",
+    "date": "2026-11-17T15:51:20+01:00",
+    "title": "vma: smaller device memory blocks"
+  },
+  {
+    "name": "elyfura",
+    "ref": "refs/remotes/elyfura-review/perf-rework",
+    "sha": "914ee55398761588e95b0c4d33e73d54aed1a147",
+    "date": "2026-11-08T18:01:23+01:00",
+    "title": "presentation: optionally report a 1080p video output"
+  },
+  {
+    "name": "joshweible",
+    "ref": "refs/remotes/joshweible-review/yotei-front-thread",
+    "sha": "99082835590f60e18890f33055318b5614ffb146",
+    "date": "2026-11-04T19:47:14-05:00",
+    "title": "GPU thread: read guest packets on a front thread"
+  },
+  {
+    "name": "nhl27",
+    "ref": "refs/remotes/nhl27-review/nhl27pc",
+    "sha": "d080449a4422bd837b78213cd1b2da0208a1091e",
+    "date": "2026-11-07T20:03:02+01:00",
+    "title": "gpu: look-ahead shader-resource materialization helper (parts 13-14)"
+  },
+  {
+    "name": "jetsku",
+    "path": "D:/Projects/kyty-forks/jetsku",
+    "ref": "refs/remotes/origin/main",
+    "sha": "dd9f9901dbafc5419a8f8e98b8bda0eb80492b2c",
+    "date": "2026-11-18T08:34:40+02:00",
+    "title": "Astro Bot preset: the other title id gets the same switches"
+  },
+  {
+    "name": "cozmaaa",
+    "path": "D:/Projects/kyty-forks/cozmaaa",
+    "ref": "refs/remotes/origin/main",
+    "sha": "42bb0da520992e35f062f44e6762484c356b9ded",
+    "date": "2026-10-17T00:05:08+02:00",
+    "title": "loader: keep the caller's flags in the TLS stubs (#1571)"
+  }
+]

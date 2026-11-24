@@ -840,10 +840,10 @@ bool TryEmulate(void* native_context) {
 }
 
 void SkipLoad(void* native_context, size_t length) {
-	CompleteLoad(native_context, 0, length);
+	CompleteLoad(native_context, length, 0);
 }
 
-void CompleteLoad(void* native_context, uint32_t value, size_t length) {
+void CompleteLoad(void* native_context, size_t length, uint32_t value) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
 	context.Gpr(0) = value;
 	context.Advance(length);

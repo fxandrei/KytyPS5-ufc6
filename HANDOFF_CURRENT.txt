@@ -1,3 +1,15 @@
+CURRENT RESUME: 2026-11-24 - UPDATE / RELEASE IN PROGRESS
+Read docs/releases/2026-11-24-integration.md and the LAST entry in
+D:/Projects/kyty-dev/handoff/2026-11-24/HANDOFF.txt first.
+User authorized refresh, push to fxandrei/KytyPS5-ufc6 and publication. Do not ask again.
+Branch release/ufc6-20261124, backup snapshot 8d40d8b2a; upstream b446af9d2 integrated.
+Build PASS; eight focused GPU functional checks PASS. Eleven CPU/resource/kernel CTests PASS.
+Full GPU suite FAIL at inherited adjacent-download stride. Filesystem suite FAIL at Linux /proc
+helper on Windows; network-only FAIL at initial NP callback sign-in state. No Vulkan validation.
+Live integrated-source control and publication still pending. Finish clean Fork/tag build,
+portable package/source archive/checksums, fast-forward personal ufc6-perf and publish prerelease.
+Preserve uploads; artifacts/TEMP on D:. Earlier dated notes below retain historical state.
+
 Kyty / UFC 6 active development handoff
 CURRENT RESUME: 2026-11-23 22:06 Europe/Bucharest. Read RESULTS_2205.md and the LAST entry in
 D:/Projects/kyty-dev/handoff/2026-11-23/HANDOFF.txt, then investigation.json and MILESTONE_2144.md.

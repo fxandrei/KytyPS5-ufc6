@@ -1,0 +1,25 @@
+Source and build information
+
+Source repository: https://github.com/fxandrei/KytyPS5-ufc6
+Release tag: ufc6-v20261124-preview.1
+The exact source revision and upstream revision are in BUILD-INFO.json.
+
+To obtain the corresponding source, including third-party submodules:
+
+  git clone --recurse-submodules https://github.com/fxandrei/KytyPS5-ufc6.git
+  cd KytyPS5-ufc6
+  git checkout ufc6-v20261124-preview.1
+  git submodule update --init --recursive
+
+Build instructions and compiler/dependency setup are in the repository README
+and CMake configuration. This package uses Release clang-cl 20.1.8, Qt 6.10.3
+and Vulkan SDK 1.4.341.1. The local historical PGO profile is identified by hash
+in BUILD-INFO.json; a normal source build does not require that private path.
+Configure KYTY_BUILD_ORIGIN=Fork, KYTY_BUILD_REPOSITORY=fxandrei/KytyPS5-ufc6,
+and KYTY_RELEASE_TAG=ufc6-v20261124-preview.1 for fork diagnostics.
+
+Kyty is distributed under the GNU GPL v2; see LICENSE. Third-party components
+retain their own licenses. Included notices are in licenses/. Complete source
+and license texts for those components are available through the pinned source
+submodules and CMake dependency declarations. No game content or NVIDIA runtime
+is included in this package.

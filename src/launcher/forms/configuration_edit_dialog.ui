@@ -96,6 +96,26 @@
             <item row="0" column="1">
              <widget class="QComboBox" name="comboBox_audio_input_device"/>
             </item>
+            <item row="1" column="0">
+             <widget class="QLabel" name="label_audio_output">
+              <property name="text"><string>Output:</string></property>
+             </widget>
+            </item>
+            <item row="1" column="1">
+             <widget class="QComboBox" name="comboBox_audio_output">
+              <property name="toolTip"><string>Audio device games see: TV, AV amplifier (7.1), sound bar (5.1) or headphones.</string></property>
+              <item><property name="text"><string>TV</string></property></item>
+              <item><property name="text"><string>AV Amplifier</string></property></item>
+              <item><property name="text"><string>Sound Bar</string></property></item>
+              <item><property name="text"><string>Headphones</string></property></item>
+             </widget>
+            </item>
+            <item row="2" column="1">
+             <widget class="QCheckBox" name="checkBox_audio_3d">
+              <property name="text"><string>3D audio</string></property>
+              <property name="toolTip"><string>Allow games to select their 3D audio mix.</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
@@ -207,6 +227,12 @@
              <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
               <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
               <property name="text"><string>Relaxed shader float math</string></property>
+             </widget>
+            </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_native_rt">
+              <property name="toolTip"><string>Use native RT on the GPU.</string></property>
+              <property name="text"><string>Native ray tracing (experimental)</string></property>
              </widget>
             </item>
            </layout>

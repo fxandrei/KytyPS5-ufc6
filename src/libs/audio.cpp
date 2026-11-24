@@ -1,3 +1,4 @@
+#include "libs/audio3d.h"
 #include "libs/audio.h"
 
 #include "common/assert.h"
@@ -23,17 +24,9 @@ namespace Libs::Audio {
 
 namespace {
 
-constexpr int AUDIO_OUT_PORT_TYPE_MAIN      = 0;
-constexpr int AUDIO_OUT_PORT_TYPE_BGM       = 1;
-constexpr int AUDIO_OUT_PORT_TYPE_VOICE     = 2;
-constexpr int AUDIO_OUT_PORT_TYPE_PERSONAL  = 3;
-constexpr int AUDIO_OUT_PORT_TYPE_PADSPK    = 4;
-constexpr int AUDIO_OUT_PORT_TYPE_VIBRATION = 10;
-constexpr int AUDIO_OUT_PORT_TYPE_AUDIO3D   = 126;
-constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
-
-constexpr uint32_t AUDIO_OUT_PARAM_FORMAT_MASK = 0x000000ffu;
-constexpr uint64_t AUDIO_OUT_TARGET_LATENCY_US = 40000;
+constexpr uint32_t AUDIO_OUT_PARAM_FORMAT_MASK     = 0x000000ffu;
+constexpr uint32_t AUDIO_OUT_PARAM_ATTR_MIX_TO_MAIN = 0x00020000u;
+constexpr uint64_t AUDIO_OUT_TARGET_LATENCY_US      = 40000;
 
 constexpr int      AUDIO_IN_SILENT_STATE_DEVICE_NONE = 0x1;
 constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;
@@ -220,6 +213,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Audio3d::Shutdown();
 	delete g_audio;
 	g_audio = nullptr;
 }
@@ -237,6 +231,7 @@ bool Audio::FormatIsFloat(Format format) {
 	switch (format) {
 		case Format::FloatMono:
 		case Format::FloatStereo:
+		case Format::Float6Ch:
 		case Format::Float8Ch:
 		case Format::Float8ChStd:
 		case Format::Float12Ch: return true;
@@ -454,6 +449,7 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				case Format::Float8Ch:
 				case Format::Signed16bit8ChStd:
 				case Format::Float8ChStd: port.channels_num = 8; break;
+				case Format::Float6Ch: port.channels_num = 6; break;
 				case Format::Float12Ch: port.channels_num = 12; break;
 				default: EXIT("unknown format");
 			}
@@ -893,7 +889,10 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 
 	EXIT_IF(g_audio == nullptr);
 
-	auto id = g_audio->AudioOutOpen(type, len, freq, format);
+	// A personal port mixed to the main output plays as a main port.
+	const bool mixed =
+	    type == AUDIO_OUT_PORT_TYPE_PERSONAL && (param & AUDIO_OUT_PARAM_ATTR_MIX_TO_MAIN) != 0;
+	auto id = g_audio->AudioOutOpen(mixed ? AUDIO_OUT_PORT_TYPE_MAIN : type, len, freq, format);
 
 	if (!id.IsValid()) {
 		return AUDIO_OUT_ERROR_PORT_FULL;
@@ -925,31 +924,11 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 
 	state->reroute_counter = 0;
-	state->volume          = 127;
 
-	switch (type) {
-		case AUDIO_OUT_PORT_TYPE_MAIN:
-		case AUDIO_OUT_PORT_TYPE_BGM:
-		case AUDIO_OUT_PORT_TYPE_AUDIO3D:
-			state->output  = 1;
-			state->channel = (channels_num > 2 ? 2 : channels_num);
-			break;
-		case AUDIO_OUT_PORT_TYPE_VOICE:
-		case AUDIO_OUT_PORT_TYPE_PERSONAL:
-			state->output  = 0x40;
-			state->channel = 1;
-			break;
-		case AUDIO_OUT_PORT_TYPE_PADSPK:
-		case AUDIO_OUT_PORT_TYPE_VIBRATION:
-			state->output  = 4;
-			state->channel = 1;
-			break;
-		case AUDIO_OUT_PORT_TYPE_AUX:
-			state->output  = 0x80;
-			state->channel = 0;
-			break;
-		default: EXIT("unknown port type: %d\n", type);
-	}
+	const auto route = AudioInternal::GetPortOutput(type);
+	state->output    = route.output;
+	state->channel   = std::min<int>(channels_num, route.channels);
+	state->volume    = route.volume;
 
 	LOGF("\t output  = %" PRIu16 "\n"
 	     "\t channel = %" PRIu8 "\n",
@@ -965,8 +944,7 @@ int KYTY_SYSV_ABI AudioOutGetSystemState(AudioOutSystemState* state) {
 		return AUDIO_OUT_ERROR_INVALID_POINTER;
 	}
 
-	// Loudness is undefined until measurement starts; no measurement is emulated.
-	*state = {};
+	*state = {AUDIO_OUT_STATE_LOUDNESS_MIN};
 
 	return OK;
 }
