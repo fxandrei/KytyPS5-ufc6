@@ -17,6 +17,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/streamline.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
@@ -936,10 +937,12 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
+	Streamline::BeforePresent(m_extent.width, m_extent.height, static_cast<uint32_t>(m_format));
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
+	Streamline::AfterPresent();
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:

@@ -118,6 +118,12 @@ Buffer::~Buffer() {
 	}
 }
 
+vk::MemoryPropertyFlags Buffer::MemoryProperties() const {
+	VkMemoryPropertyFlags properties = 0;
+	vmaGetAllocationMemoryProperties(m_graphics->allocator, m_allocation, &properties);
+	return vk::MemoryPropertyFlags{properties};
+}
+
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {

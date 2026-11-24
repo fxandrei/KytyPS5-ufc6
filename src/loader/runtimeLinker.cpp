@@ -675,6 +675,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
 		    length != 0 && access == GpuAccess::Read) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtWalkerFaults);
+			Libs::Graphics::ShaderRecompiler::IR::NoteSrtWalkerGuardedLoad();
 			const auto address = Loader::X64InstructionEmulator::ReadGpr(info->native_context, 10);
 			uint32_t   value   = 0;
 			if (Common::AbSwitch::Enabled(Common::AbSwitch::SRT_READ_BACKING) &&
@@ -705,6 +706,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			Libs::Graphics::ShaderRecompiler::IR::NoteSrtWalkerSkippedLoad();
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
@@ -1508,6 +1510,13 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 	}
 
 	return nullptr;
+}
+
+std::vector<int32_t> RuntimeLinker::GetProgramIds() {
+	Common::LockGuard    lock(m_mutex);
+	std::vector<int32_t> ids(m_programs.size());
+	std::ranges::transform(m_programs, ids.begin(), &Program::unique_id);
+	return ids;
 }
 
 Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {

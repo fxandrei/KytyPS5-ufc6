@@ -143,7 +143,35 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 // On the guest GPU thread: copies bytes the GPU did not write from a page it did write, without
 // downloading the GPU's bytes. False when not possible; then take the fault path.
 [[nodiscard]] bool TryReadGpuCleanBytes(uint64_t vaddr, void* data, uint64_t size) noexcept;
+// On the guest GPU thread: a recorded GPU write that may still be running covers `vaddr`
+// (AbSwitch SRT_OPTIONAL_DIRTY_UNKNOWN; conservatively true when unsure).
+[[nodiscard]] bool GpuWriteInFlightAt(uint64_t vaddr) noexcept;
+// Changes with every guest map, unmap or protection change (AbSwitch SRT_PREWALK_MEMO).
+[[nodiscard]] uint64_t GuestMapEpoch() noexcept;
+// KYTY_DIAG_IMAGE_LOSS=1: prints the recorded direct map/unmap/alias events (GPU thread).
+void DrainDirectMapEvents() noexcept;
 void               TraceGpuDirtyRead(const char* what, uint64_t vaddr) noexcept;
+// KYTY_SRT_DIRTY_STATS=1 (diagnostic, 2026-11-19): the SRT walker's GPU-dirty reads by the newest
+// GPU write that covers them (writer shader, bound size, in flight or done) as 'srt-dirty:' lines,
+// and shader-written bindings by writer as 'write-stats:' lines, every 5 s.
+struct SrtDirtyCover {
+	uint64_t size      = 0;
+	uint64_t offset    = 0;
+	uint64_t writer    = 0;
+	bool     found     = false;
+	bool     in_flight = false;
+};
+struct SrtDirtyRead {
+	uint64_t address      = 0;
+	uint64_t reader       = 0; // The walker's shader hash.
+	uint32_t before       = 0; // Backing value before the download.
+	uint32_t after        = 0;
+	bool     known_before = false;
+	int64_t  wait_ns      = 0;
+};
+[[nodiscard]] bool          SrtDirtyStatsEnabled() noexcept;
+[[nodiscard]] SrtDirtyCover SrtDirtyCoverAt(uint64_t vaddr) noexcept;
+void                        NoteSrtDirtyRead(const SrtDirtyCover& cover, const SrtDirtyRead& read) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

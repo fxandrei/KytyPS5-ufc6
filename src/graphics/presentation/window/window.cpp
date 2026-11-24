@@ -18,6 +18,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/streamline.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
@@ -827,6 +828,8 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+	// KYTY_DLSSG=1: Streamline must be initialized before SDL loads Vulkan for this window.
+	(void)Streamline::InitBeforeVulkan();
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {

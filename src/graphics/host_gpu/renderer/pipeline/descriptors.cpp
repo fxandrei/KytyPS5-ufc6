@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -41,6 +42,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <span>
 #include <tuple>
@@ -523,16 +525,20 @@ struct TextureInfoMemoEntry {
 };
 
 TextureInfoMemoEntry& TextureInfoMemoSlot(const ShaderTextureResource& descriptor, uint32_t flags) {
-	static constexpr size_t                              SLOTS = 512;
+	// AbSwitch TEXTURE_MEMO_WIDE uses all WIDE_SLOTS; otherwise the first SLOTS, as before.
+	static constexpr size_t                              SLOTS      = 512;
+	static constexpr size_t                              WIDE_SLOTS = 4096;
 	thread_local std::unique_ptr<TextureInfoMemoEntry[]> slots;
 	if (slots == nullptr) {
-		slots = std::make_unique<TextureInfoMemoEntry[]>(SLOTS);
+		slots = std::make_unique<TextureInfoMemoEntry[]>(WIDE_SLOTS);
 	}
 	uint64_t hash = flags;
 	for (const auto field: descriptor.fields) {
 		hash = (hash ^ field) * 0x9E3779B97F4A7C15ull;
 	}
-	return slots[(hash >> 40u) & (SLOTS - 1)];
+	const size_t mask =
+	    (Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_MEMO_WIDE) ? WIDE_SLOTS : SLOTS) - 1;
+	return slots[(hash >> 40u) & mask];
 }
 
 } // namespace
@@ -628,10 +634,14 @@ RenderExecutor::BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResourc
 	        : nullptr;
 	if (memo != nullptr && memo->valid && memo->flags == memo_flags &&
 	    std::memcmp(memo->fields, descriptor.fields, sizeof(memo->fields)) == 0) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureInfoMemoHits);
 		desc.info = memo->info;
 		view_base = memo->view_base;
 		view_levels = memo->view_levels;
 	} else {
+		if (memo != nullptr) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureInfoMemoMisses);
+		}
 		desc.info.data         = {address, 0};
 		desc.info.pixel_format = pixel_format;
 		desc.info.guest_format = format;
@@ -730,7 +740,19 @@ bool RenderExecutor::SameTextureResolvePlan(const TextureResolvePlan& left,
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
-                                              uint64_t module_id, uint32_t resource_index) {
+                                              uint64_t module_id, uint32_t resource_index,
+                                              bool materialize_stencil_storage) {
+	TextureBinding binding;
+	ResolveTextureInto(binding, resource, value, module_id, resource_index,
+	                   materialize_stencil_storage);
+	return binding;
+}
+
+void RenderExecutor::ResolveTextureInto(TextureBinding&                              out,
+                                        const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        uint64_t module_id, uint32_t resource_index,
+                                        bool materialize_stencil_storage) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -739,10 +761,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
+	// Every field ends as in a fresh binding; only mip_views keeps its storage (emptied).
+	out.image_id   = ImageId {};
+	out.image_view = nullptr;
+	out.layout     = vk::ImageLayout::eUndefined;
+	out.mip_views.clear();
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		out.desc   = TextureCache::ImageDesc {};
+		out.layout = vk::ImageLayout::eGeneral;
+		return;
 	}
 	// Count every sampled binding, including texture-plan memo hits. Heap roots and storage
 	// accesses report no samples.
@@ -757,32 +786,55 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 	}
 
-	auto plan = [&]() -> TextureResolvePlan {
+	TexturePlanMemoEntry* plan_entry = nullptr; // the wide memo entry this lookup used
+	// The plan is a memo entry's or `fresh`; out.desc receives the one copy of its description
+	// (about 1.2 KB, mostly the mip layout), which FindImage may then remap.
+	std::optional<TextureResolvePlan> fresh;
+	const TextureResolvePlan*         plan = [&]() -> const TextureResolvePlan* {
 		// Heap mapping and storage validation retain their original per-call path. Module id/slot
 		// select a bounded entry; exact resource inputs guard collisions and module-id reuse.
+		const bool wide = Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_MEMO_WIDE);
 		if (!resource.heap && !storage && resource_index != UINT32_MAX &&
-		    Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_PLAN_MEMO)) {
-			constexpr size_t Slots = 128;
+		    (wide || Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_PLAN_MEMO))) {
+			constexpr size_t Slots     = 128;
+			constexpr size_t WideSlots = 4096;
 			if (m_texture_plan_memo.empty()) m_texture_plan_memo.resize(Slots);
+			if (wide && m_texture_plan_memo_wide.empty()) m_texture_plan_memo_wide.resize(WideSlots);
 			const uint32_t flags =
 			    (resource.read ? 1u : 0u) | (resource.written ? 2u : 0u) |
 			    (resource.atomic ? 4u : 0u) | (resource.atomic64 ? 8u : 0u) |
 			    (resource.depth_compare ? 16u : 0u) | (resource.r128 ? 32u : 0u) |
 			    (resource.heap ? 64u : 0u) | (resource.cube ? 128u : 0u) |
 			    (resource.unfiltered_access_only ? 256u : 0u) | (resource.skip_degamma ? 512u : 0u);
-			const std::array<uint32_t, 7> key {flags,
+			// Every ImageResource field BuildTextureResolvePlan and its helpers read (the plan is a
+			// pure function of these and the T#; module and index only pick the narrow slot).
+			const std::array<uint32_t, 9> key {flags,
 			                                   static_cast<uint32_t>(resource.resource_class),
 			                                   static_cast<uint32_t>(resource.numeric_class),
 			                                   static_cast<uint32_t>(resource.dimension),
 			                                   static_cast<uint32_t>(resource.mip_mode),
 			                                   static_cast<uint32_t>(resource.conversion_format),
-			                                   static_cast<uint32_t>(resource.srgb_decode)};
-			const auto hash = (module_id ^ (uint64_t {resource_index} * 0x9E3779B97F4A7C15ull));
-			auto&      memo = m_texture_plan_memo[(hash ^ (hash >> 32u)) & (Slots - 1)];
+			                                   static_cast<uint32_t>(resource.srgb_decode),
+			                                   resource.shader_swizzle, resource.mip_count};
+			TexturePlanMemoEntry* slot = nullptr;
+			if (wide) {
+				uint64_t content = 0x51ED270B27C3A6E5ull;
+				for (const auto word: key) content = (content ^ word) * 0x9E3779B97F4A7C15ull;
+				for (const auto word: descriptor.fields) content = (content ^ word) * 0x9E3779B97F4A7C15ull;
+				slot = &m_texture_plan_memo_wide[(content >> 40u) & (WideSlots - 1)];
+			} else {
+				const auto hash = (module_id ^ (uint64_t {resource_index} * 0x9E3779B97F4A7C15ull));
+				slot = &m_texture_plan_memo[(hash ^ (hash >> 32u)) & (Slots - 1)];
+			}
+			auto&      memo = *slot;
+			if (wide) plan_entry = slot;
 			const bool hit =
-			    memo.valid && memo.module_id == module_id &&
-			    memo.resource_index == resource_index && memo.resource_key == key &&
+			    memo.valid && (wide || (memo.module_id == module_id &&
+			                            memo.resource_index == resource_index)) &&
+			    memo.resource_key == key &&
 			    std::memcmp(memo.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0;
+			Common::DebugCounters::Add(hit ? Common::DebugCounters::Counter::TexturePlanMemoHits
+			                               : Common::DebugCounters::Counter::TexturePlanMemoMisses);
 			static const bool probe = std::getenv("KYTY_PROBE_TEXTURE_PLAN") != nullptr;
 			if (probe) {
 				++m_texture_plan_probe_calls;
@@ -802,44 +854,76 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 					EXIT("texture plan verify: mismatch module=0x%016" PRIx64 " resource=%u\n",
 					     module_id, resource_index);
 				}
-				return memo.plan;
+				return &memo.plan;
 			}
-			auto fresh          = BuildTextureResolvePlan(resource, descriptor, true);
+			const auto& built   = fresh.emplace(BuildTextureResolvePlan(resource, descriptor, true));
 			memo.module_id      = module_id;
 			memo.resource_index = resource_index;
 			memo.resource_key   = key;
 			std::copy_n(descriptor.fields, memo.fields.size(), memo.fields.begin());
-			memo.plan  = fresh;
+			memo.plan  = built;
 			memo.valid = true;
-			return fresh;
+			memo.found_generation = 0;
+			return &built;
 		}
-		return BuildTextureResolvePlan(resource, descriptor, true);
+		return &fresh.emplace(BuildTextureResolvePlan(resource, descriptor, true));
 	}();
-	if (!plan.mapped) return {.layout = vk::ImageLayout::eGeneral};
-	// FindImage may remap this copy. Never overwrite the memo's original requested view.
-	auto       desc              = std::move(plan.desc);
-	const auto shader_conversion = plan.shader_conversion;
-	const auto pixel_format      = plan.pixel_format;
-	const auto view_format       = plan.view_format;
+	if (!plan->mapped) {
+		out.desc   = TextureCache::ImageDesc {};
+		out.layout = vk::ImageLayout::eGeneral;
+		return;
+	}
+	// FindImage may remap this copy. Never overwrite the memo's original requested view. Every
+	// plan field is read here, before any call that could resolve again into the same entry.
+	out.desc                     = plan->desc;
+	auto&      desc              = out.desc;
+	const auto shader_conversion = plan->shader_conversion;
+	const auto pixel_format      = plan->pixel_format;
+	const auto view_format       = plan->view_format;
 	const auto format            = desc.info.guest_format;
 
-	auto id = texture_cache.FindImage(desc, shader_conversion);
+	ImageId    id;
+	const bool image_memo =
+	    plan_entry != nullptr && Common::AbSwitch::Enabled(Common::AbSwitch::TEXTURE_IMAGE_MEMO);
+	if (image_memo && plan_entry->found_generation != 0 &&
+	    plan_entry->found_generation == texture_cache.StructureGeneration()) {
+		id = plan_entry->found_id;
+		static const bool verify = std::getenv("KYTY_VERIFY_TEXTURE_IMAGE") != nullptr;
+		if (verify) {
+			auto       check    = desc;
+			const auto expected = texture_cache.FindImage(check, shader_conversion);
+			if (expected != id) {
+				EXIT("texture image memo verify: reused image differs from FindImage\n");
+			}
+		} else {
+			texture_cache.ReuseImage(id, desc, desc.view_info.base_layer);
+		}
+	} else {
+		const auto base_level = desc.view_info.base_level;
+		const auto base_layer = desc.view_info.base_layer;
+		id                    = texture_cache.FindImage(desc, shader_conversion);
+		if (image_memo) {
+			const bool reusable = static_cast<bool>(id) && desc.view_info.base_level == base_level &&
+			                      desc.view_info.base_layer == base_layer;
+			plan_entry->found_id         = id;
+			plan_entry->found_generation = reusable ? texture_cache.StructureGeneration() : 0;
+		}
+	}
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
-		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
+		out.layout = vk::ImageLayout::eGeneral;
+		return;
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
-		if (storage) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Storage stencil association diagnostic: requested=0x{:016x}+0x{:x} "
-			    "owner=0x{:016x} image_format={} view_format={} module={} resource={}\n",
-			    desc.info.data.address, desc.info.data.size, image->info.data.address,
-			    static_cast<int>(image->info.pixel_format), static_cast<int>(view_format),
-			    module_id, resource_index));
+		if (storage && materialize_stencil_storage) {
+			EXIT_IF(resource.atomic || resource.heap);
+			texture_cache.MaterializeStencilStorage(id, desc);
+		}
+		if (!image->stencil_storage || !materialize_stencil_storage) {
+			id = image->depth_id;
+			image = &texture_cache.GetImage(id);
 		}
 	} else if (image->info.IsDepth()) {
 		if (storage) {
@@ -856,7 +940,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	out.image_id = id;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                                  context,
@@ -903,6 +987,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 
 void RenderExecutor::ResetBindings() {
 	for (const auto id: m_bound_images) {
+		m_context.GetTextureCache().FinishStencilStorage(id);
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}
 	m_bound_images.clear();
@@ -927,12 +1012,16 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding =
-		    ResolveTexture(program.info.images[i], snapshot.images[i], runtime.module->id, i);
+		// Resolved in place: the description is written once, and mip_views keeps its storage.
+		auto& binding = prepared.images[i];
+		ResolveTextureInto(binding, program.info.images[i], snapshot.images[i], runtime.module->id,
+		                   i);
+		if (binding.image_id && binding.desc.type == TextureCache::BindingType::Storage &&
+		    m_context.GetTextureCache().GetImage(binding.image_id).stencil_storage &&
+		    program.stage != ShaderType::Compute) {
+			EXIT("stencil storage writes outside compute are unsupported\n");
+		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1017,6 +1106,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
+	// KYTY_SRT_DIRTY_STATS: the written bindings obtained below are this shader's.
+	BufferCache::diag_writer = program.shader_hash;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword, prepared.shader_data.end(),
@@ -1043,6 +1134,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
+	BufferCache::diag_writer = 0;
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
@@ -1055,10 +1147,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
 		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
-		if (!old_image.registered || old_image.binding.needs_rebind) {
+		const auto stencil = old_image.info.HasStencil()
+		                         ? texture_cache.FindStencilPlane(old_image, images[i].desc.info.data)
+		                         : ImageId{};
+		const bool materialized_stencil = stencil && texture_cache.m_slot_images[stencil].stencil_storage;
+		if (!old_image.registered || old_image.binding.needs_rebind || materialized_stencil) {
 			old_image.binding = {};
-			images[i]         = ResolveTexture(program.info.images[i], snapshot.images[i],
-			                                   prepared.runtime->module->id, i);
+			ResolveTextureInto(images[i], program.info.images[i], snapshot.images[i],
+			                   prepared.runtime->module->id, i);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
@@ -1228,6 +1324,64 @@ static void TraceFilterBound(RenderContext& context, const PreparedBindings& pre
 	}
 }
 
+static void TraceGpuFilterBound(RenderContext& context, const PreparedBindings& prepared) {
+	const auto& program = prepared.runtime->module->info;
+	if (program.stage != ShaderType::Pixel ||
+	    (program.shader_hash != UINT64_C(0x26ec5a6f42265b1f) &&
+	     program.shader_hash != UINT64_C(0x6869ba5373a429b9))) return;
+	const auto& layout = program.bindings;
+	if (prepared.buffer_sources.empty() || prepared.buffers.empty() ||
+	    layout.memory_offset_dword >= prepared.shader_data.size() ||
+	    layout.MemorySizeDword() >= prepared.shader_data.size()) return;
+	const auto& source = prepared.buffer_sources[0];
+	const auto& native = prepared.buffers[0];
+	const auto adjustment = prepared.shader_data[layout.memory_offset_dword] & 255u;
+	const auto shader_index = (adjustment >> 2u) + 6u;
+	const auto shader_size = prepared.shader_data[layout.MemorySizeDword()];
+	if (shader_index >= (shader_size >> 2u)) return; // The shader uses zero instead of loading.
+	const uint64_t relative = 24u - (adjustment & 3u);
+	if (source.address == 0 || relative > source.size || 4 > source.size - relative) return;
+	const auto address = source.address + relative;
+	uint32_t cpu_word = 0;
+	const bool cpu_ok = LibKernel::Memory::TryReadBacking(address, &cpu_word, sizeof(cpu_word));
+	const auto label = fmt::format(
+	    "h{:016x} module={} buffer_id={} guest=0x{:x} index={} size={} cpu_ok={} cpu={} dirty={}",
+	    program.shader_hash, prepared.runtime->module->id, source.id.index, address, shader_index,
+	    shader_size, cpu_ok, cpu_word, context.GetBufferCache().HasGpuDirtyBytes(address, 4));
+	context.GetCommandScheduler().ProbeBufferWord(native.buffer, native.offset + shader_index * 4u, label);
+}
+
+// KYTY_HANG_DIAG=1: remembers where the two filter shaders' loop-bound word lives in the native
+// buffer, so that a stall report can read it as the GPU sees it. No commands, waits or faults.
+static void NoteFilterBoundForHang(RenderContext& context, const PreparedBindings& prepared) {
+	const auto& program = prepared.runtime->module->info;
+	if (program.stage != ShaderType::Pixel ||
+	    (program.shader_hash != UINT64_C(0x26ec5a6f42265b1f) &&
+	     program.shader_hash != UINT64_C(0x6869ba5373a429b9))) return;
+	const auto& layout = program.bindings;
+	if (prepared.buffer_sources.empty() || prepared.buffers.empty() ||
+	    layout.memory_offset_dword >= prepared.shader_data.size() ||
+	    layout.MemorySizeDword() >= prepared.shader_data.size()) return;
+	const auto& source       = prepared.buffer_sources[0];
+	const auto& native       = prepared.buffers[0];
+	const auto  adjustment   = prepared.shader_data[layout.memory_offset_dword] & 255u;
+	const auto  shader_index = (adjustment >> 2u) + 6u;
+	const auto  shader_size  = prepared.shader_data[layout.MemorySizeDword()];
+	if (shader_index >= (shader_size >> 2u)) return; // The shader uses zero instead of loading.
+	const uint64_t relative = 24u - (adjustment & 3u);
+	if (!source.id || source.address == 0 || relative > source.size ||
+	    4 > source.size - relative) return;
+	auto&       cache  = context.GetBufferCache();
+	const auto& buffer = cache.GetBuffer(source.id);
+	if (buffer.Handle() != native.buffer) return; // Rebound since: the note would be wrong.
+	const auto address  = source.address + relative;
+	uint32_t   cpu_word = 0;
+	(void)LibKernel::Memory::TryReadBacking(address, &cpu_word, sizeof(cpu_word));
+	context.GetCommandScheduler().NoteHangBoundWord(&buffer, native.offset + shader_index * 4u,
+	                                                address, program.shader_hash, cpu_word,
+	                                                cache.HasGpuDirtyBytes(address, 4));
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1392,6 +1546,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
 		if (TraceFilterBoundEnabled()) [[unlikely]] {
 			TraceFilterBound(m_context, *prepared);
+		}
+		if (GpuBufferWordProbeEnabled()) [[unlikely]] {
+			TraceGpuFilterBound(m_context, *prepared);
+		}
+		if (CommandScheduler::HangDiagEnabled()) [[unlikely]] {
+			NoteFilterBoundForHang(m_context, *prepared);
 		}
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,

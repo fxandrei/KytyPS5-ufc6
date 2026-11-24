@@ -602,6 +602,9 @@ add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
+add_kyty_full_emulator_test(kernel_module_info_tests "${KYTY_TESTS_DIR}/KernelModuleInfoTests.cpp")
+target_link_libraries(kernel_module_info_tests kyty_test_gtest)
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
@@ -925,6 +928,14 @@ endif()
 # dlopen/dlsym/dladdr for RenderDoc.
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
+
+# Optional NVIDIA Streamline SDK (frame-generation work, 2026-11-20): only its headers are used;
+# sl.interposer.dll is loaded at run time with KYTY_DLSSG=1 (presentation/window/streamline.cpp).
+set(KYTY_STREAMLINE_DIR "" CACHE PATH "NVIDIA Streamline SDK root (optional)")
+if(KYTY_STREAMLINE_DIR)
+	target_include_directories(kyty_emulator PRIVATE "${KYTY_STREAMLINE_DIR}/include")
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_STREAMLINE=1)
+endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
 

@@ -876,11 +876,25 @@ private:
 #endif
 
 	void ReserveGuestRegions() {
-		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
+		// KYTY_CUDA_HOLE=1 (2026-11-20, frame-generation work): leave 0xDC00000000-0xEC00000000
+		// unreserved so the NVIDIA driver can place the CUDA window (below 1 TiB) that NGX's
+		// VK_NVX_binary_import needs; UFC 6's mappings stay far below it.
+		static constexpr uint64_t CudaHoleBegin = 0xDC00000000ull;
+		static constexpr uint64_t CudaHoleEnd   = 0xEC00000000ull;
+		const char*               hole_env      = std::getenv("KYTY_CUDA_HOLE");
+		const bool                cuda_hole     = hole_env != nullptr && *hole_env == '1';
+		std::vector<std::pair<uint64_t, uint64_t>> regions {
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
-		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
-		    {kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize},
-		}};
+		};
+		if (cuda_hole) {
+			regions.emplace_back(HOST_USER_MIN, CudaHoleBegin);
+			regions.emplace_back(CudaHoleEnd, HOST_USER_MAX + 1u);
+			std::printf("guest address space: CUDA hole 0x%016" PRIx64 "-0x%016" PRIx64 " left free\n",
+			            CudaHoleBegin, CudaHoleEnd);
+		} else {
+			regions.emplace_back(HOST_USER_MIN, HOST_USER_MAX + 1u);
+		}
+		regions.emplace_back(kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;

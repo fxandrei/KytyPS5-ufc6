@@ -13,10 +13,19 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fmt/format.h>
 #include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <xbyak/xbyak.h>
 
@@ -106,6 +115,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
+		case ValueOpcode::SMin32:
 		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -157,7 +167,8 @@ bool ImmediateBits(Value value, uint64_t& bits) {
 
 // Scratch layout in bytes: per descriptor source its eight DWORDs and a known DWORD, one
 // activity byte per source, then per image, then one qword per walked value (all ones when
-// unknown). The walker's value slots, captured addresses, reachability and states follow.
+// unknown). The walker's value slots, reachability, states, read bases and captured addresses
+// follow.
 constexpr uint32_t DescriptorStride = 9u * sizeof(uint32_t);
 
 uint32_t ActiveOffset(const ResourcePlan& plan) {
@@ -174,9 +185,21 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+// The shader hash and user data of the running walker (KYTY_SRT_DIRTY_STATS diagnostics only; the
+// walks that read guest memory run on the GPU thread). Deliberately NOT thread_local: builds that
+// added these as thread_local variables rendered the UFC 6 arena with blocky corruption in every
+// run (2026-11-19, exes 6A8A5CD1/A4236336/842F4D72), the build without them did not (2F246FD7,
+// twice). Cause not understood yet; see the 2026-11-18 HANDOFF.
+uint64_t        t_walker_shader     = 0;
+const uint32_t* t_walker_user_data  = nullptr;
+uint32_t        t_walker_user_count = 0;
 
 // Set by WalkSrt from AbSwitch SRT_LOAD_CHECK; generated code tests it.
 uint8_t g_srt_load_check = 0;
+
+// Walker loads from pages that fault on guest reads, on any thread (SrtWalkerGuardedLoads).
+// Counted where SrtWalkerFaults is; only these slow paths pay for it.
+std::atomic<uint64_t> g_walker_guarded_loads {0};
 
 // A guest load from a page that faults on reads, without the fault: the same completion as the
 // fault path of Loader's exception handler (clean bytes from the backing store, else the GPU's
@@ -189,6 +212,7 @@ uint32_t SrtWalkerReadGuestDword(uint64_t address) noexcept {
 	namespace Mem  = Libs::LibKernel::Memory;
 	uint32_t value = 0;
 	Common::DebugCounters::Add(Counter::SrtWalkerFaults);
+	g_walker_guarded_loads.fetch_add(1, std::memory_order_relaxed);
 	if (Common::AbSwitch::Enabled(Common::AbSwitch::SRT_READ_BACKING) &&
 	    Mem::TryReadGpuCleanBytes(address, &value, sizeof(value))) {
 		Common::DebugCounters::Add(Counter::SrtReadsFromBacking);
@@ -200,9 +224,37 @@ uint32_t SrtWalkerReadGuestDword(uint64_t address) noexcept {
 #endif
 	uint32_t   before      = 0;
 	const bool have_before = Mem::TryReadBacking(address, &before, sizeof(before));
+	// KYTY_SRT_DIRTY_STATS (diagnostic): the GPU write this read completes, and the time it takes.
+	const bool stats = Mem::SrtDirtyStatsEnabled();
+	const auto cover = stats ? Mem::SrtDirtyCoverAt(address) : Mem::SrtDirtyCover {};
+	const auto start = stats ? std::chrono::steady_clock::now()
+	                         : std::chrono::steady_clock::time_point {};
 	if (!Mem::HandleGpuFault(PageFaultAccess::Read, address) ||
 	    !Mem::TryReadBacking(address, &value, sizeof(value))) {
 		return 0;
+	}
+	if (stats) [[unlikely]] {
+		Mem::SrtDirtyRead read;
+		read.address      = address;
+		read.reader       = t_walker_shader;
+		read.before       = before;
+		read.after        = value;
+		read.known_before = have_before;
+		read.wait_ns      = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+		Mem::NoteSrtDirtyRead(cover, read);
+		static std::atomic_int samples = 0;
+		if (cover.in_flight && samples.fetch_add(1, std::memory_order_relaxed) < 40) {
+			std::string text = fmt::format("srt-dirty-sample: reader {:016x} addr 0x{:x} {:08x}->{:08x} "
+			                               "writer {:016x} size 0x{:x} ud",
+			                               read.reader, address, before, value, cover.writer, cover.size);
+			for (uint32_t i = 0; i < t_walker_user_count && i < 16; i++) {
+				text += fmt::format(" {:08x}", t_walker_user_data[i]);
+			}
+			std::puts(text.c_str());
+			std::fflush(stdout);
+		}
 	}
 	Common::DebugCounters::Add(Counter::GpuFaults);
 	if (have_before) {
@@ -212,12 +264,68 @@ uint32_t SrtWalkerReadGuestDword(uint64_t address) noexcept {
 	return value;
 }
 
+// A load only block conditions use (AbSwitch SRT_OPTIONAL_DIRTY_UNKNOWN): the value, or bit 32 set
+// (unknown) instead of a wait when a GPU write still in flight covers the DWORD. An unknown
+// condition reaches both successors, so the walk stays correct, only less pruned.
+// KYTY_SRT_OPTIONAL_DIAG=1 (diagnostic, 2026-11-19): unknown optional loads of the current walk, and
+// the forced precise re-walk that compares the resource activity (GPU thread only, see WalkSrt).
+uint32_t g_optional_unknowns = 0;
+bool     g_force_precise     = false;
+
+uint64_t SrtWalkerReadOptionalDword(uint64_t address) noexcept {
+	namespace Mem = Libs::LibKernel::Memory;
+	using Counter = Common::DebugCounters::Counter;
+	if (!g_force_precise &&
+	    Common::AbSwitch::Enabled(Common::AbSwitch::SRT_OPTIONAL_DIRTY_UNKNOWN) &&
+	    Mem::GpuWriteInFlightAt(address)) {
+		uint32_t value = 0;
+		if (Common::AbSwitch::Enabled(Common::AbSwitch::SRT_READ_BACKING) &&
+		    Mem::TryReadGpuCleanBytes(address, &value, sizeof(value))) {
+			Common::DebugCounters::Add(Counter::SrtWalkerFaults);
+			Common::DebugCounters::Add(Counter::SrtReadsFromBacking);
+			g_walker_guarded_loads.fetch_add(1, std::memory_order_relaxed);
+			return value;
+		}
+		Common::DebugCounters::Add(Counter::SrtOptionalUnknown);
+		g_walker_guarded_loads.fetch_add(1, std::memory_order_relaxed);
+		g_optional_unknowns++;
+		return uint64_t {1} << 32u;
+	}
+	return SrtWalkerReadGuestDword(address);
+}
+
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read. With
 // AbSwitch SRT_LOAD_CHECK, the load first looks the page up in the PageManager's table: a page
 // that faults on reads (GPU-written) is read by SrtWalkerReadGuestDword instead, which saves the
 // exception round trip (about 3.5 us, some 400 times a frame in UFC 6's fights). The walker keeps
 // rdi, rsi, rdx and r8 live and r10 for the capture; rcx, r11 and rax are scratch here.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+// An optional load (only block conditions use it) calls SrtWalkerReadOptionalDword, whose rax has
+// bit 32 set for unknown; the fast path's 32-bit load clears it.
+// The slow path of a guest load: rax = the read helper's result for the address in r10.
+void EmitGuestSlowCall(Xbyak::CodeGenerator& code, bool optional) {
+	// The walker's stack depth varies (values are thunks it calls): align for the Windows x64 call.
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.and_(code.rsp, -16);
+	code.push(code.rdx);
+	code.push(code.r8);
+	code.push(code.r10);
+	code.push(code.r10);
+	code.sub(code.rsp, 32);
+	code.mov(code.rcx, code.r10);
+	code.mov(code.rax, optional ? reinterpret_cast<uint64_t>(&SrtWalkerReadOptionalDword)
+	                            : reinterpret_cast<uint64_t>(&SrtWalkerReadGuestDword));
+	code.call(code.rax);
+	code.add(code.rsp, 32);
+	code.pop(code.r10);
+	code.pop(code.r10);
+	code.pop(code.r8);
+	code.pop(code.rdx);
+	code.mov(code.rsp, code.rbp);
+	code.pop(code.rbp);
+}
+
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, bool optional = false) {
 	constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
 	code.lea(code.r10, code.ptr[address]);
 	// The walkers of a loaded shader cache compile before the PageManager exists: read its
@@ -248,26 +356,36 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.mov(code.eax, code.dword[code.r10]);
 	code.jmp(done, Near);
 	code.L(slow);
-	// The walker's stack depth varies (values are thunks it calls): align for the Windows x64 call.
-	code.push(code.rbp);
-	code.mov(code.rbp, code.rsp);
-	code.and_(code.rsp, -16);
-	code.push(code.rdx);
-	code.push(code.r8);
-	code.push(code.r10);
-	code.push(code.r10);
-	code.sub(code.rsp, 32);
-	code.mov(code.rcx, code.r10);
-	code.mov(code.rax, reinterpret_cast<uint64_t>(&SrtWalkerReadGuestDword));
-	code.call(code.rax);
-	code.add(code.rsp, 32);
-	code.pop(code.r10);
-	code.pop(code.r10);
-	code.pop(code.r8);
-	code.pop(code.rdx);
-	code.mov(code.rsp, code.rbp);
-	code.pop(code.rbp);
+	EmitGuestSlowCall(code, optional);
 	code.L(done);
+}
+
+// AbSwitch SRT_WALKER_FAST: environment switches read once.
+// KYTY_VERIFY_WALKER=1 runs the reference and the fast walker on every walk and exits on a
+// difference; KYTY_WALKER_PREFETCH=1 adds the fast walker's entry prefetches.
+bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value == '1';
+}
+
+bool VerifyWalkerEnabled() {
+	static const bool enabled = EnvFlag("KYTY_VERIFY_WALKER");
+	return enabled;
+}
+
+bool WalkerPrefetchEnabled() {
+	static const bool enabled = EnvFlag("KYTY_WALKER_PREFETCH");
+	return enabled;
+}
+
+// Whether a walker compiled now may run its fast variant: the A/B harness (KYTY_AB_FILE) may set
+// SRT_WALKER_FAST at any time, the verify mode runs both; otherwise the mask is fixed at startup.
+bool FastWalkerWanted() {
+	static const bool forced = [] {
+		const char* ab_file = std::getenv("KYTY_AB_FILE");
+		return VerifyWalkerEnabled() || (ab_file != nullptr && *ab_file != '\0');
+	}();
+	return forced || Common::AbSwitch::Enabled(Common::AbSwitch::SRT_WALKER_FAST);
 }
 
 class RuntimeValidator {
@@ -460,15 +578,40 @@ private:
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
-
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
 // state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
-// value) and a qword slot; a reference is `call thunk; cmp state, 2`. Operands that are unknown,
-// constant or plain user data are folded at emission. Registers: rdi user data, rsi flat buffer,
-// rdx scratch, r8 capture cursor.
+// value) and a qword slot; a reference is `call thunk; cmp state, 2`. A value the walk body already
+// referenced is tested first and its call runs out of line. Operands that are unknown, constant or
+// plain user data are folded at emission. Registers: rdi user data, rsi flat buffer, rdx scratch
+// plus m_bias, r8 capture cursor.
+// The walker's code plus what AbSwitch SRT_PREWALK_MEMO needs to know about its inputs.
+struct WalkerCode final : Xbyak::CodeGenerator {
+	WalkerCode(): Xbyak::CodeGenerator(4096, Xbyak::AutoGrow) {}
+	uint64_t user_data_mask       = 0;     // user-data DWORDs the walker reads
+	bool     user_data_mask_valid = false; // all of them are below 64
+	// AbSwitch SRT_WALKER_FAST: code offset of the fast variant's entry (0: not compiled). The
+	// reference variant starts at offset 0 of the same buffer, so SrtWalkerLoadLength covers both.
+	size_t fast_entry = 0;
+};
+
+// The fast variant (AbSwitch SRT_WALKER_FAST) emits the same thunks, states, slots, captures and
+// scratch stores as the reference, so both produce identical scratch, flat SRT and captures. It
+// differs in:
+// - rbx (saved at entry) holds the page number (address >> page_shift) of the last guest page this
+//   walk found readable without the slow path, or -1. A load from that page skips the lookup. Only
+//   verdicts that cannot change during the walk are kept: the load check is off, or the page's
+//   region exists and its access-watcher byte is zero (read watchers are only added on the GPU
+//   thread, which is running this walk; every slow-path call forgets the page anyway). Pages that
+//   are cached lie below region_count << region_shift (2^44), so a hit also passes
+//   LoadAddressU32's 48-bit test, which therefore moves to the miss path.
+// - The lookup and the slow path run out of line; the guest load stays mov eax, [r10] in the thunk.
+// - State bytes and the flat SRT are zeroed with SSE stores (WalkSrt resizes the flat SRT only).
+// - KYTY_WALKER_PREFETCH=1: prefetcht0 of every 16-byte group of constant offsets read from each
+//   user-data base pair, right after the base is formed (no architectural effect).
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool fast = false)
+	    : m_plan(plan), m_code(code), m_fast(fast) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -492,10 +635,28 @@ private:
 		std::vector<Operand> args;
 		uint32_t             slot = 0, state = 0;
 		Xbyak::Label         label;
-		bool                 pending = true, referenced = false, masked = false;
+		bool                 pending = true, referenced = false, masked = false, called = false;
+		// Only block conditions use the value, so it may read as unknown (EmitRead).
+		bool optional = false;
+	};
+	// An out-of-line thunk call for a walk body reference to a value the body referenced before.
+	struct Stub {
+		Operand             operand;
+		const Xbyak::Label* unknown = nullptr;
+		Xbyak::Label        entry, back;
+	};
+	// The fast variant's out-of-line page lookup of one guest load: miss is entered with r10 = the
+	// address; it continues at load (the thunk's mov eax, [r10]) or, after the slow path, at done.
+	struct ColdLoad {
+		Xbyak::Label miss, load, done;
+		bool         optional = false;
+		bool         check48  = false; // LoadAddressU32's 48-bit test, implied on the hot path
 	};
 
 	static constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
+
+	// The scratch address at offset; offsets m_reach to m_reach + 255 take 8-bit displacements.
+	Xbyak::RegExp At(size_t offset) const { return m_code.rdx - m_bias + offset; }
 
 	bool Thunk(uint32_t index) const {
 		const auto& node = m_nodes[index];
@@ -523,23 +684,41 @@ private:
 	void Zero(uint32_t offset, uint32_t size);
 	void Branch(const Operand& operand, const Xbyak::Label& unknown);
 	void Load(const Xbyak::Reg64& reg, const Operand& operand);
+	void Base(const Operand& low, const Operand& high);
 	void Fetch(const Operand& operand, const Xbyak::Label& unknown);
 	void Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Operand&));
 	void Store(const Node& node);
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node);
 	void EmitStrict(const Node& node);
+	// Fast variant (m_fast) helpers.
+	template <class Address>
+	void ZeroFast(const Address& at, uint32_t offset, uint32_t size);
+	void LoadGuestFast(bool optional, bool check48);
+	void EmitColdLoads();
+	void EmitPrefetches(uint64_t low, uint64_t high);
+	// Whether a cached page (below region_count << region_shift) implies a clear bit 48+ address.
+	static bool CachedPageImplies48();
 
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
+	bool                                              m_fast = false;
+	std::deque<ColdLoad>                              m_cold_loads;
+	uint32_t                                          m_prefetches = 0;
 	std::vector<Value>                                m_masks {Value {}};
 	std::deque<Node>                                  m_nodes;
 	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
+	// Per user-data base pair of a read, the scratch slot holding the base for the walk.
+	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_bases;
+	std::deque<Stub>                                  m_stubs;
 	Xbyak::Label                                      m_ret;
-	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
+	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
+	uint64_t m_user_mask = 0;     // user-data DWORDs Load reads (bit i = DWORD i), when all are < 64
+	bool     m_user_wide = false; // a read DWORD is >= 64: m_user_mask is incomplete
+	bool     m_body = true;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -784,18 +963,34 @@ void WalkerCompiler::Layout() {
 	offset += 8u;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
-		m_nodes[index].slot = offset;
+		auto& node = m_nodes[index];
+		node.slot  = offset;
 		offset += 8u;
+		// EmitRead forms a read's base from the two operands after LoadBufferU32's leading test.
+		const auto   op   = node.inst->GetOpcode();
+		const size_t skip = op == ValueOpcode::LoadBufferU32 ? 1u : 0u;
+		const bool read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		                  op == ValueOpcode::LoadBufferU32;
+		if (read && node.result == Operand {Kind::Node, index} && node.args.size() > skip + 2u &&
+		    node.args[skip].kind == Kind::UserData && node.args[skip + 1].kind == Kind::UserData) {
+			m_bases.try_emplace({node.args[skip].value, node.args[skip + 1].value}, 0u);
+		}
 	}
 	m_reach = offset;
+	m_bias  = m_reach + 128u;
 	offset += static_cast<uint32_t>(m_plan.control_flow.size());
 	m_states = offset;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) m_nodes[index].state = offset++;
 	}
 	m_states_end = offset;
+	offset       = (offset + 7u) & ~7u;
+	for (auto& [pair, slot]: m_bases) {
+		slot = offset;
+		offset += 8u;
+	}
 	// Captured addresses come last; EmitRead counts them.
-	m_plan.srt_captures = (offset + 7u) & ~7u;
+	m_plan.srt_captures = offset;
 }
 
 // Falls through when any gating source is active. The list is not empty.
@@ -806,7 +1001,7 @@ void WalkerCompiler::Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip
 	gates.erase(std::unique(gates.begin(), gates.end()), gates.end());
 	Xbyak::Label active;
 	for (size_t i = 0; i < gates.size(); ++i) {
-		c.cmp(c.byte[c.rdx + ActiveOffset(m_plan) + gates[i]], 0);
+		c.cmp(c.byte[At(ActiveOffset(m_plan) + gates[i])], 0);
 		if (i + 1u < gates.size()) {
 			c.jne(active, Near);
 		} else {
@@ -819,13 +1014,147 @@ void WalkerCompiler::Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip
 void WalkerCompiler::Zero(uint32_t offset, uint32_t size) {
 	auto& c = m_code;
 	if (size == 0) return;
+	if (m_fast && size <= 512u) {
+		ZeroFast([this](uint32_t at) { return At(at); }, offset, size);
+		return;
+	}
 	c.mov(c.r11, c.rdi);
-	c.lea(c.rdi, c.ptr[c.rdx + offset]);
+	c.lea(c.rdi, c.ptr[At(offset)]);
 	c.mov(c.ecx, size);
 	c.xor_(c.eax, c.eax);
 	c.rep();
 	c.stosb();
 	c.mov(c.rdi, c.r11);
+}
+
+// Zeroes exactly [offset, offset + size) of the memory that at(offset) addresses; the last store
+// may overlap the one before it. Clobbers rax and xmm0.
+template <class Address>
+void WalkerCompiler::ZeroFast(const Address& at, uint32_t offset, uint32_t size) {
+	auto& c = m_code;
+	if (size == 0) return;
+	if (size >= 16u) {
+		c.pxor(c.xmm0, c.xmm0);
+		uint32_t done = 0;
+		for (; done + 16u <= size; done += 16u) c.movdqu(c.xword[at(offset + done)], c.xmm0);
+		if (done != size) c.movdqu(c.xword[at(offset + size - 16u)], c.xmm0);
+		return;
+	}
+	c.xor_(c.eax, c.eax);
+	if (size >= 8u) {
+		c.mov(c.qword[at(offset)], c.rax);
+		if (size > 8u) c.mov(c.qword[at(offset + size - 8u)], c.rax);
+	} else if (size >= 4u) {
+		c.mov(c.dword[at(offset)], c.eax);
+		if (size > 4u) c.mov(c.dword[at(offset + size - 4u)], c.eax);
+	} else if (size >= 2u) {
+		c.mov(c.word[at(offset)], c.ax);
+		if (size > 2u) c.mov(c.word[at(offset + size - 2u)], c.ax);
+	} else {
+		c.mov(c.byte[at(offset)], c.al);
+	}
+}
+
+bool WalkerCompiler::CachedPageImplies48() {
+	const auto* lookup = PageManager::AccessLookup();
+	return lookup->page_shift <= lookup->region_shift && lookup->region_shift <= 48u &&
+	       lookup->region_count <= (uint64_t {1} << (48u - lookup->region_shift));
+}
+
+// The fast variant's guest load, r10 = the address: on the cached page, mov eax, [r10] (41 8b 02,
+// the form SrtWalkerLoadLength and the fault handler complete); otherwise the out-of-line lookup.
+void WalkerCompiler::LoadGuestFast(bool optional, bool check48) {
+	auto&       c      = m_code;
+	const auto* lookup = PageManager::AccessLookup();
+	auto&       cold   = m_cold_loads.emplace_back();
+	cold.optional      = optional;
+	cold.check48       = check48;
+	c.mov(c.rcx, c.r10);
+	c.shr(c.rcx, static_cast<int>(lookup->page_shift));
+	c.cmp(c.rcx, c.rbx);
+	c.jne(cold.miss, Near);
+	c.L(cold.load);
+	c.mov(c.eax, c.dword[c.r10]);
+	c.L(cold.done);
+}
+
+// The out-of-line part of LoadGuestFast, after every thunk. Same decisions as LoadGuest: a direct
+// load unless the load check is on, the PageManager exists, the address is in its table, the region
+// exists and the page has a read watcher (then the slow-path call). The region range test comes
+// first because a cached page must lie in the table; it only reorders tests that all lead to the
+// direct load.
+void WalkerCompiler::EmitColdLoads() {
+	auto&       c      = m_code;
+	const auto* lookup = PageManager::AccessLookup();
+	const int   shift  = static_cast<int>(lookup->page_shift);
+	for (auto& cold: m_cold_loads) {
+		Xbyak::Label slow, cache;
+		c.L(cold.miss);
+		if (cold.check48) {
+			// LoadAddressU32's 48-bit test (EmitRead), unknown when it fails: the jump returns from
+			// the thunk, whose frame this code still runs in.
+			c.mov(c.rcx, c.r10);
+			c.shr(c.rcx, 48);
+			c.jnz(m_ret, Near);
+		}
+		c.mov(c.rcx, c.r10);
+		c.shr(c.rcx, static_cast<int>(lookup->region_shift));
+		c.cmp(c.rcx, static_cast<uint32_t>(lookup->region_count));
+		c.jae(cold.load, Near);
+		c.mov(c.r11, reinterpret_cast<uint64_t>(&g_srt_load_check));
+		c.cmp(c.byte[c.r11], 0);
+		c.je(cache, Near);
+		c.mov(c.r11, reinterpret_cast<uint64_t>(&lookup->regions));
+		c.mov(c.r11, c.qword[c.r11]);
+		c.test(c.r11, c.r11);
+		c.jz(cold.load, Near);
+		c.mov(c.r11, c.qword[c.r11 + c.rcx * 8]);
+		c.test(c.r11, c.r11);
+		c.jz(cold.load, Near);
+		c.mov(c.rcx, c.r10);
+		c.shr(c.rcx, shift);
+		c.and_(c.ecx, lookup->page_mask);
+		const auto page = c.rcx * static_cast<int>(lookup->page_stride);
+		c.test(c.byte[c.r11 + page + lookup->pages_offset], lookup->access_mask);
+		c.jnz(slow, Near);
+		c.L(cache);
+		c.mov(c.rbx, c.r10);
+		c.shr(c.rbx, shift);
+		c.jmp(cold.load, Near);
+		c.L(slow);
+		EmitGuestSlowCall(c, cold.optional);
+		// The read helper may have changed page states: forget the cached page.
+		c.mov(c.rbx, ~uint64_t {0});
+		c.jmp(cold.done, Near);
+	}
+}
+
+// KYTY_WALKER_PREFETCH: rax = the base of user-data pair (low, high). Prefetches each 16-byte group
+// of the constant offsets that read thunks load from it (at most 32 per walker).
+void WalkerCompiler::EmitPrefetches(uint64_t low, uint64_t high) {
+	auto&                c = m_code;
+	std::vector<int64_t> constants;
+	for (uint32_t index = 0; index < m_nodes.size() && m_prefetches + constants.size() < 32u; ++index) {
+		if (!Thunk(index)) continue;
+		const auto& node = m_nodes[index];
+		const auto  op   = node.inst->GetOpcode();
+		if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
+		    op != ValueOpcode::LoadBufferU32) continue;
+		const size_t skip = op == ValueOpcode::LoadBufferU32 ? 1u : 0u;
+		if (node.result != Operand {Kind::Node, index} || node.args.size() <= skip + 2u ||
+		    node.args[skip] != Operand {Kind::UserData, low} ||
+		    node.args[skip + 1] != Operand {Kind::UserData, high} ||
+		    node.args[skip + 2].kind != Kind::Constant) continue;
+		const auto immediate =
+		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[node.inst->Flags<MemoryFlags>().index].offset)) &
+		    ~int64_t {3};
+		const auto constant = int64_t {static_cast<uint32_t>(node.args[skip + 2].value) & ~3u} + immediate;
+		if (constant + 4 > INT32_MAX || constant < INT32_MIN) continue;
+		if (std::ranges::none_of(constants, [&](int64_t other) { return (other >> 4) == (constant >> 4); }))
+			constants.push_back(constant);
+	}
+	for (const auto constant: constants) c.prefetcht0(c.ptr[c.rax + static_cast<size_t>(constant)]);
+	m_prefetches += static_cast<uint32_t>(constants.size());
 }
 
 // Jumps to unknown unless the operand has a value at run time.
@@ -835,8 +1164,18 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 		c.jmp(unknown, Near);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
+		if (m_body && node.called) {
+			auto& stub   = m_stubs.emplace_back();
+			stub.operand = operand;
+			stub.unknown = &unknown;
+			c.cmp(c.byte[At(node.state)], 2);
+			c.jne(stub.entry, Near);
+			c.L(stub.back);
+			return;
+		}
+		node.called |= m_body;
 		c.call(node.label);
-		c.cmp(c.byte[c.rdx + node.state], 2);
+		c.cmp(c.byte[At(node.state)], 2);
 		c.jne(unknown, Near);
 	}
 }
@@ -847,12 +1186,28 @@ void WalkerCompiler::Load(const Xbyak::Reg64& reg, const Operand& operand) {
 		case Kind::Constant: c.mov(reg, operand.value); break;
 		case Kind::UserData:
 			m_user_data = std::max(m_user_data, static_cast<uint32_t>(operand.value) + 1u);
+			if (operand.value < 64u) {
+				m_user_mask |= uint64_t {1} << operand.value;
+			} else {
+				m_user_wide = true;
+			}
 			c.mov(reg.cvt32(), c.dword[c.rdi + operand.value * sizeof(uint32_t)]);
 			break;
-		case Kind::ShaderBase: c.mov(reg, c.qword[c.rdx + m_shader_base]); break;
-		case Kind::Node: c.mov(reg, c.qword[c.rdx + m_nodes[operand.value].slot]); break;
+		case Kind::ShaderBase: c.mov(reg, c.qword[At(m_shader_base)]); break;
+		case Kind::Node: c.mov(reg, c.qword[At(m_nodes[operand.value].slot)]); break;
 		case Kind::Unknown: break;
 	}
+}
+
+// rax = the 48-bit base (high << 32 | low) with its low two bits clear.
+void WalkerCompiler::Base(const Operand& low, const Operand& high) {
+	auto& c = m_code;
+	Load(c.rax, high);
+	c.shl(c.rax, 48);
+	c.shr(c.rax, 16);
+	Load(c.rcx, low);
+	c.and_(c.ecx, ~3u);
+	c.or_(c.rax, c.rcx);
 }
 
 // Loads the operand into rax, or jumps to unknown when it has no value at run time.
@@ -869,19 +1224,20 @@ void WalkerCompiler::Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Op
 
 void WalkerCompiler::Store(const Node& node) {
 	auto& c = m_code;
-	c.mov(c.qword[c.rdx + node.slot], c.rax);
-	c.mov(c.byte[c.rdx + node.state], 2);
+	c.mov(c.qword[At(node.slot)], c.rax);
+	c.mov(c.byte[At(node.state)], 2);
 	c.ret();
 }
 
 void WalkerCompiler::EmitNode(uint32_t index) {
-	auto&       c    = m_code;
-	auto&       node = m_nodes[index];
-	const auto& args = node.args;
+	auto&       c     = m_code;
+	auto&       node  = m_nodes[index];
+	const auto& args  = node.args;
+	const auto  state = c.byte[At(node.state)];
 	c.L(node.label);
-	c.cmp(c.byte[c.rdx + node.state], 0);
+	c.cmp(state, 0);
 	c.jne(m_ret, Near);
-	c.mov(c.byte[c.rdx + node.state], 1);
+	c.mov(state, 1);
 	if (node.result != Operand {Kind::Node, index}) {
 		// A cycle referenced this value before it folded to another operand.
 		Fetch(node.result, m_ret);
@@ -893,19 +1249,18 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 			// Only predecessors reached by this walk contribute, and they must agree. The state is 3
 			// once one of them has stored the value; callers read it like 1, as unknown.
 			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
-			const auto  state  = c.byte[c.rdx + node.state];
 			for (size_t i = 0; i < args.size(); ++i) {
 				Xbyak::Label next, first;
-				c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
+				c.cmp(c.byte[At(m_reach + blocks[i])], 0);
 				c.je(next, Near);
 				Fetch(args[i], m_ret);
 				c.cmp(state, 1);
 				c.je(first, Near);
-				c.cmp(c.rax, c.qword[c.rdx + node.slot]);
+				c.cmp(c.rax, c.qword[At(node.slot)]);
 				c.jne(m_ret, Near);
 				c.jmp(next, Near);
 				c.L(first);
-				c.mov(c.qword[c.rdx + node.slot], c.rax);
+				c.mov(c.qword[At(node.slot)], c.rax);
 				c.mov(state, 3);
 				c.L(next);
 			}
@@ -1015,21 +1370,29 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		const auto immediate =
 		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
 		    ~int64_t {3};
-		// rax = the 48-bit base (high << 32 | low) with its low two bits clear.
-		Load(c.rax, args[1]);
-		c.shl(c.rax, 48);
-		c.shr(c.rax, 16);
-		Load(c.rcx, args[0]);
-		c.and_(c.ecx, ~3u);
-		c.or_(c.rax, c.rcx);
-		Load(c.r9, args[2]);
-		c.and_(c.r9d, ~3u);
+		// A constant offset folds into the displacement; r10 = the address.
+		const auto constant = int64_t {static_cast<uint32_t>(args[2].value) & ~3u} + immediate;
+		const bool folded   = args[2].kind == Kind::Constant && constant + 4 <= INT32_MAX;
+		const auto offset   = folded ? Xbyak::RegExp(static_cast<size_t>(constant))
+		                             : c.r9 + static_cast<size_t>(immediate);
+		if (args[0].kind == Kind::UserData && args[1].kind == Kind::UserData) {
+			c.mov(c.rax, c.qword[At(m_bases.at({args[0].value, args[1].value}))]);
+		} else {
+			Base(args[0], args[1]);
+		}
+		if (!folded) {
+			Load(c.r9, args[2]);
+			c.and_(c.r9d, ~3u);
+		}
+		c.lea(c.r10, c.ptr[c.rax + offset]);
+		// The fast variant tests bit 48+ on the lookup's miss path only: a cached page implies it.
+		const bool check48_on_miss = m_fast && op == ValueOpcode::LoadAddressU32 && CachedPageImplies48();
 		if (op == ValueOpcode::LoadAddressU32) {
-			c.lea(c.rax, c.ptr[c.rax + c.r9 + static_cast<size_t>(immediate)]);
-			c.mov(c.rcx, c.rax);
-			c.shr(c.rcx, 48);
-			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
+			if (!check48_on_miss) {
+				c.mov(c.rcx, c.r10);
+				c.shr(c.rcx, 48);
+				c.jnz(m_ret, Near);
+			}
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1056,16 +1419,28 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.jz(sized, Near);
 			c.imul(c.rcx, c.r11);
 			c.L(sized);
-			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
+			c.lea(c.r11, c.ptr[offset + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+		}
+		// The guest load (mov eax, [r10]) with the local SRT_LOAD_CHECK page test, see LoadGuest.
+		if (m_fast) {
+			LoadGuestFast(node.optional, check48_on_miss);
+		} else {
+			LoadGuest(c, c.r10, node.optional);
+		}
+		if (node.optional) {
+			// Bit 32: unknown, a GPU write still in flight covers the DWORD (the state stays 1).
+			c.bt(c.rax, 32);
+			c.jc(m_ret, Near);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.add(c.r8, 8);
 		Store(node);
 	}
+	// Only buffer reads have a zero path.
+	if (op == ValueOpcode::LoadAddressU32) return;
 	c.L(zero);
 	c.xor_(c.eax, c.eax);
 	Store(node);
@@ -1115,6 +1490,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::UMax32:
 			c.cmp(c.eax, c.ecx);
 			c.cmovb(c.eax, c.ecx);
+			break;
+		case ValueOpcode::SMin32:
+			c.cmp(c.eax, c.ecx);
+			c.cmovg(c.eax, c.ecx);
 			break;
 		case ValueOpcode::SMax32:
 			c.cmp(c.eax, c.ecx);
@@ -1312,14 +1691,70 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	// SRT reads, descriptors and outputs must be known; a value only block conditions use may read
+	// as unknown, which reaches both successors (AbSwitch SRT_OPTIONAL_DIRTY_UNKNOWN, EmitRead).
+	{
+		std::vector<bool>     required(m_nodes.size(), false);
+		std::vector<uint32_t> pending;
+		const auto            require = [&](const Operand& operand) {
+            if (operand.kind == Kind::Node && operand.value < required.size() &&
+                !required[operand.value]) {
+                required[operand.value] = true;
+                pending.push_back(static_cast<uint32_t>(operand.value));
+            }
+		};
+		for (const auto& read: reads) require(read);
+		for (const auto& words: descriptors) {
+			for (const auto& word: words) require(word);
+		}
+		for (const auto& output: outputs) require(output);
+		while (!pending.empty()) {
+			const auto& node = m_nodes[pending.back()];
+			pending.pop_back();
+			require(node.result);
+			for (const auto& arg: node.args) require(arg);
+		}
+		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+			m_nodes[index].optional = resources && !required[index];
+		}
+	}
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
-	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
+	// Unknown targets of walk body references; stubs jump to them after the body.
+	std::deque<Xbyak::Label> exits;
+	if (m_fast) {
+		// rbx: the cached guest page (none yet); callee-saved in the walker's SysV ABI.
+		c.push(c.rbx);
+		c.mov(c.rbx, ~uint64_t {0});
+	}
+	c.add(c.rdx, m_bias);
+	c.mov(c.qword[At(m_shader_base)], c.rcx);
+	for (const auto& [pair, slot]: m_bases) {
+		Base({Kind::UserData, pair.first}, {Kind::UserData, pair.second});
+		c.mov(c.qword[At(slot)], c.rax);
+		if (m_fast && WalkerPrefetchEnabled()) EmitPrefetches(pair.first, pair.second);
+	}
 	Zero(m_reach, m_states_end - m_reach);
-	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
+	if (m_fast) {
+		// The flat SRT (WalkSrt only sizes it): zero, as vector::assign did before the walk.
+		const auto bytes = static_cast<uint32_t>(m_plan.srt_reads.size() * sizeof(uint32_t));
+		if (bytes <= 1024u) {
+			ZeroFast([this](uint32_t at) { return m_code.rsi + at; }, 0u, bytes);
+		} else {
+			c.mov(c.r11, c.rdi);
+			c.mov(c.rdi, c.rsi);
+			c.mov(c.ecx, bytes);
+			c.xor_(c.eax, c.eax);
+			c.rep();
+			c.stosb();
+			c.mov(c.rdi, c.r11);
+		}
+	}
+	c.lea(c.r8, c.ptr[At(m_plan.srt_captures)]);
 	if (!resources) {
-		for (uint32_t block = 0; block < blocks.size(); ++block) c.mov(c.byte[c.rdx + m_reach + block], 1);
+		for (uint32_t block = 0; block < blocks.size(); ++block)
+			c.mov(c.byte[At(m_reach + block)], 1);
 	} else if (!blocks.empty()) {
 		// Reachability grows monotonically. A newly reached predecessor of an evaluated
 		// control Phi restarts the walk with fresh values; a retreating edge resumes at its target.
@@ -1330,17 +1765,23 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
 		}
 		std::vector<Xbyak::Label> starts(blocks.size());
-		c.mov(c.byte[c.rdx + m_reach], 1);
+		c.mov(c.byte[At(m_reach)], 1);
 		c.L(pass);
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			Xbyak::Label next;
 			const auto mark = [&](uint32_t target) {
+				const auto reach = c.byte[At(m_reach + target)];
+				// Reaching a later block without control Phis to recheck only sets its byte.
+				if (target > block && rechecks[target].empty()) {
+					c.mov(reach, 1);
+					return;
+				}
 				Xbyak::Label reached;
-				c.cmp(c.byte[c.rdx + m_reach + target], 0);
+				c.cmp(reach, 0);
 				c.jne(reached, Near);
-				c.mov(c.byte[c.rdx + m_reach + target], 1);
+				c.mov(reach, 1);
 				for (const auto state: rechecks[target]) {
-					c.cmp(c.byte[c.rdx + state], 0);
+					c.cmp(c.byte[At(state)], 0);
 					c.jne(reset, Near);
 				}
 				if (target <= block) c.jmp(starts[target], Near);
@@ -1349,13 +1790,14 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			const auto& successors = blocks[block].successors;
 			const auto  condition  = conditions[block];
 			c.L(starts[block]);
-			c.cmp(c.byte[c.rdx + m_reach + block], 0);
+			c.cmp(c.byte[At(m_reach + block)], 0);
 			c.je(next, Near);
 			if (condition.kind == Kind::Constant) {
 				mark(successors[condition.value != 0u ? 0 : 1]);
 			} else {
 				if (condition.kind != Kind::Unknown) {
-					Xbyak::Label both, other;
+					auto&        both = exits.emplace_back();
+					Xbyak::Label other;
 					Fetch(condition, both);
 					c.test(c.rax, c.rax);
 					c.jz(other, Near);
@@ -1387,7 +1829,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			if (blocks[block].srt_reads.empty()) continue;
 			Xbyak::Label skip;
-			c.cmp(c.byte[c.rdx + m_reach + block], 0);
+			c.cmp(c.byte[At(m_reach + block)], 0);
 			c.je(skip, Near);
 			for (const auto slot: blocks[block].srt_reads) flat(slot);
 			c.L(skip);
@@ -1401,13 +1843,13 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				const auto& list = image ? blocks[block].images : blocks[block].sources;
 				if (std::ranges::find(list, id) == list.end()) continue;
 				if (listed) {
-					c.or_(c.al, c.byte[c.rdx + m_reach + block]);
+					c.or_(c.al, c.byte[At(m_reach + block)]);
 				} else {
-					c.mov(c.al, c.byte[c.rdx + m_reach + block]);
+					c.mov(c.al, c.byte[At(m_reach + block)]);
 				}
 				listed = true;
 			}
-			const auto active = c.byte[c.rdx + ActiveOffset(m_plan) + index];
+			const auto active = c.byte[At(ActiveOffset(m_plan) + index)];
 			if (listed) {
 				c.mov(active, c.al);
 			} else {
@@ -1416,21 +1858,21 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 		for (uint32_t source = 0; source < sources.size(); ++source) {
 			if (gates[source].empty()) continue;
-			Xbyak::Label skip;
-			const auto known = c.dword[c.rdx + source * DescriptorStride + 8u * sizeof(uint32_t)];
+			auto&      skip  = exits.emplace_back();
+			const auto known = c.dword[At(source * DescriptorStride + 8u * sizeof(uint32_t))];
 			c.mov(known, 0);
 			Gate(gates[source], skip);
 			for (uint32_t word = 0; word < descriptors[source].size(); ++word) {
 				Fetch(descriptors[source][word], skip);
-				c.mov(c.dword[c.rdx + source * DescriptorStride + word * sizeof(uint32_t)], c.eax);
+				c.mov(c.dword[At(source * DescriptorStride + word * sizeof(uint32_t))], c.eax);
 			}
 			c.mov(known, 1);
 			c.L(skip);
 		}
 	}
 	for (uint32_t index = 0; index < outputs.size(); ++index) {
-		Xbyak::Label skip;
-		const auto output = c.qword[c.rdx + OutputOffset(m_plan) + index * 8u];
+		auto&      skip   = exits.emplace_back();
+		const auto output = c.qword[At(OutputOffset(m_plan) + index * 8u)];
 		c.mov(output, -1);
 		Gate(m_output_gates[index], skip);
 		Fetch(outputs[index], skip);
@@ -1439,47 +1881,395 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		c.L(skip);
 	}
 	c.mov(c.rax, c.r8);
-	c.L(m_ret);
-	c.ret();
-	c.L(fail);
-	c.xor_(c.eax, c.eax);
-	c.ret();
+	if (m_fast) {
+		// The walk's own exits restore rbx; m_ret stays the thunks' plain return.
+		c.pop(c.rbx);
+		c.ret();
+		c.L(fail);
+		c.xor_(c.eax, c.eax);
+		c.pop(c.rbx);
+		c.ret();
+		c.L(m_ret);
+		c.ret();
+	} else {
+		c.L(m_ret);
+		c.ret();
+		c.L(fail);
+		c.xor_(c.eax, c.eax);
+		c.ret();
+	}
 	if (resources && !blocks.empty()) {
 		c.L(reset);
 		Zero(m_states, m_states_end - m_states);
-		c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
+		c.lea(c.r8, c.ptr[At(m_plan.srt_captures)]);
 		c.jmp(pass, Near);
 	}
+	m_body = false;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
+	for (auto& stub: m_stubs) {
+		c.L(stub.entry);
+		Branch(stub.operand, *stub.unknown);
+		c.jmp(stub.back, Near);
+	}
+	if (m_fast) EmitColdLoads();
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
-	c.readyRE();
-	EXIT_IF(Xbyak::GetError() != 0);
+	if (auto* code = dynamic_cast<WalkerCode*>(&m_code); code != nullptr) {
+		code->user_data_mask = m_user_wide ? 0u : m_user_mask;
+		code->user_data_mask_valid = !m_user_wide;
+	}
+	// CompileSrtWalker makes the code executable once every variant is emitted.
+}
+
+// KYTY_DUMP_PLAN=<hash>[,<hash>...] (diagnostic, 2026-11-19): WalkSrt prints each listed shader's
+// plan once (descriptor sources, SRT reads, uniform fill, block conditions, buffers) as value trees.
+std::string PlanValueString(Value value, std::unordered_map<const Inst*, uint32_t>& ids,
+                            uint32_t depth) {
+	value = value.Resolve();
+	if (value.IsEmpty()) return "<null>";
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		switch (value.GetType()) {
+			case Type::ScalarReg: return fmt::format("s{}", RegIndex(value.ScalarRegister()));
+			case Type::VectorReg: return fmt::format("v{}", RegIndex(value.VectorRegister()));
+			case Type::U1: return value.U1() ? "true" : "false";
+			case Type::U32: return fmt::format("0x{:x}", value.U32());
+			case Type::U64: return fmt::format("0x{:x}", value.U64());
+			default: return fmt::format("<{}>", TypeName(value.GetType()));
+		}
+	}
+	if (const auto known = ids.find(inst); known != ids.end()) return fmt::format("%{}", known->second);
+	if (depth > 32) return "...";
+	const auto id = static_cast<uint32_t>(ids.size() + 1);
+	ids.emplace(inst, id);
+	std::string text = fmt::format("%{}={}(", id, ValueOpcodeName(inst->GetOpcode()));
+	for (size_t i = 0; i < inst->NumArgs(); i++) {
+		if (i != 0) text += ",";
+		text += PlanValueString(inst->Arg(i), ids, depth + 1);
+	}
+	return text + ")";
+}
+
+void DumpPlanOnce(const ResourcePlan& plan) {
+	static const std::vector<uint64_t> wanted = [] {
+		std::vector<uint64_t> hashes;
+		if (const char* list = std::getenv("KYTY_DUMP_PLAN"); list != nullptr) {
+			for (const char* cursor = list; *cursor != '\0';) {
+				char*      end  = nullptr;
+				const auto hash = std::strtoull(cursor, &end, 16);
+				if (end == cursor) break;
+				hashes.push_back(hash);
+				// ',' or ';' (the run scripts pass environment lists split at commas).
+				cursor = *end == ',' || *end == ';' ? end + 1 : end;
+			}
+		}
+		return hashes;
+	}();
+	if (wanted.empty() || std::ranges::find(wanted, plan.shader_hash) == wanted.end()) return;
+	static std::mutex                              mutex;
+	static std::unordered_set<const ResourcePlan*> printed;
+	std::scoped_lock                               lock(mutex);
+	if (!printed.insert(&plan).second) return;
+	std::unordered_map<const Inst*, uint32_t> ids;
+	std::string text = fmt::format(
+	    "plan {:016x}: stage {} user_data {}+{} walker_user_data {} sources {} srt_reads {} "
+	    "blocks {} fill words {} kind {} bounded {}\n",
+	    plan.shader_hash, static_cast<int>(plan.stage), plan.user_data_base, plan.user_data_count,
+	    plan.srt_user_data, plan.descriptor_sources.size(), plan.srt_reads.size(),
+	    plan.control_flow.size(), plan.uniform_fill.fill.words,
+	    static_cast<int>(plan.uniform_fill.fill.kind), plan.uniform_fill.fill.bounded_elements);
+	for (size_t i = 0; i < plan.descriptor_sources.size(); i++) {
+		const auto& source = plan.descriptor_sources[i];
+		text += fmt::format("  source {} dwords {}{}:", i, source.dword_count,
+		                    source.indirect_descriptor ? " indirect" : "");
+		for (uint32_t word = 0; word < source.dword_count; word++) {
+			text += " " + PlanValueString(source.dwords[word], ids, 0);
+		}
+		text += "\n";
+	}
+	for (size_t i = 0; i < plan.srt_reads.size(); i++) {
+		text += fmt::format("  srt_read {} flat {}: {}\n", i, plan.srt_reads[i].flat_offset,
+		                    PlanValueString(plan.srt_reads[i].value, ids, 0));
+	}
+	const auto& fill = plan.uniform_fill;
+	if (fill.fill.words != 0 || !fill.element_count.IsEmpty()) {
+		text += "  uniform_fill values:";
+		for (const auto& value: fill.values) text += " " + PlanValueString(value, ids, 0);
+		text += " pattern_size " + PlanValueString(fill.pattern_size, ids, 0) + " element_count " +
+		        PlanValueString(fill.element_count, ids, 0) + "\n";
+	}
+	for (size_t i = 0; i < plan.control_flow.size(); i++) {
+		if (!plan.control_flow[i].condition.IsEmpty()) {
+			text += fmt::format("  block {} condition {}\n", i,
+			                    PlanValueString(plan.control_flow[i].condition, ids, 0));
+		}
+	}
+	for (const auto& [address, size]: plan.source_reads) {
+		text += fmt::format("  source_read 0x{:x}+{}\n", address, size);
+	}
+	for (size_t i = 0; i < plan.info.buffers.size(); i++) {
+		const auto& buffer = plan.info.buffers[i];
+		text += fmt::format("  buffer {} source {} read {} written {} atomic {} scalar {} extent {}\n",
+		                    i, buffer.source, buffer.read, buffer.written, buffer.atomic,
+		                    buffer.scalar, buffer.max_byte_extent);
+	}
+	std::fputs(text.c_str(), stdout);
+	std::fflush(stdout);
 }
 
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
-	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+	auto  owned = std::make_unique<WalkerCode>();
+	auto& code  = *owned;
+	plan.srt_code = std::move(owned);
+	WalkerCompiler(plan, code).Compile(values);
+	if (FastWalkerWanted()) {
+		// AbSwitch SRT_WALKER_FAST: the fast variant follows in the same buffer. Its analysis and
+		// layout repeat the reference's exactly (same plan, deterministic passes); check that.
+		const auto captures  = plan.srt_captures;
+		const auto scratch   = plan.srt_scratch.size();
+		const auto user_data = plan.srt_user_data;
+		const auto mask      = code.user_data_mask;
+		const bool valid     = code.user_data_mask_valid;
+		code.fast_entry      = code.getSize();
+		WalkerCompiler(plan, code, true).Compile(values);
+		if (plan.srt_captures != captures || plan.srt_scratch.size() != scratch ||
+		    plan.srt_user_data != user_data || code.user_data_mask != mask ||
+		    code.user_data_mask_valid != valid || code.fast_entry == 0) {
+			EXIT("SRT walker: the fast variant's layout differs (hash=%016" PRIx64 ")\n",
+			     plan.shader_hash);
+		}
+	}
+	code.readyRE();
+	EXIT_IF(Xbyak::GetError() != 0);
 }
+
+bool SrtWalkerUserDataMask(const ResourcePlan& plan, uint64_t& mask) noexcept {
+	const auto* code = dynamic_cast<const WalkerCode*>(plan.srt_code.get());
+	if (code == nullptr || !code->user_data_mask_valid) return false;
+	mask = code->user_data_mask;
+	return true;
+}
+
+// KYTY_SRT_OPTIONAL_DIAG: the sources and images that a walk with unknown optional loads made active
+// but the precise re-walk did not (printed with their descriptor words), and a 5 s summary.
+static bool SrtOptionalDiagEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_OPTIONAL_DIAG");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+static void LogOptionalDifferences(const ResourcePlan& plan, std::span<const uint8_t> optimistic) {
+	static std::mutex mutex;
+	static uint64_t   diff_walks = 0, unknown_walks = 0, logged = 0;
+	static int64_t    window_start = 0;
+	// At most 3 lines per (plan, index), 600 in all.
+	static std::map<std::pair<uint64_t, uint32_t>, uint32_t> per_key;
+	std::scoped_lock  lock(mutex);
+	unknown_walks++;
+	const auto* precise = Scratch(plan);
+	const auto  sources = static_cast<uint32_t>(plan.descriptor_sources.size());
+	const auto  count   = sources + static_cast<uint32_t>(plan.info.images.size());
+	bool        differs = false;
+	for (uint32_t index = 0; index < count; ++index) {
+		const auto offset = ActiveOffset(plan) + index;
+		const bool opt    = optimistic[offset] != 0;
+		const bool exact  = precise[offset] != 0;
+		if (opt == exact) continue;
+		differs = true;
+		if (logged >= 600 || per_key[{plan.shader_hash, index}]++ >= 3) continue;
+		logged++;
+		const bool     image  = index >= sources;
+		const uint32_t source = image ? plan.info.images[index - sources].source : index;
+		std::string    words;
+		if (source < sources) {
+			uint32_t dwords[9] {};
+			std::memcpy(dwords, optimistic.data() + source * DescriptorStride, sizeof(dwords));
+			for (uint32_t w = 0; w < 9; ++w) words += fmt::format(" {:08x}", dwords[w]);
+		}
+		std::printf("srt-optional-diff: plan %016" PRIx64 " %s %u (source %u) active optimistic %d "
+		            "precise %d words%s\n",
+		            plan.shader_hash, image ? "image" : "source",
+		            image ? index - sources : index, source, opt ? 1 : 0, exact ? 1 : 0,
+		            words.c_str());
+	}
+	diff_walks += differs ? 1 : 0;
+	const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	if (window_start == 0) window_start = now;
+	if (now - window_start >= 5'000'000'000) {
+		const double s = static_cast<double>(now - window_start) / 1e9;
+		std::printf("srt-optional-diag: %.1fs unknown_walks/s=%.1f diff_walks/s=%.1f\n", s,
+		            static_cast<double>(unknown_walks) / s, static_cast<double>(diff_walks) / s);
+		std::fflush(stdout);
+		unknown_walks = diff_walks = 0;
+		window_start  = now;
+	}
+}
+
+namespace {
+
+using WalkerEntry = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+
+// One call of a walker variant; the reference starts at the code buffer, the fast one at fast_entry.
+const uint64_t* CallWalker(const ResourcePlan& plan, const WalkerCode& code, bool fast,
+                           const SrtRuntime& runtime, std::vector<uint32_t>& flat) {
+	const auto entry = reinterpret_cast<uintptr_t>(code.getCode()) + (fast ? code.fast_entry : 0u);
+	return reinterpret_cast<WalkerEntry>(entry)(runtime.user_data.data(), flat.data(),
+	                                            plan.srt_scratch.data(), runtime.shader_base);
+}
+
+// KYTY_VERIFY_WALKER: one walker run's complete result.
+struct WalkerRun {
+	size_t                end = SIZE_MAX; // capture end in scratch qwords; SIZE_MAX: the walk failed
+	std::vector<uint64_t> scratch;
+	std::vector<uint32_t> flat;
+	uint32_t              unknowns = 0; // g_optional_unknowns after the run
+
+	bool operator==(const WalkerRun& other) const = default;
+};
+
+// GPU-thread counters of the verify mode (plain globals: see the thread_local note above).
+uint64_t g_verify_walker_equal    = 0;
+uint64_t g_verify_walker_unstable = 0;
+uint64_t g_verify_walker_skipped  = 0;
+
+void ReportWalkerDifference(const ResourcePlan& plan, const WalkerRun& reference, const WalkerRun& fast) {
+	const auto signed_end = [](size_t end) { return end == SIZE_MAX ? -1ll : static_cast<long long>(end); };
+	std::printf("srt-walker-verify: plan %016" PRIx64 " stage %u differs: end %lld/%lld (qwords, -1 failed) "
+	            "optional unknowns %u/%u (reference/fast)\n",
+	            plan.shader_hash, static_cast<uint32_t>(plan.stage), signed_end(reference.end),
+	            signed_end(fast.end), reference.unknowns, fast.unknowns);
+	const auto* left  = reinterpret_cast<const uint8_t*>(reference.scratch.data());
+	const auto* right = reinterpret_cast<const uint8_t*>(fast.scratch.data());
+	const auto  bytes = std::min(reference.scratch.size(), fast.scratch.size()) * sizeof(uint64_t);
+	for (size_t byte = 0, shown = 0; byte < bytes && shown < 16; ++byte) {
+		if (left[byte] == right[byte]) continue;
+		const char* region = byte < ActiveOffset(plan)      ? "descriptor words"
+		                     : byte < OutputOffset(plan)    ? "activity"
+		                     : byte < plan.srt_captures     ? "outputs/slots/reach/states/bases"
+		                                                    : "captures";
+		std::printf("  scratch byte %zu (%s): %02x/%02x\n", byte, region, left[byte], right[byte]);
+		shown++;
+	}
+	for (size_t slot = 0, shown = 0; slot < reference.flat.size() && slot < fast.flat.size() && shown < 16; ++slot) {
+		if (reference.flat[slot] == fast.flat[slot]) continue;
+		std::printf("  flat %zu: %08x/%08x\n", slot, reference.flat[slot], fast.flat[slot]);
+		shown++;
+	}
+	std::fflush(stdout);
+}
+
+// Runs the reference and the fast walker from the same scratch contents and optional-unknown count
+// and exits when they differ while the reference reproduces its own result (a difference the
+// reference does not reproduce comes from guest memory or GPU state changing between the runs,
+// e.g. an optional load whose GPU write completed; such a walk is retried, at most three times).
+// The result left in place is the last run's.
+const uint64_t* VerifyWalk(const ResourcePlan& plan, const WalkerCode& code, const SrtRuntime& runtime,
+                           std::vector<uint32_t>& flat) {
+	const auto                  count    = plan.srt_reads.size();
+	const auto                  unknowns = g_optional_unknowns;
+	const std::vector<uint64_t> before   = plan.srt_scratch;
+	size_t                      last_end = SIZE_MAX;
+	const auto                  run      = [&](bool fast) {
+		std::copy(before.begin(), before.end(), plan.srt_scratch.begin());
+		g_optional_unknowns = unknowns;
+		// The fast walker zeroes the flat SRT itself: start it from garbage to check that.
+		flat.assign(count, fast ? 0xcdcdcdcdu : 0u);
+		const auto* end = CallWalker(plan, code, fast, runtime, flat);
+		WalkerRun   result;
+		result.end   = end == nullptr ? SIZE_MAX : static_cast<size_t>(end - plan.srt_scratch.data());
+		last_end     = result.end;
+		result.scratch  = plan.srt_scratch;
+		result.flat     = flat;
+		result.unknowns = g_optional_unknowns;
+		return result;
+	};
+	const auto finish = [&]() -> const uint64_t* {
+		return last_end == SIZE_MAX ? nullptr : plan.srt_scratch.data() + last_end;
+	};
+	for (int attempt = 0; attempt < 3; ++attempt) {
+		const auto reference = run(false);
+		const auto fast      = run(true);
+		if (fast == reference) {
+			if ((g_verify_walker_equal++ & ((uint64_t {1} << 20u) - 1u)) == 0) {
+				std::printf("srt-walker-verify: %" PRIu64 " walks equal, %" PRIu64 " unstable retries, %" PRIu64
+				            " unverified\n",
+				            g_verify_walker_equal, g_verify_walker_unstable, g_verify_walker_skipped);
+				std::fflush(stdout);
+			}
+			return finish();
+		}
+		const auto again = run(false);
+		if (again == reference) {
+			ReportWalkerDifference(plan, reference, fast);
+			EXIT("SRT walker verify: the fast walker differs from the reference (hash=%016" PRIx64 ")\n",
+			     plan.shader_hash);
+		}
+		g_verify_walker_unstable++;
+	}
+	g_verify_walker_skipped++;
+	return finish();
+}
+
+// One walk with the selected variant (both under KYTY_VERIFY_WALKER).
+const uint64_t* RunWalker(const ResourcePlan& plan, const WalkerCode& code, bool fast,
+                          const SrtRuntime& runtime, std::vector<uint32_t>& flat) {
+	if (code.fast_entry != 0 && VerifyWalkerEnabled()) [[unlikely]] {
+		return VerifyWalk(plan, code, runtime, flat);
+	}
+	if (fast) {
+		// The fast walker zeroes the flat SRT at entry.
+		flat.resize(plan.srt_reads.size());
+	} else {
+		flat.assign(plan.srt_reads.size(), 0u);
+	}
+	return CallWalker(plan, code, fast, runtime, flat);
+}
+
+} // namespace
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
-	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	t_running_walker = plan.srt_code.get();
+	DumpPlanOnce(plan);
+	// CompileSrtWalker is the only producer of srt_code.
+	const auto& code = static_cast<const WalkerCode&>(*plan.srt_code);
+	const bool  fast = code.fast_entry != 0 &&
+	                  Common::AbSwitch::Enabled(Common::AbSwitch::SRT_WALKER_FAST);
+	t_running_walker    = &code;
+	t_walker_shader     = plan.shader_hash;
+	t_walker_user_data  = runtime.user_data.data();
+	t_walker_user_count = static_cast<uint32_t>(runtime.user_data.size());
 	g_srt_load_check = Common::AbSwitch::Enabled(Common::AbSwitch::SRT_LOAD_CHECK) ? 1 : 0;
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	g_optional_unknowns = 0;
+	const auto* end = RunWalker(plan, code, fast, runtime, flat);
+	if (end != nullptr && g_optional_unknowns != 0 && SrtOptionalDiagEnabled()) [[unlikely]] {
+		// Keep this walk's descriptors and activity, then walk again waiting for the GPU (the
+		// precise result is the one used, so the diagnostic behaves like bit 59 off).
+		const auto* scratch = Scratch(plan);
+		const std::vector<uint8_t> optimistic(scratch, scratch + OutputOffset(plan));
+		g_force_precise = true;
+		end = RunWalker(plan, code, fast, runtime, flat);
+		g_force_precise = false;
+		if (end != nullptr) LogOptionalDifferences(plan, optimistic);
+	}
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
-			reads->emplace_back(*read, sizeof(uint32_t));
+		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
+		const std::span captured {plan.srt_scratch.data() + plan.srt_captures / 8u, end};
+		const auto      first = reads->size();
+		reads->resize(first + captured.size());
+		std::ranges::transform(captured, reads->data() + first, [](uint64_t address) {
+			return std::pair {address, uint64_t {sizeof(uint32_t)}};
+		});
 	}
 	return true;
 }
@@ -1525,6 +2315,43 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
+}
+
+namespace {
+uint64_t g_walker_skipped_loads = 0;
+} // namespace
+
+uint32_t SrtWalkerLastOptionalUnknowns() noexcept {
+	return g_optional_unknowns;
+}
+
+uint64_t SrtWalkerSkippedLoads() noexcept {
+	return g_walker_skipped_loads;
+}
+
+void NoteSrtWalkerSkippedLoad() noexcept {
+	g_walker_skipped_loads++;
+}
+
+uint64_t SrtWalkerGuardedLoads() noexcept {
+	return g_walker_guarded_loads.load(std::memory_order_relaxed);
+}
+
+void NoteSrtWalkerGuardedLoad() noexcept {
+	g_walker_guarded_loads.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool SrtPageReadWatched(uint64_t address) noexcept {
+	// The same test LoadGuest emits.
+	const auto* lookup = PageManager::AccessLookup();
+	const void* table  = lookup->regions;
+	if (table == nullptr) return false;
+	const uint64_t region = address >> lookup->region_shift;
+	if (region >= lookup->region_count) return false;
+	const auto* base = static_cast<const uint8_t* const*>(table)[region];
+	if (base == nullptr) return false;
+	const uint64_t page = (address >> lookup->page_shift) & lookup->page_mask;
+	return (base[page * lookup->page_stride + lookup->pages_offset] & lookup->access_mask) != 0;
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

@@ -22,6 +22,9 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	// DS_INC/DS_DEC with an all-ones limit run as one native atomic add or subtract
+	// (KYTY_GDS_FIX=1, A/B experiment; off emits the compare-exchange loop for every limit).
+	bool inc_dec_add = false;
 };
 
 inline constexpr Profile DefaultProfile {};

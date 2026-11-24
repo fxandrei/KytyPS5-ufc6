@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -47,6 +48,29 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
+
+// Set and not "0". Read once at startup, so hot paths test no static guard.
+bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+// KYTY_PROGRAM_HINT=1: GetProgram first tries the program its stage found last (same key, no hash
+// lookup). KYTY_VERIFY_PROGRAM_HINT=1 implies it, looks up anyway and exits on a different entry.
+const bool g_verify_program_hint = EnvFlag("KYTY_VERIFY_PROGRAM_HINT");
+// Default on since 2026-11-21 (verified, A/B with bits 43/44): KYTY_PROGRAM_HINT=0 turns it off.
+const bool g_program_hint        = g_verify_program_hint || std::getenv("KYTY_PROGRAM_HINT") == nullptr ||
+                                   EnvFlag("KYTY_PROGRAM_HINT");
+// KYTY_COMPUTE_HINT=1: compute program and pipeline lookups first try the slot of their shader hash
+// / module id (PipelineCache::m_compute_program_hints). KYTY_VERIFY_COMPUTE_HINT=1 implies it, also
+// does the hash lookups and exits when they find another entry.
+const bool g_verify_compute_hint = EnvFlag("KYTY_VERIFY_COMPUTE_HINT");
+// Default on since 2026-11-21 (verified: 6.8M lookups, 0 mismatches): KYTY_COMPUTE_HINT=0 turns it off.
+const bool g_compute_hint        = g_verify_compute_hint || std::getenv("KYTY_COMPUTE_HINT") == nullptr ||
+                                   EnvFlag("KYTY_COMPUTE_HINT");
+
+constexpr size_t ComputeHintSlot(uint64_t hash, size_t slots) {
+	return static_cast<size_t>((hash ^ (hash >> 29u) ^ (hash >> 47u)) & (slots - 1u));
+}
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -239,6 +263,15 @@ VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
+	// KYTY_GDS_FIX=1 (2026-11-21, A/B experiment, default off): DS_INC/DS_DEC with an all-ones
+	// limit use one native atomic instead of a load/compare-exchange loop. UFC 6's strand-hair
+	// rasterizer (b37644325c6f10c6) takes one GDS ticket per tile from 144 persistent groups; the
+	// loop retires about one ticket per L2 round trip under that contention. The store header holds
+	// the profile, so changing the variable rebuilds the shader store.
+	static const bool inc_dec_add = [] {
+		const char* value = std::getenv("KYTY_GDS_FIX");
+		return value == nullptr || std::atoi(value) != 0; // default ON since 2026-11-21 23:55 (exact for all-ones limits)
+	}();
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
 	return {.maintenance8           = graphics.maintenance8_enabled,
@@ -247,7 +280,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .inc_dec_add            = inc_dec_add};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -418,8 +452,71 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	auto       entry = m_program_cache.find(m_lookup_key);
-	const auto bind  = [&](const ShaderModule& module) {
+	// The stage's last program when the key is the same (KYTY_PROGRAM_HINT): the hash lookup compares
+	// the key with every cached variant of the shader, which all share its bucket.
+	const auto    stage_index = static_cast<size_t>(options.stage);
+	const bool    use_hint    = g_program_hint && stage_index < m_program_hints.size();
+	ProgramEntry* entry       = nullptr;
+	// KYTY_COMPUTE_HINT: this compute shader's slot; set to what the lookup below finds.
+	ProgramEntry** compute_slot = nullptr;
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (g_compute_hint) {
+			compute_slot = &m_compute_program_hints[ComputeHintSlot(params.hash, COMPUTE_HINT_SLOTS)];
+		}
+	}
+	if (compute_slot != nullptr && *compute_slot != nullptr && (*compute_slot)->first == m_lookup_key) {
+		// Keys are unique in m_program_cache: the entry with an equal key is the one find returns.
+		entry = *compute_slot;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputeHintHits);
+		if (use_hint) {
+			// The per-stage hint stays "the program this stage found last", as without the slots.
+			if (m_program_hints[stage_index] == entry) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputeHintStageHits);
+			}
+			m_program_hints[stage_index] = entry;
+		}
+		if (g_verify_compute_hint) [[unlikely]] {
+			const auto found = m_program_cache.find(m_lookup_key);
+			if (found == m_program_cache.end() || &*found != entry) {
+				EXIT("compute hint verify: hash 0x%016" PRIx64 " found another program\n",
+				     params.hash);
+			}
+			m_compute_hint_hits++;
+		}
+	} else if (use_hint && m_program_hints[stage_index] != nullptr &&
+	    m_program_hints[stage_index]->first == m_lookup_key) {
+		entry = m_program_hints[stage_index];
+		if (g_verify_program_hint) [[unlikely]] {
+			const auto found = m_program_cache.find(m_lookup_key);
+			if (found == m_program_cache.end() || &*found != entry) {
+				EXIT("program hint verify: stage %u hash 0x%016" PRIx64 " found another program\n",
+				     static_cast<uint32_t>(stage_index), params.hash);
+			}
+			m_program_hint_hits++;
+		}
+	} else {
+		const auto found = m_program_cache.find(m_lookup_key);
+		entry            = found == m_program_cache.end() ? nullptr : &*found;
+		if (use_hint) {
+			m_program_hints[stage_index] = entry;
+		}
+	}
+	if (compute_slot != nullptr && *compute_slot != entry) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputeHintMisses);
+		*compute_slot = entry; // nullptr for a new program: set again after the emplace below
+	}
+	if (compute_slot != nullptr && g_verify_compute_hint &&
+	    (++m_compute_hint_lookups & 0x3ffffu) == 0) [[unlikely]] {
+		std::printf("compute hint verify: %" PRIu64 " lookups, %" PRIu64 " hint hits, 0 mismatches\n",
+		            m_compute_hint_lookups, m_compute_hint_hits);
+		std::fflush(stdout);
+	}
+	if (g_verify_program_hint && (++m_program_hint_lookups & 0xfffffu) == 0) [[unlikely]] {
+		std::printf("program hint verify: %" PRIu64 " lookups, %" PRIu64 " hint hits, 0 mismatches\n",
+		            m_program_hint_lookups, m_program_hint_hits);
+		std::fflush(stdout);
+	}
+	const auto bind = [&](const ShaderModule& module) {
         // Diagnostic only: compare a retained shader against the same live inputs compiled
         // without the store. This deliberately does extra work and is not a benchmark mode.
         static const bool verify_store = std::getenv("KYTY_VERIFY_SHADER_STORE") != nullptr;
@@ -482,7 +579,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
         return &module;
 	};
 	bool source_changed = false;
-	if (entry != m_program_cache.end()) {
+	if (entry != nullptr) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
@@ -501,7 +598,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
-	if (entry == m_program_cache.end()) {
+	if (entry == nullptr) {
 		DumpShader(params.code,
 		           fmt::format("original/{}_{:016x}.bin",
 		                       ShaderRecompiler::StageName(options.stage), params.hash));
@@ -515,11 +612,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return nullptr;
 		}
 	}
-	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
+	auto* current = entry == nullptr ? &source : entry->second.call_source.get();
 	ShaderRecompiler::TranslateResult translated;
 	if (current != nullptr) {
 		if (!current->calls.empty()) {
-			if (entry == m_program_cache.end())
+			if (entry == nullptr)
 				ShaderRecompiler::RefreshShaderSource(*current, runtime);
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 			translated.program.source_reads = current->reads;
@@ -529,11 +626,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	} else {
 		translated = ShaderRecompiler::TranslateProgram(params.code, options);
 	}
-	if (entry == m_program_cache.end()) {
+	if (entry == nullptr) {
 		auto retained = !source.calls.empty()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 		                    : nullptr;
-		entry         = m_program_cache
+		entry         = &*m_program_cache
 		            .emplace(m_lookup_key,
 		                     Program {
 		                         .call_source = std::move(retained),
@@ -541,6 +638,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		                             ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		                     })
 		            .first;
+		if (use_hint) {
+			m_program_hints[stage_index] = entry;
+		}
+		if (compute_slot != nullptr) {
+			*compute_slot = entry;
+		}
 		auto& program = entry->second;
 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 		    program.resource_plan, runtime, program.resources, program.specialization,
@@ -560,6 +663,94 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor));
+}
+
+// KYTY_DRAW_PREP (M1): GetProgram for an existing program and module, with no write to the
+// cache. Differences to GetProgram, each with the reason the result is still the same:
+//  - The key goes to m_prep_key; the per-stage hint is read but never written, and a miss uses
+//    find. Keys are unique in m_program_cache, so the hint and find give the same entry.
+//  - No SRT memo: the memo only skips recomputing what an equal walk gives (KYTY_VERIFY_SRT_MEMO);
+//    Program::resources/specialization/memo/last_module stay as the serial path left them, so the
+//    memo's "Program::resources matches memo.key" invariant still holds for its next use.
+//  - The module search reads last_module as a first guess and scans otherwise; at most one module
+//    matches a (push start, specialization) pair, since CompileModule only runs without a match.
+//  - The image heap is the same object: Acquire is idempotent within a draw (one refresh per draw,
+//    views found again, m_active deduplicated), and the pure path runs after BeginDraw like the
+//    serial one. A worker (M3) must refuse plans that can reach Acquire instead.
+//  - Never translates, compiles or emplaces: those cases are refusals.
+template <typename InputInfo>
+const ShaderModule* PipelineCache::GetProgramPure(
+    const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+    ShaderRecompiler::IR::ResourceSnapshot&       resources,
+    ShaderRecompiler::IR::ResourceSpecialization& specialization, DrawPrepRefusal& refusal) {
+	static_assert(std::is_same_v<InputInfo, ShaderVertexInputInfo> ||
+	              std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+	const auto user_data = std::span(params.user_data).first(params.user_data_count);
+	ShaderType stage     = ShaderType::Pixel;
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		stage = input_info.logical_stage;
+	}
+	m_prep_key.stage           = stage;
+	m_prep_key.hash            = params.hash;
+	m_prep_key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, m_prep_key.static_state);
+	const auto          stage_index = static_cast<size_t>(stage);
+	const ProgramEntry* entry       = nullptr;
+	if (stage_index < m_program_hints.size() && m_program_hints[stage_index] != nullptr &&
+	    m_program_hints[stage_index]->first == m_prep_key) {
+		entry = m_program_hints[stage_index];
+	} else if (const auto found = m_program_cache.find(m_prep_key); found != m_program_cache.end()) {
+		entry = &*found;
+	}
+	if (entry == nullptr) {
+		refusal = DrawPrepRefusal::NoProgram;
+		return nullptr;
+	}
+	const auto& program = entry->second;
+	if (program.skip_dispatch) {
+		refusal = DrawPrepRefusal::SkipProgram;
+		return nullptr;
+	}
+	if (program.call_source != nullptr) {
+		refusal = DrawPrepRefusal::CallProgram;
+		return nullptr;
+	}
+	const ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = params.Base(),
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	    .image_heap                 = m_image_heap,
+	};
+	if (!ShaderRecompiler::IR::MaterializeResources(program.resource_plan, runtime, resources,
+	                                                specialization, nullptr)) {
+		refusal = DrawPrepRefusal::Materialize;
+		return nullptr;
+	}
+	const auto matches = [&](const ShaderModule& candidate) {
+		const auto& layout = candidate.info.bindings;
+		return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+		                                           push_data_cursor, layout.ShaderDataDwords()) &&
+		       candidate.specialization == specialization;
+	};
+	const ShaderModule* module = nullptr;
+	if (program.last_module < program.modules.size() &&
+	    matches(program.modules[program.last_module])) {
+		module = &program.modules[program.last_module];
+	} else {
+		for (const auto& candidate: program.modules) {
+			if (matches(candidate)) {
+				module = &candidate;
+				break;
+			}
+		}
+	}
+	if (module == nullptr) {
+		refusal = DrawPrepRefusal::NoModule;
+		return nullptr;
+	}
+	input_info.stage = {.module = module, .resources = &resources};
+	module->info.bindings.AdvancePushData(push_data_cursor);
+	return module;
 }
 
 PipelineCache::PipelineCache(GraphicContext&                        graphics,
@@ -745,11 +936,38 @@ void PipelineCache::WriteDriverCache() const {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
-	const auto& context             = command.GetRegisters();
-	const auto& user_config         = command.GetUserConfig();
+	GraphicsProgramsImpl<false>(command.GetRegisters(), command.GetUserConfig(),
+	                            command.GetShaders(), state, nullptr);
+}
+
+bool PipelineCache::PrepareGraphicsPrograms(const HW::Context&    context,
+                                            const HW::UserConfig& user_config,
+                                            const HW::Shader& shaders, DrawRenderState& state,
+                                            DrawProgramPrep& prep) {
+	// The certificate is loaded before the first read of guest memory or the shader map.
+	prep.refusal               = DrawPrepRefusal::None;
+	prep.guest_map_epoch       = Libs::LibKernel::Memory::GuestMapEpoch();
+	prep.shader_map_generation = ShaderMapGeneration();
+	const auto guarded_before  = ShaderRecompiler::IR::SrtWalkerGuardedLoads();
+	const bool prepared = GraphicsProgramsImpl<true>(context, user_config, shaders, state, &prep);
+	prep.guarded_loads  = ShaderRecompiler::IR::SrtWalkerGuardedLoads() - guarded_before;
+	return prepared;
+}
+
+bool PipelineCache::DrawPrepCertificateHolds(const DrawProgramPrep& prep) {
+	return prep.guest_map_epoch == Libs::LibKernel::Memory::GuestMapEpoch() &&
+	       prep.shader_map_generation == ShaderMapGeneration();
+}
+
+// Pure = false is the serial path, unchanged apart from the `if constexpr (Pure)` branches.
+template <bool Pure>
+bool PipelineCache::GraphicsProgramsImpl(const HW::Context&    context,
+                                         const HW::UserConfig& user_config,
+                                         const HW::Shader& shaders, DrawRenderState& state,
+                                         [[maybe_unused]] DrawProgramPrep* prep) {
 	const auto& sh                  = context.GetShaderRegisters();
-	const auto& vertex_regs         = command.GetShaders().GetVs();
-	const auto& pixel_regs          = command.GetShaders().GetPs();
+	const auto& vertex_regs         = shaders.GetVs();
+	const auto& pixel_regs          = shaders.GetPs();
 	auto&       vertex_info         = state.vertex_info;
 	auto&       pixel_info          = state.ps_input_info;
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
@@ -774,6 +992,12 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	state.ps_active        = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
+	if constexpr (Pure) {
+		if (tess_active) {
+			prep->refusal = DrawPrepRefusal::Tessellation;
+			return false;
+		}
+	}
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 		// Reflection decodes both programs; the key also covers the VGT fields in tess.
@@ -785,7 +1009,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		if (inserted) {
 			ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
 			                                              vertex_params[1].code, layout->second);
-			StoreLayout(layout->first, layout->second);
+			if constexpr (!Pure) {
+				StoreLayout(layout->first, layout->second);
+			}
 		}
 		for (auto& stage: vertex_info) {
 			stage.tess = layout->second;
@@ -828,7 +1054,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
 				    vertex_params[0].hash));
 			}
-			return;
+			if constexpr (Pure) {
+				prep->refusal = DrawPrepRefusal::MeshDropped;
+				return false;
+			}
+			return true;
 		}
 		// A task shader launches each record's groups and passes its draw parameters in a
 		// payload beside the LDS, the allocation pair and the Layer array; without room for
@@ -955,7 +1185,18 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		const ShaderModule* pixel_program = nullptr;
+		if constexpr (Pure) {
+			pixel_program = GetProgramPure(pixel_params, pixel_info, push_data_cursor,
+			                               prep->resources[1], prep->specialization[1],
+			                               prep->refusal);
+			if (pixel_program == nullptr) {
+				return false;
+			}
+		} else {
+			pixel_program = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		}
+		const auto& pixel_module = *pixel_program;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -965,8 +1206,195 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		if constexpr (Pure) {
+			// Tessellation was refused: only stage 0 runs here.
+			if (GetProgramPure(vertex_params[i], vertex_info[i], push_data_cursor,
+			                   prep->resources[0], prep->specialization[0],
+			                   prep->refusal) == nullptr) {
+				return false;
+			}
+		} else {
+			GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		}
 	}
+	return true;
+}
+
+template bool PipelineCache::GraphicsProgramsImpl<false>(const HW::Context&, const HW::UserConfig&,
+                                                         const HW::Shader&, DrawRenderState&,
+                                                         DrawProgramPrep*);
+template bool PipelineCache::GraphicsProgramsImpl<true>(const HW::Context&, const HW::UserConfig&,
+                                                        const HW::Shader&, DrawRenderState&,
+                                                        DrawProgramPrep*);
+
+namespace {
+
+// KYTY_VERIFY_DRAW_PREP comparison helpers. Both sides start from one copy of the reset state and
+// are written by the same code, so whole-array comparisons are exact for padding-free elements.
+template <typename T>
+bool SameArray(const T& left, const T& right) {
+	static_assert(std::has_unique_object_representations_v<std::remove_all_extents_t<T>>);
+	return std::memcmp(&left, &right, sizeof(T)) == 0;
+}
+
+bool SameFloats(const float (&left)[2], const float (&right)[2]) {
+	return std::memcmp(left, right, sizeof(left)) == 0;
+}
+
+const char* DiffResources(const ShaderRecompiler::IR::ResourceSnapshot* left,
+                          const ShaderRecompiler::IR::ResourceSnapshot* right) {
+	if ((left == nullptr) != (right == nullptr)) return "stage.resources (null)";
+	if (left == nullptr) return nullptr;
+	if (left->buffers != right->buffers) return "resources.buffers";
+	if (left->images != right->images) return "resources.images";
+	if (left->samplers != right->samplers) return "resources.samplers";
+	if (left->flattened_srt != right->flattened_srt) return "resources.flattened_srt";
+	if (left->user_data != right->user_data) return "resources.user_data";
+	if (left->specialization_reads != right->specialization_reads)
+		return "resources.specialization_reads";
+	if (!(left->uniform_fill == right->uniform_fill)) return "resources.uniform_fill";
+	return nullptr;
+}
+
+#define KYTY_DRAW_PREP_SAME(field)                                                                 \
+	if (!(left.field == right.field)) return KYTY_DP_PREFIX #field
+#define KYTY_DRAW_PREP_SAME_ARRAY(field)                                                           \
+	if (!SameArray(left.field, right.field)) return KYTY_DP_PREFIX #field
+
+const char* DiffVertexInfo(const ShaderVertexInputInfo& left, const ShaderVertexInputInfo& right) {
+#define KYTY_DP_PREFIX "vertex_info."
+	KYTY_DRAW_PREP_SAME(stage.module);
+	KYTY_DRAW_PREP_SAME(logical_stage);
+	KYTY_DRAW_PREP_SAME(resources_num);
+	KYTY_DRAW_PREP_SAME(fetch_attrib_reg);
+	KYTY_DRAW_PREP_SAME(fetch_buffer_reg);
+	KYTY_DRAW_PREP_SAME(buffers_num);
+	KYTY_DRAW_PREP_SAME(wave_size);
+	KYTY_DRAW_PREP_SAME(scratch_size_dwords);
+	KYTY_DRAW_PREP_SAME(lds_size_dwords);
+	KYTY_DRAW_PREP_SAME(pa_cl_vs_out_cntl);
+	KYTY_DRAW_PREP_SAME(user_clip_planes);
+	KYTY_DRAW_PREP_SAME(indirect_offsets);
+	KYTY_DRAW_PREP_SAME(indirect_draw);
+	KYTY_DRAW_PREP_SAME(has_dynamic_vertex_fetch);
+	for (int i = 0; i < ShaderVertexInputInfo::RES_MAX; i++) {
+		if (!SameArray(left.resources[i].fields, right.resources[i].fields))
+			return KYTY_DP_PREFIX "resources";
+		const auto& l = left.resources_dst[i];
+		const auto& r = right.resources_dst[i];
+		if (l.register_start != r.register_start || l.registers_num != r.registers_num ||
+		    l.attr_id != r.attr_id || l.fetch_index != r.fetch_index ||
+		    l.buffer_index != r.buffer_index)
+			return KYTY_DP_PREFIX "resources_dst";
+		const auto& lb = left.buffers[i];
+		const auto& rb = right.buffers[i];
+		if (lb.addr != rb.addr || lb.stride != rb.stride || lb.num_records != rb.num_records ||
+		    lb.fetch_index != rb.fetch_index)
+			return KYTY_DP_PREFIX "buffers";
+	}
+	if (!SameFloats(left.clip_space.scale, right.clip_space.scale) ||
+	    !SameFloats(left.clip_space.offset, right.clip_space.offset) ||
+	    !SameFloats(left.clip_space.half_extent, right.clip_space.half_extent) ||
+	    left.clip_space.enabled != right.clip_space.enabled)
+		return KYTY_DP_PREFIX "clip_space";
+	KYTY_DRAW_PREP_SAME_ARRAY(mesh.threads_num);
+	KYTY_DRAW_PREP_SAME(mesh.lds_size_dwords);
+	KYTY_DRAW_PREP_SAME(mesh.scratch_size_dwords);
+	KYTY_DRAW_PREP_SAME(mesh.host_subgroup_size);
+	KYTY_DRAW_PREP_SAME(mesh.wave_size);
+	KYTY_DRAW_PREP_SAME(mesh.input_primitive);
+	KYTY_DRAW_PREP_SAME(mesh.primitives_per_group);
+	KYTY_DRAW_PREP_SAME(mesh.vertices_per_group);
+	KYTY_DRAW_PREP_SAME(mesh.max_vertices);
+	KYTY_DRAW_PREP_SAME(mesh.max_primitives);
+	KYTY_DRAW_PREP_SAME(mesh.provoking_vertex);
+	KYTY_DRAW_PREP_SAME(mesh.fast_launch);
+	KYTY_DRAW_PREP_SAME(tess.input_control_points);
+	KYTY_DRAW_PREP_SAME(tess.output_control_points);
+	KYTY_DRAW_PREP_SAME(tess.ls_stride);
+	KYTY_DRAW_PREP_SAME(tess.hs_stride);
+	KYTY_DRAW_PREP_SAME(tess.patch_base);
+	KYTY_DRAW_PREP_SAME(tess.patch_size);
+	KYTY_DRAW_PREP_SAME(tess.domain);
+	KYTY_DRAW_PREP_SAME(tess.partitioning);
+	KYTY_DRAW_PREP_SAME(tess.output_topology);
+#undef KYTY_DP_PREFIX
+	std::vector<uint32_t> left_key;
+	std::vector<uint32_t> right_key;
+	BuildStageStaticKey(left, left_key);
+	BuildStageStaticKey(right, right_key);
+	if (left_key != right_key) return "vertex_info static key";
+	return DiffResources(left.stage.resources, right.stage.resources);
+}
+
+const char* DiffPixelInfo(const ShaderPixelInputInfo& left, const ShaderPixelInputInfo& right) {
+#define KYTY_DP_PREFIX "ps_input_info."
+	KYTY_DRAW_PREP_SAME(stage.module);
+	KYTY_DRAW_PREP_SAME_ARRAY(interpolator_settings);
+	KYTY_DRAW_PREP_SAME(input_num);
+	KYTY_DRAW_PREP_SAME(wave_size);
+	KYTY_DRAW_PREP_SAME(ps_system_input_base);
+	KYTY_DRAW_PREP_SAME(custom_interpolation_mask);
+	KYTY_DRAW_PREP_SAME(ps_perspective_center_vgpr);
+	KYTY_DRAW_PREP_SAME(ps_perspective_sample_vgpr);
+	KYTY_DRAW_PREP_SAME(ps_perspective_centroid_vgpr);
+	KYTY_DRAW_PREP_SAME_ARRAY(target_output_mode);
+	KYTY_DRAW_PREP_SAME(target_shader_mask);
+	for (size_t i = 0; i < left.target_export_mapping.size(); i++) {
+		if (left.target_export_mapping[i].packed != right.target_export_mapping[i].packed)
+			return KYTY_DP_PREFIX "target_export_mapping";
+	}
+	KYTY_DRAW_PREP_SAME(target_packed_unorm_mask);
+	KYTY_DRAW_PREP_SAME(target_uint_mask);
+	KYTY_DRAW_PREP_SAME(target_sint_mask);
+	KYTY_DRAW_PREP_SAME(target_round_mode);
+	KYTY_DRAW_PREP_SAME(scratch_size_dwords);
+	KYTY_DRAW_PREP_SAME(lds_size_dwords);
+	KYTY_DRAW_PREP_SAME(ps_pos_x);
+	KYTY_DRAW_PREP_SAME(ps_pos_y);
+	KYTY_DRAW_PREP_SAME(ps_pos_z);
+	KYTY_DRAW_PREP_SAME(ps_pos_w);
+	KYTY_DRAW_PREP_SAME(ps_front_face);
+	KYTY_DRAW_PREP_SAME(ps_front_face_all_bits);
+	KYTY_DRAW_PREP_SAME(ps_ancillary);
+	KYTY_DRAW_PREP_SAME(ps_no_perspective);
+	KYTY_DRAW_PREP_SAME(parameter_mode);
+	KYTY_DRAW_PREP_SAME(ps_pixel_kill_enable);
+	KYTY_DRAW_PREP_SAME(ps_depth_export_enable);
+	KYTY_DRAW_PREP_SAME(ps_sample_mask_export_enable);
+	KYTY_DRAW_PREP_SAME(ps_sample_shading);
+	KYTY_DRAW_PREP_SAME(dual_source_blending);
+	KYTY_DRAW_PREP_SAME(object_primitive_id);
+	KYTY_DRAW_PREP_SAME(alpha_blend_source);
+	KYTY_DRAW_PREP_SAME(ps_early_z);
+#undef KYTY_DP_PREFIX
+	std::vector<uint32_t> left_key;
+	std::vector<uint32_t> right_key;
+	BuildStageStaticKey(left, left_key);
+	BuildStageStaticKey(right, right_key);
+	if (left_key != right_key) return "ps_input_info static key";
+	return DiffResources(left.stage.resources, right.stage.resources);
+}
+
+#undef KYTY_DRAW_PREP_SAME
+#undef KYTY_DRAW_PREP_SAME_ARRAY
+
+} // namespace
+
+const char* DiffGraphicsPrograms(const DrawRenderState& left, const DrawRenderState& right) {
+	if (left.mrt_mask != right.mrt_mask) return "mrt_mask";
+	if (left.ps_active != right.ps_active) return "ps_active";
+	if (left.topology != right.topology) return "topology";
+	if (left.primitive_restart_enable != right.primitive_restart_enable)
+		return "primitive_restart_enable";
+	// Tessellation is refused by the pure path, so only stage 0 is ever prepared; the other
+	// stages are compared for their (reset) module pointers.
+	for (size_t i = 1; i < left.vertex_info.size(); i++) {
+		if (left.vertex_info[i].stage.module != right.vertex_info[i].stage.module)
+			return "vertex_info[1..2].stage.module";
+	}
+	if (const auto* field = DiffVertexInfo(left.vertex_info[0], right.vertex_info[0])) return field;
+	return DiffPixelInfo(left.ps_input_info, right.ps_input_info);
 }
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -1249,8 +1677,29 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 
 	const auto& module = *input_info.stage.module;
 
+	// KYTY_COMPUTE_HINT: the pipeline this module id found last. Elements of m_compute_pipelines keep
+	// their address, so the slot holds what try_emplace would return for the same id.
+	ComputePipelineHint* slot = nullptr;
+	if (g_compute_hint) {
+		slot = &m_compute_pipeline_hints[ComputeHintSlot(module.id, COMPUTE_HINT_SLOTS)];
+		if (slot->pipeline != nullptr && slot->module_id == module.id) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputePipeMemoHits);
+			if (g_verify_compute_hint) [[unlikely]] {
+				const auto found = m_compute_pipelines.find(module.id);
+				if (found == m_compute_pipelines.end() || &found->second != slot->pipeline) {
+					EXIT("compute hint verify: module 0x%016" PRIx64 " found another pipeline\n",
+					     module.id);
+				}
+			}
+			return *slot->pipeline;
+		}
+	}
+
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);
 	auto& pipeline        = iter->second;
+	if (slot != nullptr) {
+		*slot = {module.id, &pipeline};
+	}
 	if (!inserted) {
 		return pipeline;
 	}

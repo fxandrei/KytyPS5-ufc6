@@ -342,6 +342,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Changes with every ShaderMapUserData (KYTY_DRAW_PREP certificate).
+[[nodiscard]] uint64_t ShaderMapGeneration() noexcept;
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -76,6 +77,9 @@ public:
         return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Materialize a stencil association as R8 storage; keep its native depth owner coherent.
+	void MaterializeStencilStorage(ImageId id, const ImageDesc& desc);
+	void FinishStencilStorage(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -89,6 +93,10 @@ public:
 	// that skip the fault path would race with it.
 	[[nodiscard]] bool HasPendingBackingPublish() const {
 		return m_pending_publishes.load(std::memory_order_acquire) != 0;
+	}
+	// The image downloads still to land in guest memory (KYTY_VERIFY_UNMAP_TARGETED).
+	[[nodiscard]] uint32_t PendingBackingPublishes() const {
+		return m_pending_publishes.load(std::memory_order_acquire);
 	}
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -106,6 +114,9 @@ public:
 	void RunGarbageCollector();
 
 private:
+	void DetachStencilStorage(ImageId id);
+	void CheckStencilStorageMeta(const Image& owner);
+	Buffer& StencilScratch();
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
@@ -284,6 +295,7 @@ private:
 	BlitHelper                m_blit_helper;
 	TileManager               m_tiler;
 	BufferCache&              m_buffer_cache;
+	std::unique_ptr<Buffer>   m_stencil_scratch;
 	Common::SlotVector<Image> m_slot_images;
 	ImagePageTable            m_image_page_table;
 	// Registered images per start address (AbSwitch IMAGE_START_INDEX): FindImageFromRange and

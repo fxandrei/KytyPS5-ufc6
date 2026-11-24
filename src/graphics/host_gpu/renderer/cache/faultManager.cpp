@@ -115,7 +115,22 @@ void FaultManager::ProcessFaultBuffer() {
 		MarkGpuCheckpoint(command, "fault buffer processing");
 	}
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
-	dependency.pBufferMemoryBarriers = &post_barrier;
+	// The host reads the page list after the tick (deferred operation below): only a device-to-host
+	// dependency makes the shader's writes visible to host reads; waiting for the tick alone does not
+	// (2026-11-20, from Senaxx/KytyPS5 1e7597c01 via Jetsku 3fd14ddb). A stale list skips BDA syncs.
+	vk::BufferMemoryBarrier2 host_barrier {};
+	host_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eComputeShader;
+	host_barrier.srcAccessMask       = vk::AccessFlagBits2::eShaderWrite;
+	host_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eHost;
+	host_barrier.dstAccessMask       = vk::AccessFlagBits2::eHostRead;
+	host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	host_barrier.buffer              = m_download_buffer.Handle();
+	host_barrier.offset              = offset;
+	host_barrier.size                = PageFaultAreaSize;
+	const vk::BufferMemoryBarrier2 post_barriers[] = {post_barrier, host_barrier};
+	dependency.bufferMemoryBarrierCount = 2;
+	dependency.pBufferMemoryBarriers    = post_barriers;
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;

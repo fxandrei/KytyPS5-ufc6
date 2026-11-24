@@ -1,0 +1,208 @@
+Kyty / UFC 6 active development handoff
+CURRENT RESUME: 2026-11-23 22:06 Europe/Bucharest. Read RESULTS_2205.md and the LAST entry in
+D:/Projects/kyty-dev/handoff/2026-11-23/HANDOFF.txt, then investigation.json and MILESTONE_2144.md.
+Older entries below preserve history; do not treat their pending/stopped statements as current.
+- Preserved inherited working tree, new Streamline/draw-pass sources, user uploads and scripts.
+- Final fetch origin/main ->4e9065450 (POSIX rename export, reviewed); not integrated into the dirty tree.
+- run-series keeps current post-GDS caches; old FDD/E413 restoration requires an explicit switch.
+  Now records resource-state.csv, guest watchdogs and manual closes. Exit0 is not a healthy-run assertion.
+- Offline hair ISA decoded (1014 instructions, no unsupported; DS_INC_RTN at0x218, not DS_ORDERED_COUNT).
+- Timing v1 lacked explicit gates AFTER timestamps. Do not attribute its 40ms interval exclusively to a shader.
+  V2 completed selected samples remain ~0.005-0.32ms despite a2.4FPS corner menu; ring coverage is limited.
+- Unmapped guest-buffer control spontaneously recovered; BAR control stayed slow. NOT an accepted FPS gain.
+  Allocation flags do not prove WDDM residency; allocation control also changed the blanket host barrier.
+- CURRENT exe B913385F1979F38CE5AE72A282F27922E55F3FB04F91E1B23672C55135E9DDE7 (build PASS).
+  Added opt-in KYTY_HOST_BARRIER_AB with unmapped guest buffers; bit11 adds blanket host visibility.
+  GDS CPU read now has its own buffer-specific barrier. GDS/BDA/ordered/stencil focused checks PASS.
+  Full functional GPU suite remains FAIL at BufferCacheDirtyGarbageCollection adjacent-download stride.
+  No Vulkan validation this turn (user RTSS active); do not close user processes.
+- All own game/test/monitor processes CLOSED. Host-barrier A/B272s:13pairs, FPSratio1.000715, near60both.
+  Normal BAR allocation still reproduced severe slowdown without shader timers and without direct BAR reads.
+  Unmapped guest-buffer fight reached clean observed UFC APEX combat and KO/results, but pre-fight guest watchdog.
+  Observed active-fight t_s120..190, zero compilation rows, native4Kdepth:59samples mean39.21/median39.28FPS.
+  No accepted optimization or stability fix; menu60 does not establish combat60. See RESULTS_2205.md for limits.
+  Next: warm-cache fight-only CPU profile; separately isolate mapped allocation/residency and full-suite assertion.
+- User authorized current-RAM launch; explicit runtime guard0.25GiB for bounded diagnostics. Artifacts/TEMP onD.
+  Final C13.50GiB/D207.11GiB. No push/deployment or accepted FPS improvement.
+
+Updated 2026-11-20 18:30 Europe/Bucharest (Claude Code session). Branch dev/zt-clamp; HEAD 2882ea1a9af3bdfe97e6264a2c1b3ab290964bcd.
+(File rebuilt 2026-11-18 23:50 from the session transcript after an accidental truncation by a failed script;
+ content is the 18:20/19:10 versions plus the 23:50 section.)
+
+READ FIRST:
+docs/ufc6-rendering-investigation.md
+D:\Projects\kyty-dev\handoff\2026-11-18\HANDOFF.txt   (newest; continuation of 2026-11-13)
+D:\Projects\kyty-dev\handoff\2026-11-13\HANDOFF.txt
+D:\Projects\kyty-dev\handoff\2026-11-13\investigation.json
+D:\Projects\kyty-dev\handoff\2026-11-13\STENCIL_STORAGE_PLAN.txt
+
+2026-11-22 00:05 - SESSION STOPPED BY USER. START HERE: last entry of D:/Projects/kyty-dev/handoff/2026-11-18/HANDOFF.txt ("SESSION STOPPED ... FINAL CONCLUSIONS + NEXT STEPS"). Tree saved: working-tree-20261122-0005.patch. Adopted today: bits 43/44, program+compute hints, texture GC 16/8/4/200, KYTY_GDS_FIX default on. Open: 4K close-up menus, frozen user exe update (needs user OK).
+2026-11-21 23:55 - 4K menus: texture-GC defaults changed (16/8/4/200, fixes VRAM fill); hair compute chain still makes close-up menus slow (KYTY_GDS_FIX, KYTY_ORDERED_SERIAL default off = TDR risk); targeted unmap patch applied, off. 4K Apex fight ~42-44 FPS. Details in kyty-dev/handoff/2026-11-18/HANDOFF.txt (entries 21:45-23:55). Frozen user exe not updated (permission).
+2026-11-21 17:30 - 4K: FPS depends on the random arena (UFC Apex fight ~44 FPS, T-Mobile Arena ~17-25 FPS, GPU-side; SELECT CORNER sometimes 4.5 FPS GPU-bound). drawprep M1/M2 applied+verified (0 mismatches). Fixed-arena macro ufc6-to-fight-apex.txt needs a fix. Launchers in D:/games: run-ufc6-dev.bat, -nocrowd.bat, -1080p.bat (1080p+FSR). Agent 4k-gpu.md running. Working tree saved: kyty-dev/handoff/2026-11-18/working-tree-20261121-1730.patch (+untracked-20261121/).
+2026-11-21 16:25 - TARGET IS NOW NATIVE 4K (user decision): run-series.ps1 defaults to KYTY_OUTPUT_1080P=0. Compute hint adopted (default on). User launchers D:/games/run-ufc6-dev.bat (crowd) and run-ufc6-dev-nocrowd.bat (frozen exe chint-9B5561B9, 4K, no stats/logs). GPU intro hang analysed (agents/2026-11-21/gpu-hang.md, KYTY_HANG_DIAG=1).
+2026-11-21 11:45 - ADOPTED bits 43 (walker fast) + 44 (read fast path) + program hint default on: A/B +3.0% median 24/31 (verified identical). M0: parallel CP feasible if indirect reg writes are clean-checked. Shadow atlas = 61% of draws (2182/frame, 12 views) -> game patch is the big lever. draw-skip test is broken (skips nothing). User clean script: D:/Projects/kyty-dev/play/emu-clean/run-ufc6.ps1. Details: kyty-dev/handoff/2026-11-18/HANDOFF.txt.
+2026-11-21 10:55 - DLSS-G reads TAA constants + dynamic res (exe dynres-2B419AC6; FG needs a focused window: user test); vblank 240 A/B rejected (no gain); GPU hangs persist (OC suspect). Agents resumed.
+2026-11-20 23:00 - mprotect corruption hypothesis tested and refuted (no runtime mprotect on GPU memory); bit 30 added, off.
+2026-11-20 18:30 - PAUSED (usage limit). START HERE: detailed state, next steps and the unfixed mprotect finding are in
+  D:/Projects/kyty-dev/handoff/2026-11-18/HANDOFF.txt (last entry "2026-11-20 18:30 - SESSION PAUSE"); agent reports in
+  D:/Projects/kyty-dev/agents/2026-11-20/. Since 18:00: BDA per-slice gate restored (+2.5%/+2.7%, bit 13 effective again),
+  fault-list host barrier added, best exe = exe/bda13-1870218C, working-tree patch working-tree-20261120-1830.patch plus
+  copies of the two new untracked files (streamline.cpp/.h) in the same handoff folder.
+
+2026-11-20 18:00 - STATE SUMMARY (goal: as close to 60 FPS as possible incl. DLSS/FG; loop until the user stops it)
+- DEFAULT_MASK now 6832770114085711823 = previous | bit 62 TEXTURE_MEMO_WIDE | bit 7 TEXTURE_IMAGE_MEMO (both verify-clean,
+  small positive A/Bs: bit 62 no crowd 1.033 / crowd 1.013; bit 7 1.024 / 1.021). Bits 61 (prewalk memo) and 63 (guest
+  read bounce) stay off. Free AbSwitch bits: 30, 43, 44.
+- Frame generation: DLSS-G via NVIDIA Streamline 2.14.16 works inside the emulator (src/graphics/presentation/window/
+  streamline.cpp + hooks in renderCompute.cpp/swapchain.cpp; CMake -DKYTY_STREAMLINE_DIR; env KYTY_DLSSG=1, KYTY_CUDA_HOLE=1,
+  KYTY_STREAMLINE_PATH=<sdk>\bin\x64). Tags motion vectors + depth at the TAA pass (cs c3af833d5e36e33c). Frames are only
+  generated with the window FOCUSED (SL rule); camera constants are still identity. User test launcher:
+  D:\Projects\kyty-dev\play\play-ufc6-dlssg.ps1 (log prints app vs displayed FPS). Driver alternative: NVIDIA Smooth Motion.
+- Corruption (blocky tiles, ~50% of runs): not tied to any AbSwitch group (mask 0 too) nor to older builds; the user's
+  RTX 4090 runs MSI Afterburner +1000 MHz memory + undervolt (TDRs 23:56, 04:20, 04:33) - retest at stock suggested.
+  Measurement protocol: snapper.ps1 + blackscore.ps1/contact-sheet.ps1 (handoff\2026-11-18), discard corrupt runs.
+- znver4 (current code, exe\znver4-4586D2AA vs exe\bit7-261ED331): 3 pairs FPS 44.9 -> 46.6 (+3.8%), work/s equal:
+  inconclusive.
+- Agents (read-only analysis, user request), reports in D:\Projects\kyty-dev\agents\2026-11-20\: cp-hotspots.md,
+  parallel-cp-design.md, jetsku-port-candidates.md, dlssg-constants.md, game-side-and-pro-mode.md, upstream-and-forks.md.
+- Upstream: 13 new commits f6c16fd95..a1fc5ae43 (fetched 2026-11-20), incl. AMPR/AMM fixes 91bc5e2ee/5ad27cdd1/d79ccfce5 and
+  shader 8d0ebb8fa - not merged yet. Jetsku latest release still int22 (2026-11-18).
+- Full detail: D:\Projects\kyty-dev\handoff\2026-11-18\HANDOFF.txt (entries 2026-11-19 22:40 ... 2026-11-20).
+
+2026-11-20 00:21 - PAUSED BY THE USER; bit 62 TEXTURE_MEMO_WIDE promising, bit 61 rejected
+- Bit 62 (wider, content-addressed texture plan/info memos; 97% plan hits): no-crowd A/B FPS 1.033 (16/17), work/s
+  1.042. First crowd A/B (1.024) had the known tile corruption in a B-phase screenshot + a GPU hang in an A phase;
+  later crowd runs with bit 62 on were clean (13 fight snapshots). Needs one clean full-fight crowd A/B with
+  snapshots (snapper.ps1 + contact-sheet.ps1 in D:/Projects/kyty-dev/handoff/2026-11-18) before adoption. Not in DEFAULT_MASK.
+- Bit 61 rejected: walker user data changes per draw (ring-allocated tables), prewalk hits 3.5%.
+- Frame generation (DLSS FG) recorded as a later track at the user's request; real FPS first.
+- Do not resume game runs until the user says so.
+
+2026-11-19 23:45 - BIT 61 (SRT_PREWALK_MEMO) IN TEST; znver4 A/B incomplete; AstroHybrid repo evaluated
+- Bit 61 skips the SRT walk when a Program's walker inputs are unchanged (walker user data, shader base, workgroups,
+  every loaded DWORD on pages without GPU-written bytes, guest map epoch). Not in DEFAULT_MASK. Verify run clean
+  (KYTY_VERIFY_PREWALK=1) but only 3.5% hits in the fight; build bit61b-4902A252 compares only the user data the
+  walker reads, admits direct dispatches and logs miss reasons (perf.csv pw_*). Needs a verify run, then -AbBit 61.
+- znver4 exe A/B was killed for low memory after one pair (inconclusive). Arena-load GPU hang recurred once
+  (22:55, verify61, independent of bits 59-61; repeat the run).
+- https://github.com/imnotsharingmyname/pcportastrobot (AstroHybrid) uses the Jetsku fork (int21) as kyty_gpu.dll;
+  its patches do not apply to this tree; details and what transfers in the 2026-11-18 HANDOFF.txt (23:40 entry).
+- Game runs only with >= 11 GB free RAM (user's apps vary: Razer AppEngine 2-3 GB, browsers).
+
+2026-11-19 19:10 - BIT 60 ADOPTED (default mask 2221084095658323791 = bits ...58+59+60)
+- Bit 60 WAIT_REG_MEM_BACKING clean A/Bs: no crowd FPS median 1.037 (14/15), 41.15 -> 43.87 FPS; crowd 1.041 (17/17),
+  work/s 1.059, 33.40 -> 35.62 FPS; GPU-thread waits 40-45 -> 1-13 ms/s. In DEFAULT_MASK; exe\default60-049A62E2.
+- The user allowed game runs again after the low-memory stop (check free RAM before each run; ~11-13 GB free).
+- GPU waits are now small; the frame is CPU work on the GPU thread (~5 us per draw/dispatch). Next: clean fight
+  profile (sample60-nocrowd), then attack the largest CPU items (bindings/texture resolve, SRT materialization,
+  BDA sync re-protection).
+
+2026-11-19 18:50 - BIT 59 ADOPTED, BIT 60 BUILT, GAME RUNS PAUSED (low system memory)
+- Bit 59 SRT_OPTIONAL_DIRTY_UNKNOWN is in DEFAULT_MASK (clean A/Bs: no crowd FPS median 1.070 / work/s 1.056 16/16,
+  40.9 -> 44.7 FPS; crowd 1.023 / 1.036, 31.7 -> 33.3 FPS). Default mask now 1068162591051476815 (scripts updated).
+- New find: WAIT_REG_MEM reads of GPU-written pages wait only because OTHER bytes of the 4 KiB page are still being
+  written (the waited bytes are clean): 58-78 ms/s of the GPU thread in the arena. Fix = AbSwitch bit 60
+  WAIT_REG_MEM_BACKING (read clean bytes from the backing store), built (exe\bit60-383E58B3), NOT measured yet.
+- A diagnostic run was killed by Claude Code for low system memory (emulator ~10 GB, system 26-28/31 GB during runs);
+  game runs resume only when the user agrees. Next: bit 60 A/B (no crowd, then crowd).
+- A TDR (nvlddmkm 153) happened at 18:35 in a no-crowd run with bit 59 on, during a lighter scene right after new
+  content shaders compiled; not attributed to bit 59 (stalls/TDRs predate it). Keep watching.
+
+2026-11-19 18:20 - LOOP RESUMED (details: handoff\2026-11-18\HANDOFF.txt, updates 17:20 .. 18:15)
+- New PGO profile (20261119-intro-crowd+fight-nocrowd) measured: NEUTRAL (crowd exe A/B, work/s 0.99) -> not adopted;
+  windows-pgo keeps pgo\20261030-235243-perf-pgo-fight.profdata. (configure-pgo1119.ps1 built into _Build\windows-pgogen2;
+  that dir now holds a PGO-use build; configure-pgogen2.ps1 turns it back into an instrumented build.)
+- ROOT CAUSE of most GPU-thread readback waits (~100 ms/s = ~10% of the CP in the no-crowd fight), from the new
+  env-gated diagnostics KYTY_SRT_DIRTY_STATS=1 and KYTY_DUMP_PLAN=<hash>[;<hash>]:
+  the JIT SRT walker reads counters at offset 0 of small buffers that compute shaders (ad1a9c77, 085e9fdd, f9c1e0b0)
+  are still writing on the GPU, only to evaluate block conditions like !(buf1[buf0[0]] <= Undef) in compute readers
+  (b54f4ecc, 9ad619ec, a2932b1d). Such a condition is unknown unless the value is 0, so both successors are reached
+  anyway: the CP waited ~0.5 ms per read for a pruning decision that almost never prunes.
+- FIX (uncommitted): AbSwitch bit 59 SRT_OPTIONAL_DIRTY_UNKNOWN. The walker compiler marks loads that only feed block
+  conditions as optional; with bit 59 such a load reads as unknown instead of waiting when a GPU write still in flight
+  covers it (BufferCache::HasInFlightWriteAt). New perf.csv column srt_optional_unknown.
+  Same-process A/B (no crowd): FPS median 1.041, mean 1.067, 15/17 pairs; 39.5 -> 42.2 FPS. NOT ACCEPTED YET: that
+  run's frames were corrupted (next item). Bit 59 is NOT in DEFAULT_MASK.
+- NEW INTERMITTENT CORRUPTION (no-crowd arena, blocky tiles over the 3D scene) in 4 of 7 no-crowd runs today, with
+  bit 59 off too, and the same exe both corrupt and clean -> not caused by bit 59; cause unknown (suspects: stale-BDA
+  family / bit 58, the uncommitted stencil-storage prototype, game save state after last night's PGO training runs).
+  Crowd runs today and all no-crowd runs of last night were clean. ALWAYS check the run screenshots
+  (shots\0091s-macro.png, control-shots\*.png) before trusting an FPS number.
+- Tooling: start-run.ps1 / run-series.ps1 -ExtraEnv 'NAME=VALUE[,...]'; ab-exe.ps1 copies the matching .pdb;
+  srt_dirty_report.py; shader SPIR-V exports in handoff\2026-11-19\shaders-writers and shaders-readers.
+- Exes: D:\Projects\kyty-dev\exe (srtdirty*, bit59-842F4D72, bit59notls-B9F9700E = current tree, pgo1119-E486FE58).
+- Goal unchanged: 60 FPS in the fight (CP frame < 16.7 ms). Next: confirm bit 59 on clean runs (crowd + no crowd),
+  find the corruption trigger, then the remaining readback waits ('done' writes still waited for the 4 KiB window).
+
+2026-11-19 01:35 - PAUSED AT THE USER'S REQUEST (details: handoff\2026-11-18\HANDOFF.txt, last update 01:30)
+- No emulator running; windows-pgo exe restored to the optimized build 6C73079A (current working tree).
+- Working tree: handoff\2026-11-18\working-tree-20261119-0125.patch (uncommitted).
+- New PGO profile ready but NOT yet built or measured: D:\Projects\kyty-dev\pgo\20261119-intro-crowd+fight-nocrowd.profdata
+  (current builds still use pgo\20261030-235243-perf-pgo-fight.profdata). Next: rebuild windows-pgo with it,
+  then cross-run exe A/B (ab-exe.ps1) against exe\qtiming-6C73079A.exe.
+- Two TDRs (nvlddmkm 153) happened only with the INSTRUMENTED exe (01:15, 01:19); cause unknown; watch for them.
+
+2026-11-19 01:20 - LOOP STATUS (details: handoff\2026-11-18\HANDOFF.txt, updates 23:55 and 00:55):
+- ADOPTED (working tree): port of upstream 46213dfd9 + 657a94e72 (shorter SRT walkers) onto our SrtWalker.cpp,
+  keeping our LoadGuest/SRT_LOAD_CHECK. Cross-run exe A/B (crowd): +2-4% FPS, every port run faster.
+  Patch handoff\2026-11-18\upstream-srtwalker-657a94e7-46213dfd-local.patch.
+- New env-gated diagnostics: KYTY_READBACK_TIMING, KYTY_QUEUE_TIMING (start-run/run-series -ReadbackTiming).
+  Findings: readback waits are GPU execution of ~3 in-flight command buffers (~500 us per waiting readback),
+  not record-thread lag; async compute queues are only ~6% of the GPU thread.
+- FACT: fight frame times are vblank-quantized (p50 25.0 ms no crowd = 40 FPS, 33.3 ms crowd = 30 FPS);
+  60 FPS needs the CP frame < 16.7 ms: -32% without crowd, ~-48% with crowd.
+- Neutral: bit 8 EAGER_FLUSH_COARSE off (0.987). Upstream 3e226bff9/f4411bd15/449c7cce4/006e33bd5 do not
+  apply cleanly (manual port needed, small gains); left for the next upstream merge.
+- IN PROGRESS: fresh PGO profile (current profile is from 2026-10-30; much code changed since).
+  Instrumented build in _Build\windows-pgogen; profile runs next; then rebuild windows-pgo and exe A/B.
+- Exes kept in D:\Projects\kyty-dev\exe (copy the matching .pdb with an exe; see HANDOFF 00:55 note).
+
+2026-11-18 23:50 - GPU STALL ROOT CAUSE FIXED (uncommitted, AbSwitch bit 58 BDA_SYNC_ALL_WRITES, now in
+DEFAULT_MASK = 491701838748053327): BufferCache::QueueBdaSync ignored CPU writes to pages no BDA shader
+had accessed yet, so UFC 6's list-walk compute shader b059f33ca3077aac read stale memory and ran
+56-130 ms per dispatch (game watchdog "GPU Stopped Working", ~1 FPS for seconds). With bit 58: watchdog
+reports 0/9 runs (5/9 without), shader 1.25 ms/call (2.5-17 without), FPS A/B neutral (1.015).
+Exe e31a95eb...; patch handoff\2026-11-18\working-tree-20261118-bda58-default.patch.
+Upstream check 2026-11-18: origin/main f6c16fd95 (+74); full merge has 44 conflict hunks, not done;
+3 perf cherry-picks parked in worktree D:\Projects\kyty-upstream-merge (branch dev/upstream-merge-20261118).
+Re-check origin/main every few days (user request).
+FPS status: ~32.5 with crowd, ~43 without crowd (1280x720 output, vblank 120); still CP-bound.
+
+2026-11-18 SUMMARY: the intermittent stencil layout guard is identified (owner stencil is HTILE-compressed);
+guard widened, pending HTILE clear now an explicit exit. New stall diagnostic prints indirect draw args
+(GPU-visible + CPU backing) when KYTY_GPU_CHECKPOINTS (or KYTY_INDIRECT_NOTES=1) is on. Record-off run
+20261118-180532 ran 578 s without guard or stall (single run, not proof). All changes uncommitted;
+details in handoff\2026-11-18.
+
+2026-11-18 19:10: series of 4 long default-config runs: 3 clean, 1 STALL at the same filter draws
+(PS 26ec5a6f42265b1f/6869ba5373a429b9, indirect) -> stall is independent of the stencil change.
+(23:50: superseded - the stall episodes are the stale-BDA shader above, not the filter draws.)
+Series 2 was killed by low system RAM (not a game failure). Patch: handoff\2026-11-18\working-tree-20261118-1910.patch
+
+----- previous summary (2026-11-14 00:31), still valid unless contradicted above -----
+
+READ FIRST:
+docs/ufc6-rendering-investigation.md
+D:\Projects\kyty-dev\handoff\2026-11-13\HANDOFF.txt
+D:\Projects\kyty-dev\handoff\2026-11-13\investigation.json
+D:\Projects\kyty-dev\handoff\2026-11-13\STENCIL_STORAGE_PLAN.txt
+
+Current prototype IS implemented in 8 modified source/test files, UNCOMMITTED / NOT ACCEPTED.
+Do not discard it. It materializes R8 stencil storage in-place with private GPU transfer scratch,
+writeback, CPU coherence, sampled/storage rebinding and owner lifecycle handling.
+Native 3x2 partial-write / unchanged depth / CPU / LDS integrity / lifecycle tests pass (0 VUIDs).
+Functional full CTest passes; NOT a claim that the entire suite is Vulkan-validation clean.
+
+Live behavior remains mixed: a validated active fight reached 4:10 with attacks and clean image;
+one run hit unsupported-layout guard (predicate unknown); nonvalidation002439 GPU-stalled/crashed
+at225s, exit321. No accepted FPS improvement. No stable-fight / replay / 60FPS claim.
+
+CURRENT RUN: 20261114-003012-perf-stencil-private-record-off-checkpoints-20261114
+Game PID20880 (verify live/path before use); sampler PID51308.
+Record thread bit37 OFF, GPU checkpoints ON, validation OFF. Same887D8012 binary,
+FDD clean fight shader store; nativeE413 restored. Investigate stall before FPS optimization.
+
+The user selected Extra High; no switch tool used. No further escalation recommended yet.
+Use D: for all artifacts and TEMP/TMP. C>=5GiB/D>=10GiB launch guards remain.
+User v2 guide read; its implementation/hardware snapshot is partly stale; use actual logs.
+Origin fetched00:30:58ca8d1d7 remains integrated. Installed release unchanged; no push/deploy.

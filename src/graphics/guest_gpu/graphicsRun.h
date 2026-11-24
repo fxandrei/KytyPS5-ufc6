@@ -73,6 +73,7 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	bool              ProcessTimed(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 

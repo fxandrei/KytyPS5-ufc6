@@ -795,11 +795,12 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	using Clock       = std::chrono::steady_clock;
-	const auto period = Clock::duration(std::chrono::seconds(1)) / Config::GetVblankFrequency();
+	using Clock = std::chrono::steady_clock;
 
 	std::chrono::nanoseconds total_wait {};
 	while (!token.stop_requested()) {
+		// Read per vblank: KYTY_VBLANK_ALT can switch the rate at run time (emulatorConfig.cpp).
+		const auto period      = Clock::duration(std::chrono::seconds(1)) / Config::GetVblankFrequency();
 		const auto sleep_begin = Clock::now();
 		if (total_wait.count() > 0) {
 			Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));

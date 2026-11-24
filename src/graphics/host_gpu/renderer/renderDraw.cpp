@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPassStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1379,10 +1380,152 @@ void RenderExecutor::KeepTargetMemo(CommandBuffer& buffer, const DrawRenderState
 	memo.valid                = true;
 }
 
+namespace {
+
+// KYTY_DRAW_PREP=inline (agents/2026-11-20/parallel-cp-design.md, M2): each draw that reaches
+// GetGraphicsPrograms takes a copy of its registers, PipelineCache::PrepareGraphicsPrograms
+// prepares its programs from that copy without changing the cache, and the result is committed
+// after a certificate check; a refused draw takes the serial path. "parallel" (M3) is not
+// implemented yet and runs inline. KYTY_VERIFY_DRAW_PREP=1 implies inline, also runs the serial
+// path on a copy of every accepted draw's state and exits on the first difference.
+// Read once at startup; unset (the default) leaves the serial path alone.
+bool DrawPrepEnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+const bool g_verify_draw_prep = DrawPrepEnvFlag("KYTY_VERIFY_DRAW_PREP");
+const bool g_draw_prep_inline = g_verify_draw_prep || [] {
+	const char* value = std::getenv("KYTY_DRAW_PREP");
+	return value != nullptr && (std::strcmp(value, "inline") == 0 ||
+	                            std::strcmp(value, "parallel") == 0 || std::strcmp(value, "1") == 0);
+}();
+
+constexpr std::array<const char*, static_cast<size_t>(DrawPrepRefusal::Count)> DrawPrepRefusalNames {
+    "none", "tess", "mesh", "no_program", "skip", "call", "materialize", "no_module", "cert"};
+
+uint64_t DrawPrepNs(std::chrono::steady_clock::duration duration) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+}
+
+} // namespace
+
+struct RenderExecutor::DrawPrepState {
+	// The published draw: the register files the preparation reads instead of the live ones.
+	HW::Context     context;
+	HW::UserConfig  user_config;
+	HW::Shader      shaders;
+	// What the prepared draw state points into, valid until the next draw.
+	DrawProgramPrep prep;
+	// KYTY_VERIFY_DRAW_PREP: the serial path's result for the same draw.
+	DrawRenderState oracle;
+	uint64_t        draws      = 0;
+	uint64_t        accepted   = 0;
+	uint64_t        guarded    = 0; // accepted or not, read a page with GPU-written bytes
+	uint64_t        verified   = 0;
+	uint64_t        prepare_ns = 0;
+	uint64_t        serial_ns  = 0; // the oracle's GetGraphicsPrograms (verify only)
+	std::array<uint64_t, static_cast<size_t>(DrawPrepRefusal::Count)> refused {};
+};
+
+void RenderExecutor::DrawPrepStateDeleter::operator()(DrawPrepState* state) const noexcept {
+	delete state;
+}
+
+void RenderExecutor::PrepareProgramsInline(CommandBuffer& buffer, DrawRenderState& state) {
+	auto& cache = m_context.GetPipelineCache();
+	if (m_draw_prep == nullptr) [[unlikely]] {
+		m_draw_prep.reset(new DrawPrepState);
+		Log::WriteToConsoleAndLog(fmt::format("draw prep: inline{}\n",
+		                                      g_verify_draw_prep ? ", verified against the serial path" : ""));
+	}
+	auto& dp = *m_draw_prep;
+	// Publish: the draw's register snapshot. The preparation reads these copies, guest memory, the
+	// shader map and the program cache, nothing of the command buffer.
+	dp.context     = buffer.GetRegisters();
+	dp.user_config = buffer.GetUserConfig();
+	dp.shaders     = buffer.GetShaders();
+	// The only fields the caller set before the programs (BeginDrawState and the draw handler).
+	const auto topology          = state.topology;
+	const bool primitive_restart = state.primitive_restart_enable;
+	if (g_verify_draw_prep) {
+		dp.oracle = state;
+	}
+	const auto start    = std::chrono::steady_clock::now();
+	bool       accepted = cache.PrepareGraphicsPrograms(dp.context, dp.user_config, dp.shaders,
+	                                                    state, dp.prep);
+	dp.prepare_ns += DrawPrepNs(std::chrono::steady_clock::now() - start);
+	// Commit, in order: the certificate must still hold. Inline nothing runs in between; with a
+	// window (M3) other draws' commits do.
+	if (accepted && !PipelineCache::DrawPrepCertificateHolds(dp.prep)) {
+		dp.prep.refusal = DrawPrepRefusal::Certificate;
+		accepted        = false;
+	}
+	dp.draws++;
+	dp.guarded += dp.prep.guarded_loads != 0 ? 1u : 0u;
+	if (accepted) {
+		dp.accepted++;
+	} else {
+		dp.refused[static_cast<size_t>(dp.prep.refusal)]++;
+		// Back to the state the caller handed in: the pure path wrote only vertex_info[0],
+		// ps_input_info, mrt_mask and ps_active (tessellation is refused before it writes stages,
+		// so stages 1-2 are as BeginDrawState left them).
+		state.Reset(state.indirect_offsets, state.indirect_draw, false);
+		state.topology                 = topology;
+		state.primitive_restart_enable = primitive_restart;
+		cache.GetGraphicsPrograms(buffer, state);
+	}
+	if (accepted && g_verify_draw_prep) {
+		// The serial path on the copy, which also leaves the program cache as without the pure path.
+		const auto serial_start = std::chrono::steady_clock::now();
+		cache.GetGraphicsPrograms(buffer, dp.oracle);
+		dp.serial_ns += DrawPrepNs(std::chrono::steady_clock::now() - serial_start);
+		dp.verified++;
+		if (const char* field = DiffGraphicsPrograms(state, dp.oracle)) {
+			const auto module_id = [](const ShaderStageRuntime& stage) {
+				return stage.module != nullptr ? stage.module->id : 0;
+			};
+			EXIT("draw prep verify: draw %" PRIu64 " differs in %s (es 0x%016" PRIx64
+			     " gs 0x%016" PRIx64 " ps 0x%016" PRIx64 "; vs module %016" PRIx64 " / %016" PRIx64
+			     ", ps module %016" PRIx64 " / %016" PRIx64 ")\n",
+			     dp.draws, field, dp.shaders.GetVs().es_regs.data_addr,
+			     dp.shaders.GetVs().gs_regs.data_addr, dp.shaders.GetPs().ps_regs.data_addr,
+			     module_id(state.vertex_info[0].stage), module_id(dp.oracle.vertex_info[0].stage),
+			     module_id(state.ps_input_info.stage), module_id(dp.oracle.ps_input_info.stage));
+		}
+	}
+	if ((dp.draws & 0x3ffffu) == 0) [[unlikely]] {
+		std::string text = fmt::format(
+		    "draw prep: {} draws, {} accepted ({:.1f}%), {} read GPU-written pages; refused:", dp.draws,
+		    dp.accepted, 100.0 * static_cast<double>(dp.accepted) / static_cast<double>(dp.draws),
+		    dp.guarded);
+		for (size_t reason = 1; reason < dp.refused.size(); reason++) {
+			text += fmt::format(" {} {}", DrawPrepRefusalNames[reason], dp.refused[reason]);
+		}
+		text += fmt::format("; prepare {:.0f} ns/draw",
+		                    static_cast<double>(dp.prepare_ns) / static_cast<double>(dp.draws));
+		if (g_verify_draw_prep && dp.verified != 0) {
+			text += fmt::format("; serial {:.0f} ns/draw; {} verified, 0 mismatches",
+			                    static_cast<double>(dp.serial_ns) / static_cast<double>(dp.verified),
+			                    dp.verified);
+		}
+		text += '\n';
+		Log::WriteToConsoleAndLog(text);
+	}
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
+	// KYTY_SKIP_DRAW_* (measurement only): drop the draw before its programs are looked up.
+	if (DrawPassStats::Active() && DrawPassStats::SkipBeforePrograms(buffer)) [[unlikely]] {
+		return false;
+	}
 	m_context.GetImageHeap().BeginDraw();
-	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	if (g_draw_prep_inline) [[unlikely]] {
+		PrepareProgramsInline(buffer, state);
+	} else {
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	}
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
@@ -1917,6 +2060,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                   draw.instance_count, args_buffer.first != nullptr ? " indirect" : "",
 		                   mesh_active ? " mesh" : "", rendering.width, rendering.height);
 	});
+	if (args_buffer.first != nullptr && !mesh_task && CommandScheduler::IndirectNotesEnabled()) [[unlikely]] {
+		const auto* ps = state.ps_active ? state.ps_input_info.stage.module : nullptr;
+		scheduler.NoteIndirectDraw(args_buffer.first, args_buffer.second, emit.indirect.count,
+		                           emit.indirect.stride, draw.indexed,
+		                           state.vertex_info[0].stage.module->info.shader_hash,
+		                           ps != nullptr ? ps->info.shader_hash : 0);
+	}
+	if (CommandScheduler::HangDiagEnabled()) [[unlikely]] {
+		const auto* ps       = state.ps_active ? state.ps_input_info.stage.module : nullptr;
+		const bool  indirect = args_buffer.first != nullptr && !mesh_task;
+		scheduler.NoteHangWork('D', state.vertex_info[0].stage.module->info.shader_hash,
+		                       ps != nullptr ? ps->info.shader_hash : 0, rendering.width,
+		                       rendering.height, indirect ? 0u : draw.index_count,
+		                       indirect ? args_buffer.first : nullptr,
+		                       indirect ? args_buffer.second : 0, draw.indexed, indirect);
+	}
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1937,6 +2096,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	if (DrawPassStats::Active()) [[unlikely]] {
+		DrawPassStats::NoteDraw(buffer, state, m_targets, draw.index_count, draw.instance_count,
+		                        args_buffer.first != nullptr ? emit.indirect.count : 0u, mesh_active);
+	}
 
 	if (shader_write_stages) {
 		buffer.EndRendering();
@@ -1980,6 +2143,9 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	if (DrawPassStats::Active()) [[unlikely]] {
+		DrawPassStats::NoteCall();
+	}
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -2063,7 +2229,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count, args.first_instance};
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, state) ||
+	    (DrawPassStats::Active() && DrawPassStats::SkipResolved(buffer, state, m_targets))) {
 		ResetBindings();
 		return true;
 	}
@@ -2081,6 +2248,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	if (DrawPassStats::Active()) [[unlikely]] {
+		DrawPassStats::NoteCall();
+	}
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -2136,7 +2306,8 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return true;
 	}
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, state) ||
+	    (DrawPassStats::Active() && DrawPassStats::SkipResolved(buffer, state, m_targets))) {
 		ResetBindings();
 		return true;
 	}

@@ -1,5 +1,6 @@
 #include "kernel/fileSystem.h"
 
+#include "common/abSwitch.h"
 #include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -175,6 +176,30 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 		*last_reclen += static_cast<uint16_t>(dirents.size() - offset);
 	}
 	return dirents;
+}
+
+// AbSwitch GUEST_READ_BOUNCE: reads a host file into guest memory through a host buffer. The copy
+// into guest memory is an ordinary guest write: a page the GPU thread write-protected meanwhile
+// faults and is marked CPU-written again, where a host read straight into it would fail.
+static void ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes, uint32_t* bytes_read) {
+	if (!Common::AbSwitch::Enabled(Common::AbSwitch::GUEST_READ_BOUNCE)) {
+		f.Read(buf, nbytes, bytes_read);
+		return;
+	}
+	constexpr uint32_t                       Chunk = 4u << 20u;
+	static thread_local std::vector<uint8_t> bounce;
+	uint32_t                                 total = 0;
+	while (total < nbytes) {
+		const uint32_t request = std::min(Chunk, nbytes - total);
+		if (bounce.size() < request) bounce.resize(request);
+		uint32_t got = 0;
+		f.Read(bounce.data(), request, &got);
+		if (got == 0) break;
+		std::memcpy(static_cast<uint8_t*>(buf) + total, bounce.data(), got);
+		total += got;
+		if (got < request) break;
+	}
+	if (bytes_read != nullptr) *bytes_read = total;
 }
 
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
@@ -704,7 +729,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
@@ -832,7 +857,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
@@ -934,7 +959,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		ReadIntoGuest(file->f, buffer.iov_base, count, &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
 		bytes_read += bytes;
 		remaining -= bytes;

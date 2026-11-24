@@ -11,6 +11,7 @@
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/runtimeLinker.h"
+#include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -87,6 +88,10 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
+}
+
+namespace Libs::LibAmpr {
+void InitAmpr_1(Loader::SymbolDatabase* symbols);
 }
 
 namespace {
@@ -3781,6 +3786,74 @@ void TestAutomaticMemoryReuseAndAliases() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// An AMM command buffer driven through the library's exports.
+struct AmmCommandBuffer {
+	struct Result {
+		int32_t  result;
+		uint32_t error_offset;
+	};
+	const char*              test;
+	Loader::SymbolDatabase   symbols;
+	std::array<uint64_t, 3>  header {};
+	std::array<uint32_t, 16> data {};
+	uint32_t*                buffer;
+
+	explicit AmmCommandBuffer(const char* name, uint32_t* storage = nullptr)
+	    : test(name), buffer(storage != nullptr ? storage : data.data()) {
+		Libs::LibAmpr::InitAmpr_1(&symbols);
+		Find<int(KYTY_SYSV_ABI*)(void*)>("8aI7R7WaOlc")(header.data());
+		CheckOk(test,
+		        Find<int(KYTY_SYSV_ABI*)(void*, void*, uint32_t)>("N-FSPA4S3nI")(
+		            header.data(), buffer, sizeof(data)),
+		        "set AMM command buffer");
+	}
+	template <class Function>
+	Function Find(const char* nid) {
+		const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+		Check(test, symbol != nullptr, "AMM export does not resolve");
+		return reinterpret_cast<Function>(symbol->vaddr);
+	}
+	uint32_t Offset() {
+		return static_cast<uint32_t>(
+		    Find<uint64_t(KYTY_SYSV_ABI*)(void*)>("GnxKOHEawhk")(header.data()));
+	}
+	// Runs every appended command and reports each GPU range change.
+	Result Submit() {
+		Result   result {1234, 5678};
+		uint32_t submission = 0;
+		g_gpu_range_events.clear();
+		Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
+		CheckOk(test,
+		        Find<int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*)>(
+		            "OJf3vCckPAM")(buffer, Offset(), 0, &result, &submission),
+		        "submit AMM commands");
+		CheckOk(test, Find<int(KYTY_SYSV_ABI*)(uint32_t)>("HXymib4T8gc")(submission),
+		        "wait AMM commands");
+		Libs::LibKernel::Memory::TestSetGpuRangeCallback(nullptr);
+		return result;
+	}
+};
+
+// A submission runs the command buffer that owns the submitted buffer, even when that buffer
+// occupies the header storage of a command buffer that was never destroyed.
+void TestAmmSubmitReusedHeaderStorage() {
+	const char*      test  = "AmmSubmitReusedHeaderStorage";
+	uint64_t         value = 0;
+	AmmCommandBuffer abandoned(test);
+	const auto       write =
+	    abandoned.Find<int(KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint64_t, uint32_t)>(
+	        "j0+3uJMxYJY");
+	CheckOk(test, write(abandoned.header.data(), &value, 1, 0), "append abandoned writeAddress");
+
+	AmmCommandBuffer commands(test, reinterpret_cast<uint32_t*>(abandoned.header.data()));
+	CheckOk(test, write(commands.header.data(), &value, 2, 0), "append writeAddress");
+	CheckOk(test, write(commands.header.data(), &value, 3, 0), "append second writeAddress");
+	const auto result = commands.Submit();
+	Check(test, result.result == OK && result.error_offset == 0 && value == 3,
+	      "submission did not run the command buffer that owns the buffer");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestAutomaticMemoryFragmentedMap() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test   = "AutomaticMemoryFragmentedMap";
@@ -6043,6 +6116,7 @@ int main(int argc, char** argv) {
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
+	RunTest(TestAmmSubmitReusedHeaderStorage);
 	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);

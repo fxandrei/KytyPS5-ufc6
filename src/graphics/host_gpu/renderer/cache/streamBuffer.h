@@ -51,6 +51,7 @@ public:
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
+	[[nodiscard]] vk::MemoryPropertyFlags MemoryProperties() const;
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
         EXIT_IF(m_device_address == 0);
@@ -85,6 +86,10 @@ public:
 	size_t lru_id       = 0;
 	// The tick of this buffer's LRU entry, so a repeated touch skips the LRU lookup.
 	uint64_t lru_tick = 0;
+	// BufferCache (KYTY_UNMAP_TARGETED rule=use, KYTY_VERIFY_UNMAP_TARGETED): no older than the tick
+	// of the newest recorded GPU command that uses the buffer; BufferCache::PENDING_USE while a use
+	// waits for its draw or dispatch to be recorded (then it counts as the current tick).
+	uint64_t use_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

@@ -12,6 +12,11 @@
 #include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
 
+#include <atomic>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_file_t {
@@ -30,9 +35,26 @@ constexpr DWORD FILE_SHARE_POSIX = static_cast<DWORD>(FILE_SHARE_READ) |
 constexpr DWORD READ_WRITE_DELETE = static_cast<DWORD>(GENERIC_READ) |
                                     static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE);
 
+// A failed host read used to go unnoticed. ERROR_NOACCESS (998) means the destination had
+// inaccessible pages, e.g. guest pages the GPU thread write-protected while the read ran
+// (2026-11-20 corruption investigation).
+static void ReportHostReadFailure(const void* data, uint32_t size, DWORD read, DWORD error) {
+	static std::atomic<uint64_t> failures {0};
+	const auto                   count = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 50 || count % 1000 == 0) {
+		std::printf("host file read failed (%" PRIu64 "): error %lu, requested %u bytes, read %lu, "
+		            "buffer %p\n",
+		            count, static_cast<unsigned long>(error), size,
+		            static_cast<unsigned long>(read), data);
+		std::fflush(stdout);
+	}
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	DWORD r = 0;
-	ReadFile(f.handle, data, size, &r, nullptr);
+	if (ReadFile(f.handle, data, size, &r, nullptr) == FALSE) {
+		ReportHostReadFailure(data, size, r, GetLastError());
+	}
 	if (bytes_read != nullptr) {
 		*bytes_read = r;
 	}

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -188,7 +189,15 @@ public:
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value,
 	                                            uint64_t module_id      = 0,
-	                                            uint32_t resource_index = UINT32_MAX);
+	                                            uint32_t resource_index = UINT32_MAX,
+	                                            bool materialize_stencil_storage = true);
+	// ResolveTexture into an existing binding, which ends as a fresh one except that mip_views keeps
+	// its storage: the description (about 1.2 KB) is written once instead of being copied through
+	// the return value and an assignment.
+	void ResolveTextureInto(TextureBinding& out, const ShaderRecompiler::IR::ImageResource& resource,
+	                        const ShaderRecompiler::IR::DescriptorValue& value,
+	                        uint64_t module_id = 0, uint32_t resource_index = UINT32_MAX,
+	                        bool materialize_stencil_storage = true);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -216,6 +225,9 @@ private:
 	                                              const DrawIndirectArgs& indirect, bool tessellation);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
+	// KYTY_DRAW_PREP=inline: the programs of GetGraphicsPrograms from a register snapshot, prepared
+	// and committed in place, or the serial path for a refused draw (renderDraw.cpp).
+	void PrepareProgramsInline(CommandBuffer& buffer, DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, const DrawEmitInfo& emit,
 	                         const DrawIndexBufferSource& index_source);
@@ -279,10 +291,12 @@ private:
 	struct TexturePlanMemoEntry {
 		uint64_t                module_id      = 0;
 		uint32_t                resource_index = UINT32_MAX;
-		std::array<uint32_t, 7> resource_key {};
+		std::array<uint32_t, 9> resource_key {};
 		std::array<uint32_t, 8> fields {};
 		bool                    valid = false;
 		TextureResolvePlan      plan;
+		ImageId                 found_id;             // AbSwitch TEXTURE_IMAGE_MEMO
+		uint64_t                found_generation = 0; // 0: no reusable image
 	};
 	[[nodiscard]] TextureResolvePlan
 	BuildTextureResolvePlan(const ShaderRecompiler::IR::ImageResource& resource,
@@ -296,6 +310,7 @@ private:
 	std::array<ColorTargetMemo, 8>    m_color_target_memo;
 	DepthTargetMemo                   m_depth_target_memo;
 	std::vector<TexturePlanMemoEntry> m_texture_plan_memo;
+	std::vector<TexturePlanMemoEntry> m_texture_plan_memo_wide; // AbSwitch TEXTURE_MEMO_WIDE
 	uint64_t                          m_texture_plan_probe_calls = 0;
 	uint64_t                          m_texture_plan_probe_hits  = 0;
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
@@ -319,6 +334,13 @@ private:
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
+	// KYTY_DRAW_PREP: the register snapshot, the prepared outputs the draw state points into and
+	// the statistics; created on the first prepared draw (renderDraw.cpp).
+	struct DrawPrepState;
+	struct DrawPrepStateDeleter {
+		void operator()(DrawPrepState* state) const noexcept;
+	};
+	std::unique_ptr<DrawPrepState, DrawPrepStateDeleter> m_draw_prep;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

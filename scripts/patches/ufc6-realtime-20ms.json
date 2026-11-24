@@ -1,0 +1,23 @@
+{
+    "id":  "PPSA23566",
+    "version":  "01.005.000",
+    "process":  "eboot.bin",
+    "mods":  [
+                 {
+                     "name":  "EXPERIMENT UNVALIDATED: elapsed / 20ms, capped at 100ms; intermediate calibration, about 1.25x legacy elapsed/25ms at 20-40 FPS",
+                     "enabled":  false,
+                     "memory":  [
+                                    {
+                                        "offset":  "0x353db",
+                                        "off":  "4c89f84c29e0498946184c897b38",
+                                        "on":  "4c89f84c29e0e91aacfc0e909090"
+                                    },
+                                    {
+                                        "offset":  "0xf000000",
+                                        "off":  "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                                        "on":  "498946184c897b38498b4610483d002d31017e1b483d00e1f5057e05b800e1f50549f72eb9002d310148f7f9498906e9b55303f1"
+                                    }
+                                ]
+                 }
+             ]
+}

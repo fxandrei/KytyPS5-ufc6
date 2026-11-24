@@ -1,5 +1,6 @@
 #include "kernel/memory.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -15,7 +16,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -23,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <tuple>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -87,7 +92,68 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
+// Bumped by every guest map, unmap and protection change (AbSwitch SRT_PREWALK_MEMO revalidates
+// remembered guest addresses only while it is unchanged).
+static std::atomic<uint64_t> g_guest_map_epoch {1};
+
+uint64_t GuestMapEpoch() noexcept {
+	return g_guest_map_epoch.load(std::memory_order_acquire);
+}
+
+// KYTY_DIAG_IMAGE_LOSS=1 (2026-11-20 tile-corruption investigation): direct map (1), unmap (2) and
+// physical alias (3: the same direct memory at a second guest address) events. Guest threads only
+// store them - formatting text there overran a guest stack - and the GPU thread prints them
+// (DrainDirectMapEvents, from RenderContext::RunGarbageCollector).
+namespace {
+struct DirectMapEvent {
+	double   time;
+	uint64_t vaddr, phys, size, other;
+	uint32_t kind;
+};
+constexpr uint32_t                 DirectMapEventSlots = 8192;
+DirectMapEvent                     g_direct_map_events[DirectMapEventSlots];
+std::atomic<uint32_t>              g_direct_map_written {0};
+std::atomic<uint32_t>              g_direct_map_published {0};
+uint32_t                           g_direct_map_printed = 0;
+} // namespace
+
+static bool DirectMapDiagEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DIAG_IMAGE_LOSS");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+static void NoteDirectMapEvent(uint32_t kind, uint64_t vaddr, uint64_t phys, uint64_t size,
+                               uint64_t other = 0) noexcept {
+	if (!DirectMapDiagEnabled()) return;
+	// Map and Unmap run under g_memory_state_mutex: one writer at a time.
+	const auto index = g_direct_map_written.load(std::memory_order_relaxed);
+	if (index >= DirectMapEventSlots) return;
+	g_direct_map_events[index] = {
+	    std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(),
+	    vaddr, phys, size, other, kind};
+	g_direct_map_written.store(index + 1, std::memory_order_relaxed);
+	g_direct_map_published.store(index + 1, std::memory_order_release);
+}
+
+void DrainDirectMapEvents() noexcept {
+	if (!DirectMapDiagEnabled()) return;
+	const auto published = g_direct_map_published.load(std::memory_order_acquire);
+	for (; g_direct_map_printed < published; g_direct_map_printed++) {
+		const auto& event = g_direct_map_events[g_direct_map_printed];
+		static constexpr const char* Kinds[] = {"?", "map", "unmap", "alias", "mprotect"};
+		std::printf("dmem-%s t=%.3f va=0x%016" PRIx64 " phys=0x%016" PRIx64 " len=0x%" PRIx64
+		            " other_va=0x%016" PRIx64 "\n",
+		            Kinds[event.kind <= 4 ? event.kind : 0], event.time, event.vaddr, event.phys,
+		            event.size, event.other);
+	}
+	std::fflush(stdout);
+}
+
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
+	g_guest_map_epoch.fetch_add(1, std::memory_order_acq_rel);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
 #endif
@@ -98,6 +164,7 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
+	g_guest_map_epoch.fetch_add(1, std::memory_order_acq_rel);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
 #endif
@@ -868,10 +935,115 @@ bool TryReadGpuCleanBytes(uint64_t vaddr, void* data, uint64_t size) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->ReadCleanBytes(vaddr, data, size);
 }
 
+bool GpuWriteInFlightAt(uint64_t vaddr) noexcept {
+	return g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	       g_gpu_resources->GetBufferCache().HasInFlightWriteAt(vaddr);
+}
+
 void TraceGpuDirtyRead(const char* what, uint64_t vaddr) noexcept {
 	if (g_gpu_resources != nullptr) {
 		g_gpu_resources->TraceDirtyRead(what, vaddr);
 	}
+}
+
+bool SrtDirtyStatsEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_DIRTY_STATS");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+SrtDirtyCover SrtDirtyCoverAt(uint64_t vaddr) noexcept {
+	SrtDirtyCover cover;
+	if (g_gpu_resources == nullptr) {
+		return cover;
+	}
+	const auto write = g_gpu_resources->GetBufferCache().NewestCoveringWrite(vaddr);
+	if (write.end == 0) {
+		return cover;
+	}
+	cover.found  = true;
+	cover.size   = write.end - write.begin;
+	cover.offset = vaddr - write.begin;
+	cover.writer = write.writer;
+	cover.in_flight =
+	    write.tick > g_gpu_resources->GetCommandScheduler().GetMasterSemaphore().KnownGpuTick();
+	return cover;
+}
+
+void NoteSrtDirtyRead(const SrtDirtyCover& cover, const SrtDirtyRead& read) noexcept {
+	struct Entry {
+		uint64_t n = 0, changed = 0, unchanged = 0, waited = 0;
+		int64_t  wait_ns    = 0;
+		uint64_t min_offset = UINT64_MAX, max_offset = 0;
+		uint64_t sample_address = 0;
+		uint32_t sample_before = 0, sample_after = 0;
+	};
+	const bool    known_before = read.known_before;
+	const bool    changed      = read.before != read.after;
+	const int64_t wait_ns      = read.wait_ns;
+	// Writer shader, bit width of the covering write's size (0 = no recorded write), in flight,
+	// reader (walker) shader.
+	using Key = std::tuple<uint64_t, uint32_t, bool, uint64_t>;
+	static std::mutex           mutex;
+	static std::map<Key, Entry> entries;
+	static Entry                total;
+	static int64_t              window_start = 0;
+	const int64_t               now          = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+	std::lock_guard lock(mutex);
+	if (window_start == 0) {
+		window_start = now;
+	}
+	const uint32_t bucket = cover.found ? static_cast<uint32_t>(std::bit_width(cover.size)) : 0u;
+	auto&          entry  = entries[Key {cover.writer, bucket, cover.in_flight, read.reader}];
+	entry.sample_address  = read.address;
+	entry.sample_before   = read.before;
+	entry.sample_after    = read.after;
+	for (auto* e: {&entry, &total}) {
+		e->n++;
+		if (known_before) {
+			(changed ? e->changed : e->unchanged)++;
+		}
+		e->waited += wait_ns > 20000 ? 1 : 0;
+		e->wait_ns += wait_ns;
+		if (cover.found) {
+			e->min_offset = std::min(e->min_offset, cover.offset);
+			e->max_offset = std::max(e->max_offset, cover.offset);
+		}
+	}
+	if (now - window_start < 5'000'000'000) {
+		return;
+	}
+	const double s = static_cast<double>(now - window_start) / 1e9;
+	const double n = static_cast<double>(std::max<uint64_t>(total.n, 1));
+	std::printf("srt-dirty: %.1fs reads/s=%.1f changed=%.0f%% unchanged=%.0f%% waited/s=%.1f "
+	            "wait_ms/s=%.2f\n",
+	            s, static_cast<double>(total.n) / s, 100.0 * static_cast<double>(total.changed) / n,
+	            100.0 * static_cast<double>(total.unchanged) / n,
+	            static_cast<double>(total.waited) / s, static_cast<double>(total.wait_ns) / 1e6 / s);
+	std::vector<std::pair<Key, Entry>> sorted(entries.begin(), entries.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+		return a.second.wait_ns != b.second.wait_ns ? a.second.wait_ns > b.second.wait_ns
+		                                            : a.second.n > b.second.n;
+	});
+	for (size_t i = 0; i < sorted.size() && i < 16; i++) {
+		const auto& [key, e] = sorted[i];
+		std::printf("srt-dirty:   writer %016" PRIx64 " size<2^%u %s n/s=%.1f changed=%" PRIu64
+		            " unchanged=%" PRIu64 " waited/s=%.1f wait_ms/s=%.2f offsets 0x%" PRIx64
+		            "-0x%" PRIx64 " reader %016" PRIx64 " sample @0x%" PRIx64 " %08x->%08x\n",
+		            std::get<0>(key), std::get<1>(key), std::get<2>(key) ? "in-flight" : "done",
+		            static_cast<double>(e.n) / s, e.changed, e.unchanged,
+		            static_cast<double>(e.waited) / s, static_cast<double>(e.wait_ns) / 1e6 / s,
+		            e.min_offset == UINT64_MAX ? 0 : e.min_offset, e.max_offset, std::get<3>(key),
+		            e.sample_address, e.sample_before, e.sample_after);
+	}
+	std::fflush(stdout);
+	entries.clear();
+	total        = {};
+	window_start = now;
 }
 
 struct PrtAperture {
@@ -1209,6 +1381,13 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 
 	m_mappings.emplace_hint(next, vaddr, Mapping {phys_addr, len});
 	RemoveFreeRange(m_automatic_free, phys_addr, len);
+	NoteDirectMapEvent(1, vaddr, phys_addr, len);
+	for (const auto& [other_va, other]: m_mappings) {
+		if (DirectMapDiagEnabled() && other_va != vaddr && other.start_addr < phys_addr + len &&
+		    phys_addr < other.start_addr + other.size) {
+			NoteDirectMapEvent(3, vaddr, phys_addr, len, other_va);
+		}
+	}
 	return true;
 }
 
@@ -1301,6 +1480,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	}
 	const auto last = SplitMapping(end);
 	first           = SplitMapping(vaddr);
+	NoteDirectMapEvent(2, vaddr, first != m_mappings.end() ? first->second.start_addr : 0, size);
 	while (first != last) {
 		const auto removed = first->second;
 		first              = m_mappings.erase(first);
@@ -2886,6 +3066,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int ProtectMemory(const void* addr, size_t len, int prot) {
+	g_guest_map_epoch.fetch_add(1, std::memory_order_acq_rel);
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
 	LOGF("\t addr = 0x%016" PRIx64 "\n"
@@ -2911,10 +3092,19 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	    !g_guest_address_space->Owns(aligned_addr, aligned_len)) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	// AbSwitch MPROTECT_TRACKING: keep the GPU caches coherent before the host protection of these pages
+	// is replaced (outside g_memory_state_mutex: InvalidateMemory may wait for the GPU thread).
+	if (mode != VirtualMemory::Mode::NoAccess && g_gpu_resources != nullptr &&
+	    Common::AbSwitch::Enabled(Common::AbSwitch::MPROTECT_TRACKING)) {
+		(void)g_gpu_resources->InvalidateMemory(aligned_addr, aligned_len);
+	}
 	// Reserved ranges and holes have nothing to protect.
 	std::vector<VirtualRanges::Range> ranges;
 	g_virtual_ranges->QueryFragments(aligned_addr, aligned_len, &ranges);
 	std::lock_guard state(g_memory_state_mutex);
+	// KYTY_DIAG_IMAGE_LOSS: "dmem-mprotect va=<addr> phys=<guest prot> len=<bytes>" on the GPU thread.
+	NoteDirectMapEvent(4, aligned_addr, static_cast<uint64_t>(static_cast<uint32_t>(prot)), aligned_len,
+	                   static_cast<uint64_t>(mode));
 	for (const auto& range: ranges) {
 		if (!IsCommittedRangeType(range.type)) continue;
 		if (!g_guest_address_space->Protect(range.start, range.size, mode)) {

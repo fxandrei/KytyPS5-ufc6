@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPassStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -23,6 +24,7 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -263,11 +265,113 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+namespace {
+// KYTY_SRT_DIRTY_STATS=1 (diagnostic, 2026-11-19): WAIT_REG_MEM reads of GPU-written pages, split by
+// whether a write still in flight covers the waited bytes themselves or only other bytes of the
+// 4 KiB download window (then the fault's download waits longer than the value needs).
+struct WaitRegMemStats {
+	std::mutex mutex;
+	int64_t    window_start = 0;
+	uint64_t   n = 0, gpu_page = 0, exact = 0, window_only = 0, none = 0, clean_bytes = 0;
+	int64_t    wait_ns = 0, window_only_ns = 0;
+	int        samples = 0;
+};
+WaitRegMemStats g_wait_reg_mem_stats;
+
+int64_t NowNsDiag() noexcept {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+} // namespace
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
+	// A satisfied wait orders the game's earlier writes before what follows (BDA_SYNC_PER_SUBMIT).
+	m_renderer.RequestBdaSync();
 	if ((wait_op & ~1u) != 0) {
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
+	}
+
+	// AbSwitch WAIT_REG_MEM_BACKING: the waited bytes on a GPU-written page that the GPU did not write
+	// come from the backing store, like CP_READ_BACKING; the guest read would fault and download the
+	// 4 KiB window, waiting for every write still in flight to the rest of the page.
+	if (Common::AbSwitch::Enabled(Common::AbSwitch::WAIT_REG_MEM_BACKING)) {
+		auto&      buffers = m_renderer.GetBufferCache();
+		const auto vaddr   = reinterpret_cast<uint64_t>(addr);
+		T          value {};
+		if (buffers.IsRegionGpuModified(vaddr, sizeof(T)) &&
+		    !buffers.HasGpuDirtyBytes(vaddr, sizeof(T)) &&
+		    !m_renderer.GetTextureCache().HasPendingBackingPublish() &&
+		    LibKernel::Memory::TryReadBacking(vaddr, &value, sizeof(T))) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::WaitRegMemBacking);
+			if (!TestWaitRegMemValue(value, ref, mask, func)) {
+				SuspendPm4();
+			}
+			return;
+		}
+	}
+
+	if (LibKernel::Memory::SrtDirtyStatsEnabled()) [[unlikely]] {
+		auto&          buffers = m_renderer.GetBufferCache();
+		const auto     vaddr   = reinterpret_cast<uint64_t>(addr);
+		const bool     gpu     = buffers.IsRegionGpuModified(vaddr, sizeof(T));
+		const bool     dirty   = gpu && buffers.HasGpuDirtyBytes(vaddr, sizeof(T));
+		const auto     page    = vaddr & ~uint64_t {4095};
+		const auto     ticks   = gpu ? buffers.DiagInFlightTicks(vaddr, sizeof(T), page, page + 4096)
+		                             : BufferCache::InFlightTicks {};
+		const int64_t  start   = NowNsDiag();
+		const T        value   = *addr;
+		const int64_t  end     = NowNsDiag();
+		auto&          s       = g_wait_reg_mem_stats;
+		std::scoped_lock lock(s.mutex);
+		if (s.window_start == 0) s.window_start = start;
+		s.n++;
+		s.wait_ns += end - start;
+		if (gpu) {
+			s.gpu_page++;
+			if (!dirty) {
+				s.clean_bytes++;
+			}
+			if (ticks.exact != 0) {
+				s.exact++;
+			} else if (ticks.window != 0) {
+				s.window_only++;
+				s.window_only_ns += end - start;
+			} else {
+				s.none++;
+			}
+			if (s.samples < 30 && (ticks.exact != 0 || ticks.window != 0)) {
+				s.samples++;
+				std::printf("wait-reg-mem-sample: addr 0x%" PRIx64 " func %u ref 0x%" PRIx64
+				            " value 0x%" PRIx64 " dirty %d exact_tick %" PRIu64
+				            " window_tick %" PRIu64 " known %" PRIu64 " writer %016" PRIx64
+				            " wait_us %.1f\n",
+				            vaddr, func, static_cast<uint64_t>(ref), static_cast<uint64_t>(value),
+				            dirty ? 1 : 0, ticks.exact, ticks.window, ticks.known, ticks.writer,
+				            static_cast<double>(end - start) / 1e3);
+			}
+		}
+		if (end - s.window_start >= 5'000'000'000) {
+			const double sec = static_cast<double>(end - s.window_start) / 1e9;
+			std::printf("wait-reg-mem: %.1fs n/s=%.0f gpu_page/s=%.0f exact_inflight/s=%.0f "
+			            "window_only/s=%.0f none/s=%.0f clean_bytes/s=%.0f wait_ms/s=%.2f "
+			            "window_only_wait_ms/s=%.2f\n",
+			            sec, static_cast<double>(s.n) / sec, static_cast<double>(s.gpu_page) / sec,
+			            static_cast<double>(s.exact) / sec, static_cast<double>(s.window_only) / sec,
+			            static_cast<double>(s.none) / sec, static_cast<double>(s.clean_bytes) / sec,
+			            static_cast<double>(s.wait_ns) / 1e6 / sec,
+			            static_cast<double>(s.window_only_ns) / 1e6 / sec);
+			std::fflush(stdout);
+			s.n = s.gpu_page = s.exact = s.window_only = s.none = s.clean_bytes = 0;
+			s.wait_ns = s.window_only_ns = 0;
+			s.window_start = end;
+		}
+		if (!TestWaitRegMemValue(value, ref, mask, func)) {
+			SuspendPm4();
+		}
+		return;
 	}
 
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
@@ -551,7 +655,63 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+namespace {
+// KYTY_QUEUE_TIMING=1 (diagnostic, 2026-11-19): GPU thread time per guest queue kind (graphics
+// ring vs. async compute queues), printed every 5 s as "queue-timing:".
+struct QueueTiming {
+	bool    enabled = [] {
+        const char* value = std::getenv("KYTY_QUEUE_TIMING");
+        return value != nullptr && *value == '1';
+	}();
+	int64_t window_start = 0;
+	int64_t gfx_ns = 0, compute_ns = 0, other_ns = 0;
+	uint64_t gfx_slices = 0, compute_slices = 0;
+	static int64_t Now() noexcept {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		           std::chrono::steady_clock::now().time_since_epoch())
+		    .count();
+	}
+	void Add(bool commands, uint32_t queue_id, int64_t start, int64_t end) noexcept {
+		if (window_start == 0) window_start = start;
+		if (!commands) {
+			other_ns += end - start;
+		} else if (queue_id == 0) {
+			gfx_ns += end - start;
+			gfx_slices++;
+		} else {
+			compute_ns += end - start;
+			compute_slices++;
+		}
+		if (end - window_start >= 5'000'000'000) {
+			const double s = static_cast<double>(end - window_start) / 1e9;
+			std::printf("queue-timing: %.1fs gfx_ms/s=%.1f compute_ms/s=%.1f other_ms/s=%.1f "
+			            "gfx_slices/s=%.0f compute_slices/s=%.0f\n",
+			            s, static_cast<double>(gfx_ns) / 1e6 / s,
+			            static_cast<double>(compute_ns) / 1e6 / s,
+			            static_cast<double>(other_ns) / 1e6 / s,
+			            static_cast<double>(gfx_slices) / s,
+			            static_cast<double>(compute_slices) / s);
+			std::fflush(stdout);
+			gfx_ns = compute_ns = other_ns = 0;
+			gfx_slices = compute_slices = 0;
+			window_start = end;
+		}
+	}
+};
+QueueTiming g_queue_timing;
+} // namespace
+
 bool GuestGpu::Process(Submission& submission) {
+	const int64_t timing_start = g_queue_timing.enabled ? QueueTiming::Now() : 0;
+	const bool    result       = ProcessTimed(submission);
+	if (g_queue_timing.enabled) [[unlikely]] {
+		g_queue_timing.Add(submission.type == SubmissionType::Commands, submission.queue_id,
+		                   timing_start, QueueTiming::Now());
+	}
+	return result;
+}
+
+bool GuestGpu::ProcessTimed(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 	// Game threads wrote what this slice reads before submitting it, or before the wait it resumes
@@ -623,9 +783,144 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// M0 of agents/2026-11-20/parallel-cp-design.md (measurement only, KYTY_CP_WINDOW_STATS=1): how many
+// draws sit between two "fences" (packets a prepare-ahead window could not cross) on the graphics
+// queue. Every 10 s the GPU thread prints the draw-weighted histogram of window lengths, for the
+// plain window (closed by every non-register packet) and the M5 variant (not closed by RELEASE_MEM,
+// EVENT_WRITE, ACQUIRE_MEM or dispatches), plus the packets that closed windows most often.
+namespace {
+
+struct CpWindowStats {
+	static constexpr uint32_t BUCKETS = 6; // window length 1, 2-3, 4-7, 8-15, 16-31, 32+
+	uint64_t draws = 0, dispatches = 0, windows = 0, m5_windows = 0;
+	uint64_t len_draws[BUCKETS] {}, m5_len_draws[BUCKETS] {};
+	uint64_t closers[0x140] {};
+	uint32_t open = 0, m5_open = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+
+	static uint32_t Bucket(uint32_t l) {
+		uint32_t b = 0;
+		while (b + 1 < BUCKETS && l >= (2u << b)) b++;
+		return b;
+	}
+	void CloseWindow() {
+		if (open != 0) {
+			len_draws[Bucket(open)] += open;
+			windows++;
+		}
+		open = 0;
+	}
+	void CloseM5() {
+		if (m5_open != 0) {
+			m5_len_draws[Bucket(m5_open)] += m5_open;
+			m5_windows++;
+		}
+		m5_open = 0;
+	}
+	void Packet(uint32_t header, uint32_t opcode) {
+		switch (opcode) {
+			case Pm4::IT_DRAW_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDIRECT_MULTI:
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+			case Pm4::IT_DRAW_INDEX_MULTI_INST:
+			case Pm4::IT_DISPATCH_DRAW:
+				draws++;
+				open++;
+				m5_open++;
+				return;
+			case Pm4::IT_SET_CONFIG_REG:
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_QUEUE_REG:
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX:
+			case Pm4::IT_INDEX_BUFFER_SIZE:
+			case Pm4::IT_INDEX_BASE:
+			case Pm4::IT_INDEX_TYPE:
+			case Pm4::IT_NUM_INSTANCES:
+			case Pm4::IT_CONTEXT_CONTROL:
+			case Pm4::IT_CLEAR_STATE:
+			case Pm4::IT_SET_BASE:
+			case Pm4::IT_INDIRECT_BUFFER:
+				return;
+			case Pm4::IT_NOP: {
+				const auto r = KYTY_PM4_R(header);
+				if (r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER) return;
+				closers[0x100 + (r & 0x3f)]++;
+				CloseWindow();
+				CloseM5();
+				return;
+			}
+			default: break;
+		}
+		closers[opcode & 0xff]++;
+		CloseWindow();
+		const bool dispatch     = opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_DISPATCH_INDIRECT;
+		const bool m5_crossable = opcode == Pm4::IT_RELEASE_MEM || opcode == Pm4::IT_EVENT_WRITE ||
+		                          opcode == Pm4::IT_ACQUIRE_MEM || dispatch ||
+		                          // M5 here also crosses register writes from memory (clean in the common case).
+		                          opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+		                          opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT;
+		if (dispatch) dispatches++;
+		if (!m5_crossable) CloseM5();
+	}
+	double Pct(const uint64_t* h, uint32_t b) const {
+		return draws != 0 ? 100.0 * static_cast<double>(h[b]) / static_cast<double>(draws) : 0.0;
+	}
+	void EndOfStream() {
+		CloseWindow();
+		CloseM5();
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last < std::chrono::seconds(10)) return;
+		std::printf("cp-window: draws %" PRIu64 " dispatches %" PRIu64 " windows %" PRIu64
+		            " (%.2f draws/window) ge4 %.1f%% | len1 %.1f 2-3 %.1f 4-7 %.1f 8-15 %.1f 16-31 %.1f "
+		            "32+ %.1f | M5 windows %" PRIu64 " ge4 %.1f%% | 1 %.1f 2-3 %.1f 4-7 %.1f 8-15 %.1f "
+		            "16-31 %.1f 32+ %.1f\n",
+		            draws, dispatches, windows,
+		            windows != 0 ? static_cast<double>(draws) / static_cast<double>(windows) : 0.0,
+		            Pct(len_draws, 2) + Pct(len_draws, 3) + Pct(len_draws, 4) + Pct(len_draws, 5),
+		            Pct(len_draws, 0), Pct(len_draws, 1), Pct(len_draws, 2), Pct(len_draws, 3),
+		            Pct(len_draws, 4), Pct(len_draws, 5), m5_windows,
+		            Pct(m5_len_draws, 2) + Pct(m5_len_draws, 3) + Pct(m5_len_draws, 4) + Pct(m5_len_draws, 5),
+		            Pct(m5_len_draws, 0), Pct(m5_len_draws, 1), Pct(m5_len_draws, 2), Pct(m5_len_draws, 3),
+		            Pct(m5_len_draws, 4), Pct(m5_len_draws, 5));
+		std::array<std::pair<uint64_t, uint32_t>, 0x140> top {};
+		for (uint32_t i = 0; i < 0x140; i++) top[i] = {closers[i], i};
+		std::partial_sort(top.begin(), top.begin() + 12, top.end(),
+		                  [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::printf("cp-window closers:");
+		for (uint32_t i = 0; i < 12 && top[i].first != 0; i++) {
+			if (top[i].second >= 0x100) {
+				std::printf(" nop_r%02x=%" PRIu64, top[i].second - 0x100, top[i].first);
+			} else {
+				std::printf(" op%02x=%" PRIu64, top[i].second, top[i].first);
+			}
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+		*this = CpWindowStats {};
+		last  = now;
+	}
+};
+
+CpWindowStats* CpWindowStatsInstance() {
+	static CpWindowStats* const instance = []() -> CpWindowStats* {
+		const char* v = std::getenv("KYTY_CP_WINDOW_STATS");
+		return v != nullptr && std::atoi(v) != 0 ? new CpWindowStats {} : nullptr;
+	}();
+	return instance;
+}
+
+} // namespace
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	// Two config reads per packet only to decide whether to log it.
-	const bool debug_dump = graphics_debug_dump_enabled();
+	const bool  debug_dump   = graphics_debug_dump_enabled();
+	auto* const window_stats = IsAsyncComputeQueue() ? nullptr : CpWindowStatsInstance();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
 			g_gpu_state->ProcessCommands();
@@ -665,6 +960,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		if (window_stats != nullptr) [[unlikely]] {
+			window_stats->Packet(packet_header, opcode);
+		}
 
 		// The draw chain (AbSwitch DRAW_CHAIN) keeps a draw's render targets for the next draw
 		// while the registers they resolve from cannot change: these packets leave those
@@ -692,6 +990,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
+			if (window_stats != nullptr) {
+				window_stats->CloseWindow();
+				window_stats->CloseM5();
+			}
 			return;
 		}
 		cursor.offset_dw += packet_dw;
@@ -705,6 +1007,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			execution.m_next_buffer = {};
 		}
+	}
+	if (window_stats != nullptr) {
+		window_stats->EndOfStream();
 	}
 }
 
@@ -1146,6 +1451,20 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
 			m_renderer.RequestBdaSync();
+			// GDS remains mapped even when guest buffers use staging. Make its writes visible
+			// to the CPU here instead of relying on the BAR path's blanket submit barrier.
+			auto& command = GetScheduler().Current();
+			command.EndRendering();
+			vk::BufferMemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+			barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer = m_renderer.GetBufferCache().GetGdsBuffer()->Handle();
+			barrier.offset = 0;
+			barrier.size = VK_WHOLE_SIZE;
+			command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                                 vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+			                                 1, &barrier, 0, nullptr);
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
@@ -1257,6 +1576,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
+	if (DrawPassStats::Active()) [[unlikely]] {
+		DrawPassStats::NoteFlip();
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1272,6 +1594,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	if (DrawPassStats::Active()) [[unlikely]] {
+		DrawPassStats::NoteFlip();
+	}
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(

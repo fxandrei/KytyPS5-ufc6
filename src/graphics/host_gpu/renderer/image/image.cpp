@@ -487,18 +487,28 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 	return static_cast<uint32_t>(std::min<uint64_t>(rows, capacity / row_size));
 }
 
-void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
+void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler, bool stencil) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
-	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto     source_bytes      = DepthAspectTransferBytes(source.backing.format) != 0
+	const auto transfer_aspect = [stencil](vk::Format format) {
+		const auto aspects = FullAspectMask(format);
+		return stencil && (aspects & vk::ImageAspectFlagBits::eStencil)
+		           ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eStencil}
+		           : aspects & ~vk::ImageAspectFlagBits::eStencil;
+	};
+	const auto source_aspect = transfer_aspect(source.backing.format);
+	const auto destination_aspect = transfer_aspect(backing.format);
+	if (stencil) {
+		EXIT_IF((source_aspect != vk::ImageAspectFlagBits::eStencil &&
+		         source.backing.format != vk::Format::eR8Uint) ||
+		        (destination_aspect != vk::ImageAspectFlagBits::eStencil &&
+		         backing.format != vk::Format::eR8Uint));
+	}
+	const auto     source_bytes      = stencil ? 1u : DepthAspectTransferBytes(source.backing.format) != 0
 	                                       ? DepthAspectTransferBytes(source.backing.format)
 	                                       : source.info.bytes_per_block;
-	const auto     destination_bytes = DepthAspectTransferBytes(backing.format) != 0
+	const auto     destination_bytes = stencil ? 1u : DepthAspectTransferBytes(backing.format) != 0
 	                                       ? DepthAspectTransferBytes(backing.format)
 	                                       : info.bytes_per_block;
 	const uint32_t source_block      = source.info.IsBlock() ? 4u : 1u;
@@ -523,6 +533,14 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	// The utility allocation can previously have served as shader shared memory.
+	// Order only this scratch buffer, including its earlier shader accesses.
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	barrier.size = buffer.Size();
+	command.pipelineBarrier2(dependency);
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
 	for (uint32_t level = 0; level < levels; level++) {
 		// As in CopyImage: overlapping cache images can differ in size, and copying the source
 		// extent into a smaller destination writes out of bounds and loses the device. UFC 6 at a
@@ -591,6 +609,12 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 			}
 		}
 	}
+	// Return the scratch allocation to arbitrary shader/transfer users, including LDS.
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.size = buffer.Size();
+	command.pipelineBarrier2(dependency);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
@@ -727,6 +751,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	if (info.pixel_format == vk::Format::eUndefined) {
 		return;
 	}
+	CreateBacking();
+}
+
+void Image::CreateBacking() {
+	EXIT_IF(backing.image != nullptr || info.pixel_format == vk::Format::eUndefined);
+	auto& graphics = m_graphics;
 
 	vk::ImageCreateInfo create {};
 	create.usage         = ImageUsageFlags(graphics, info);

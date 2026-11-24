@@ -43,6 +43,33 @@ enum class Counter {
 	WrittenBindingBytes,
 	DirtyReadsUnchanged, // A read that waited for GPU-dirty bytes found guest memory unchanged.
 	DirtyReadsChanged,   // ... found that the GPU had changed them.
+	SrtOptionalUnknown,  // Condition-only walker loads that read as unknown (AbSwitch bit 59).
+	WaitRegMemBacking,   // WAIT_REG_MEM values read from the backing store (AbSwitch bit 60).
+	SrtMemoCalls,        // Materializations with an eligible L1 SRT memo (AbSwitch SRT_REFRESH_MEMO).
+	SrtMemoHits,         // ... that reused the previous result.
+	SrtPrewalkHits,      // ... that also skipped the walk (AbSwitch SRT_PREWALK_MEMO).
+	SrtPrewalkNoRecord,  // Prewalk-eligible materializations without a usable record,
+	SrtPrewalkEpochMiss, // ... after a guest map change,
+	SrtPrewalkUserDataMiss, // ... with different walker user data, shader base or workgroups,
+	SrtPrewalkWatchedMiss,  // ... reading a page with GPU-written bytes,
+	SrtPrewalkValueMiss,    // ... with a different loaded DWORD.
+	SrtPrewalkNotRecorded,  // Walks not recorded (unknown/skipped loads, GPU-written page).
+	TexturePlanMemoHits,    // Sampled texture plans reused (TEXTURE_PLAN_MEMO / TEXTURE_MEMO_WIDE).
+	TexturePlanMemoMisses,
+	TextureInfoMemoHits,    // Texture image layouts reused (TEXTURE_INFO_MEMO).
+	TextureInfoMemoMisses,
+	ReadFastHits,       // Read-only buffer bindings that skipped SynchronizeBuffer (bit 44).
+	ReadFastMisses,     // ... that had CPU-written pages to upload (bit 44 on).
+	ReadFastImageSyncs, // Fast-path texel bindings that still searched for an image (bit 44).
+	ComputeHintHits,     // Compute program lookups its shader's slot answered (KYTY_COMPUTE_HINT).
+	ComputeHintStageHits, // ... hits the per-stage hint (KYTY_PROGRAM_HINT) would have answered too.
+	ComputeHintMisses,   // ... that searched the program cache (slot empty, collision or new key).
+	ComputePipeMemoHits, // Compute pipelines found in their module's slot (KYTY_COMPUTE_HINT).
+	DispatchesTiny,      // Direct dispatches of one 1x1x1 workgroup (counted in Dispatches too).
+	DispatchNs,          // GPU-thread time in dispatches after the lock (KYTY_DISPATCH_TIMING=1).
+	DispatchProgramNs,   // ... of recorded ones: up to the end of GetComputeProgram.
+	DispatchBindNs,      // ... then fill checks, pipeline lookup, binding preparation.
+	DispatchCommitNs,    // ... then CommitBindings to the end (barriers, bind, dispatch).
 	TextureRefreshesGpu, // Bytes of images refreshed after a GPU buffer write over them.
 	TextureRefreshesCpu, // Bytes of images refreshed after guest CPU writes.
 	GpuBusyNs,           // GPU execution time of command buffers, from timestamps.

@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <mutex>
 #include <set>
 #include <smmintrin.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -63,6 +65,25 @@ void ReadWriteCombined(const uint8_t* source, uint64_t size, Sink&& sink) {
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
+
+// KYTY_VERIFY_READ_FAST_PATH (AbSwitch READ_BINDING_FAST_PATH), read once at startup so the hot path
+// tests no static guard.
+const bool g_verify_read_fast_path = std::getenv("KYTY_VERIFY_READ_FAST_PATH") != nullptr;
+
+// KYTY_VERIFY_READ_FAST_PATH: checked fast-path decisions, and those a CPU write overtook before the
+// full path ran (the race UPLOAD_PRECHECK accepts: the write is for later commands). GPU thread only.
+void NoteReadFastPathVerify(bool overtaken) {
+	static uint64_t checked = 0;
+	static uint64_t late    = 0;
+	++checked;
+	late += overtaken ? 1u : 0u;
+	if ((checked & 0xfffffu) == 0) {
+		std::printf("read-fast-path verify: %" PRIu64 " checked, %" PRIu64
+		            " overtaken by a CPU write, 0 mismatches\n",
+		            checked, late);
+		std::fflush(stdout);
+	}
+}
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                           StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -104,6 +125,50 @@ void TraceWrittenBinding(uint64_t vaddr, uint64_t size) {
 	            size / 1024);
 }
 
+// KYTY_SRT_DIRTY_STATS (diagnostic, 2026-11-19): shader-written bindings by writer shader.
+void NoteWrittenBindingStats(uint64_t writer, uint64_t size) {
+	struct Entry {
+		uint64_t n = 0, bytes = 0, max = 0;
+	};
+	static std::mutex                          mutex;
+	static std::unordered_map<uint64_t, Entry> entries;
+	static Entry                               total;
+	static int64_t                             window_start = 0;
+	const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	std::scoped_lock lock(mutex);
+	if (window_start == 0) {
+		window_start = now;
+	}
+	for (auto* e: {&entries[writer], &total}) {
+		e->n++;
+		e->bytes += size;
+		e->max = std::max(e->max, size);
+	}
+	if (now - window_start < 5'000'000'000) {
+		return;
+	}
+	const double s = static_cast<double>(now - window_start) / 1e9;
+	std::printf("write-stats: %.1fs bindings/s=%.0f MB/s=%.0f max_kib=%" PRIu64 "\n", s,
+	            static_cast<double>(total.n) / s, static_cast<double>(total.bytes) / 1e6 / s,
+	            total.max / 1024);
+	std::vector<std::pair<uint64_t, Entry>> sorted(entries.begin(), entries.end());
+	std::sort(sorted.begin(), sorted.end(),
+	          [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+	for (size_t i = 0; i < sorted.size() && i < 12; i++) {
+		const auto& [hash, e] = sorted[i];
+		std::printf("write-stats:   writer %016" PRIx64 " n/s=%.1f MB/s=%.1f avg_kib=%.1f "
+		            "max_kib=%" PRIu64 "\n",
+		            hash, static_cast<double>(e.n) / s, static_cast<double>(e.bytes) / 1e6 / s,
+		            static_cast<double>(e.bytes) / 1024.0 / static_cast<double>(e.n), e.max / 1024);
+	}
+	std::fflush(stdout);
+	entries.clear();
+	total        = {};
+	window_start = now;
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -141,6 +206,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 		dependency.pBufferMemoryBarriers = &after;
 		command.pipelineBarrier2(dependency);
+		NoteRecordedUse(buffer);
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -204,7 +270,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 void BufferCache::RecordGpuWrite(uint64_t vaddr, uint64_t size) {
 	auto& slot           = m_gpu_writes[m_next_gpu_write];
 	m_evicted_write_tick = std::max(m_evicted_write_tick, slot.tick);
-	slot                 = {vaddr, vaddr + size, m_scheduler.CurrentTick()};
+	slot                 = {vaddr, vaddr + size, m_scheduler.CurrentTick(), diag_writer};
 	m_next_gpu_write     = (m_next_gpu_write + 1) % GPU_WRITE_RING;
 	if (m_next_gpu_write == m_first_unretagged) {
 		// More than a ring of writes without a draw: the oldest unretagged one was just evicted.
@@ -219,6 +285,113 @@ void BufferCache::RetagGpuWrites() {
 		m_gpu_writes[slot].tick = std::max(m_gpu_writes[slot].tick, tick);
 	}
 	m_first_unretagged = m_next_gpu_write;
+	// The uses noted since the last call were recorded by now, at this tick or earlier. A reused
+	// slot's new buffer only gets a later tick than needed.
+	for (const auto id: m_pending_uses) {
+		if (auto* buffer = m_slot_buffers.try_get(id);
+		    buffer != nullptr && buffer->use_tick == PENDING_USE) {
+			buffer->use_tick = tick;
+		}
+	}
+	m_pending_uses.clear();
+	if (std::exchange(m_bda_pending, false)) {
+		m_bda_tick = tick;
+	}
+}
+
+void BufferCache::NoteRecordedUse(Buffer& buffer) {
+	if (m_track_uses && buffer.use_tick != PENDING_USE) {
+		buffer.use_tick = std::max(buffer.use_tick, m_scheduler.CurrentTick());
+	}
+}
+
+uint64_t BufferCache::NewestUseTick(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	const auto current = m_scheduler.CurrentTick();
+	const auto end     = vaddr + size;
+	uint64_t   tick    = 0;
+	bool       found   = false;
+	auto       it      = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() <= vaddr) {
+			continue;
+		}
+		found = true;
+		tick  = std::max({tick, buffer.use_tick == PENDING_USE ? current : buffer.use_tick,
+		                  buffer.LastGpuWriteTick()});
+	}
+	if (!found) {
+		return 0;
+	}
+	if (!m_track_uses) {
+		return current;
+	}
+	// A BDA program can address every registered buffer.
+	return std::min(current, std::max(tick, m_bda_pending ? current : m_bda_tick));
+}
+
+bool BufferCache::HasInFlightWriteAt(uint64_t vaddr) const {
+	const auto known = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	if (m_evicted_write_tick > known) {
+		return true; // A write that left the ring may still be running.
+	}
+	// Newest first; ticks never decrease from oldest to newest, so the first completed write ends
+	// the search: it and every older one are done.
+	for (size_t i = 0; i < GPU_WRITE_RING; i++) {
+		const auto& write =
+		    m_gpu_writes[(m_next_gpu_write + GPU_WRITE_RING - 1 - i) % GPU_WRITE_RING];
+		if (write.tick <= known) {
+			return false;
+		}
+		if (write.begin <= vaddr && vaddr < write.end) {
+			return true;
+		}
+	}
+	return true;
+}
+
+BufferCache::InFlightTicks BufferCache::DiagInFlightTicks(uint64_t vaddr, uint64_t size,
+                                                          uint64_t window_begin,
+                                                          uint64_t window_end) const {
+	InFlightTicks result;
+	result.known = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	for (size_t i = 0; i < GPU_WRITE_RING; i++) {
+		const auto& write =
+		    m_gpu_writes[(m_next_gpu_write + GPU_WRITE_RING - 1 - i) % GPU_WRITE_RING];
+		if (write.tick <= result.known) {
+			break;
+		}
+		if (write.begin < vaddr + size && vaddr < write.end) {
+			if (result.exact == 0) {
+				result.writer = write.writer;
+			}
+			result.exact = std::max(result.exact, write.tick);
+		}
+		if (write.begin < window_end && window_begin < write.end) {
+			result.window = std::max(result.window, write.tick);
+		}
+	}
+	return result;
+}
+
+BufferCache::CoveringWrite BufferCache::NewestCoveringWrite(uint64_t vaddr) const {
+	for (size_t i = 0; i < GPU_WRITE_RING; i++) {
+		const auto& write =
+		    m_gpu_writes[(m_next_gpu_write + GPU_WRITE_RING - 1 - i) % GPU_WRITE_RING];
+		if (write.end == 0) {
+			break; // Never used: the ring has not wrapped yet.
+		}
+		if (write.begin <= vaddr && vaddr < write.end) {
+			return {write.begin, write.end, write.tick, write.writer};
+		}
+	}
+	return {};
 }
 
 uint64_t BufferCache::ReadbackWriteTick(const Buffer& buffer, uint64_t buffer_address,
@@ -309,14 +482,27 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_READBACK)) {
 			{
 			KYTY_PROFILER_BLOCK("Readback: direct wait and priority completion");
-			if (write_tick >= m_scheduler.CurrentTick()) {
+			const bool     timing   = CommandScheduler::ReadbackTimingEnabled();
+			const int64_t  start_ns = timing ? CommandScheduler::NowNs() : 0;
+			const bool     open     = write_tick >= m_scheduler.CurrentTick();
+			const uint64_t in_flight =
+			    timing ? m_scheduler.CurrentTick() - 1 -
+			                 m_scheduler.GetMasterSemaphore().KnownGpuTick()
+			           : 0;
+			if (open) {
 				m_scheduler.FlushUrgent(); // The writes are still being recorded.
 			}
+			const int64_t flushed_ns = timing ? CommandScheduler::NowNs() : 0;
 			if (!m_scheduler.IsFree(write_tick)) {
 				buffer.MarkWaitedForReadback();
 			}
 			m_scheduler.Wait(write_tick);
+			const int64_t done_ns = timing ? CommandScheduler::NowNs() : 0;
 			m_scheduler.WaitPriorityOperations(write_tick);
+			if (timing) [[unlikely]] {
+				m_scheduler.NoteReadbackWait(write_tick, open, in_flight, start_ns, flushed_ns,
+				                             done_ns, CommandScheduler::NowNs());
+			}
 			}
 			KYTY_PROFILER_BLOCK("Readback: BAR copy and backing publication");
 			const auto* mapped = buffer.Mapped().data();
@@ -352,6 +538,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
+	NoteRecordedUse(buffer);
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -373,7 +560,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		// Tagged with its guest range: an unmap of the range waits for it (KYTY_UNMAP_TARGETED).
+		m_scheduler.DeferPriorityOperation(std::move(publish), vaddr, size);
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		{
@@ -413,7 +601,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	// A host-visible type on a large device-local heap means a resizable BAR; a small (256 MiB) BAR
 	// heap could not hold the guest buffers.
 	const auto& memory = m_graphics.physical_device_memory_properties;
-	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+	const auto* device_only = std::getenv("KYTY_DEVICE_LOCAL_GUEST_BUFFERS");
+	const bool force_device_only = device_only != nullptr && std::strcmp(device_only, "1") == 0;
+	if (force_device_only) {
+		Log::WriteToConsoleAndLog("Buffer cache diagnostic: unmapped device-local guest buffers (BAR path disabled)\n");
+		const auto* host_ab = std::getenv("KYTY_HOST_BARRIER_AB");
+		if (host_ab != nullptr && std::strcmp(host_ab, "1") == 0) {
+			m_scheduler.SetHostReadBarrier(false, true);
+			Log::WriteToConsoleAndLog("Host barrier diagnostic: bit 11 adds blanket host visibility; guest buffers stay unmapped\n");
+		}
+	}
+	for (uint32_t i = 0; !force_device_only && i < memory.memoryTypeCount; i++) {
 		const auto flags = memory.memoryTypes[i].propertyFlags;
 		const auto heap  = memory.memoryHeaps[memory.memoryTypes[i].heapIndex];
 		if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
@@ -473,9 +671,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 		if (IsRegionGpuModified(vaddr, size)) {
-			const auto start =
-			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
-			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
+			using namespace Common::AbSwitch;
+			const uint64_t window = Enabled(DOWNLOAD_WINDOW_4K)      ? 4 * 1024
+			                        : Enabled(DOWNLOAD_WINDOW_16K)   ? 16 * 1024
+			                        : Enabled(SMALL_DOWNLOAD_WINDOW) ? 64 * 1024
+			                                                         : DownloadWindowSize;
+			const auto start = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
+			const auto end = std::min(std::max(start + window, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
 			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
@@ -570,6 +772,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	new_buffer.MarkGpuWrite(m_scheduler.CurrentTick());
+	NoteRecordedUse(new_buffer);
 	RecordGpuWrite(overlap.CpuAddress(), overlap.Size());
 	m_merge_count++;
 	DeleteBuffer(overlap_id);
@@ -653,6 +856,7 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 	for (const auto& upload: uploads) {
 		native.copyBuffer(source.first->Handle(), upload.buffer->Handle(),
 		                  static_cast<uint32_t>(upload.end - first), copies.data() + first);
+		NoteRecordedUse(*upload.buffer);
 		first = upload.end;
 	}
 	const vk::MemoryBarrier after {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -668,9 +872,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        BufferId id) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
+	// Whether the small-range query below found no CPU-written page (AbSwitch READ_BINDING_FAST_PATH);
+	// it creates missing regions, which start CPU-written, so this is IsUploaded at that moment.
+	bool known_uploaded = false;
 	if (!is_written && size <= CACHING_PAGESIZE) {
 		// One pass over the regions for the three questions the fast path used to ask separately.
 		const auto region = m_memory_tracker.QueryRegionState(vaddr, size);
+		known_uploaded    = !region.cpu_modified;
 		if (region.cpu_modified && !region.gpu_modified) {
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
@@ -690,12 +898,45 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	NoteUse(id, buffer);
+	if (!is_written && Common::AbSwitch::Enabled(Common::AbSwitch::READ_BINDING_FAST_PATH) &&
+	    Common::AbSwitch::Enabled(Common::AbSwitch::UPLOAD_PRECHECK)) {
+		// Nothing to upload: SynchronizeBuffer would take UPLOAD_PRECHECK's lock-free exit and then
+		// only search for an image starting at the address, which FindImageFromRange rules out on
+		// the same start-bucket test.
+		if (known_uploaded || m_memory_tracker.IsUploaded(vaddr, size)) {
+			const bool image_search =
+			    is_texel_buffer &&
+			    (!Common::AbSwitch::Enabled(Common::AbSwitch::IMAGE_START_INDEX) ||
+			     m_texture_cache.MayStartAt(vaddr));
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::ReadFastHits);
+			if (g_verify_read_fast_path) [[unlikely]] {
+				// The full path as well (so a verify run behaves as with the bit off).
+				const bool overtaken    = !m_memory_tracker.IsUploaded(vaddr, size);
+				const bool image_synced = SynchronizeBuffer(buffer, vaddr, size, false, is_texel_buffer);
+				if (image_synced && !image_search) {
+					EXIT("read-fast-path verify: an image at 0x%016" PRIx64 " size 0x%" PRIx64
+					     " was synchronized although the fast path skipped the search\n",
+					     vaddr, size);
+				}
+				NoteReadFastPathVerify(overtaken);
+			} else if (image_search) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::ReadFastImageSyncs);
+				(void)SynchronizeBufferFromImage(buffer, vaddr, size);
+			}
+			return {&buffer, buffer.Offset(vaddr)};
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ReadFastMisses);
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		// The whole bound range counts as GPU-written, whatever the shader stores to.
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::WrittenBindings);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::WrittenBindingBytes, size);
 		TraceWrittenBinding(vaddr, size);
+		if (LibKernel::Memory::SrtDirtyStatsEnabled()) [[unlikely]] {
+			NoteWrittenBindingStats(diag_writer, size);
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer.MarkGpuWrite(m_scheduler.CurrentTick());
 		RecordGpuWrite(vaddr, size);
@@ -715,6 +956,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
+			NoteUse(*owner, buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 			return {&buffer, buffer.Offset(vaddr)};
 		}
@@ -943,7 +1185,7 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	if (!is_write) {
+	if (!is_write || Common::AbSwitch::Enabled(Common::AbSwitch::BDA_SYNC_ALL_WRITES)) {
 		m_bda_sync.Add(begin, end - begin);
 		return;
 	}

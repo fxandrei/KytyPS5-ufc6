@@ -239,7 +239,12 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 	    "draw_chain_taken,draw_chain_dyn_kept,draw_chain_pipe_kept,"
 	    "target_memo_structure_miss,target_memo_target_miss,target_memo_state_miss,"
 	    "target_memo_invalid_miss,target_memo_serial_miss,target_memo_rendering_miss,"
-	    "target_memo_mask_miss\n",
+	    "target_memo_mask_miss,srt_optional_unknown,wrm_backing,srt_memo_calls,srt_memo_hits,"
+	    "srt_prewalk_hits,pw_norec,pw_epoch,pw_ud,pw_watch,pw_value,pw_notrec,tex_plan_hit,"
+	    "tex_plan_miss,tex_info_hit,tex_info_miss,read_fast_hits,read_fast_misses,read_fast_img,"
+	    "cs_hint_hit,cs_hint_stage,cs_hint_miss,cs_pipe_memo,disp_tiny,disp_ms,disp_prog_ms,"
+	    "disp_bind_ms,"
+	    "disp_commit_ms\n",
 	    file);
 	const char*              ab_file = std::getenv("KYTY_AB_FILE");
 	uint64_t                 ab      = Common::AbSwitch::Mask();
@@ -352,6 +357,24 @@ void PerfCsvThread(const std::stop_token& stop, std::FILE* file) {
 		std::fprintf(file, ",%.0f,%.0f,%.0f,%.0f", rate(Counter::TargetMemoInvalidMiss),
 		             rate(Counter::TargetMemoSerialMiss), rate(Counter::TargetMemoRenderingMiss),
 		             rate(Counter::TargetMemoMaskMiss));
+		std::fprintf(file, ",%.0f,%.0f,%.0f,%.0f,%.0f", rate(Counter::SrtOptionalUnknown),
+		             rate(Counter::WaitRegMemBacking), rate(Counter::SrtMemoCalls),
+		             rate(Counter::SrtMemoHits), rate(Counter::SrtPrewalkHits));
+		std::fprintf(file, ",%.0f,%.0f,%.0f,%.0f,%.0f,%.0f", rate(Counter::SrtPrewalkNoRecord),
+		             rate(Counter::SrtPrewalkEpochMiss), rate(Counter::SrtPrewalkUserDataMiss),
+		             rate(Counter::SrtPrewalkWatchedMiss), rate(Counter::SrtPrewalkValueMiss),
+		             rate(Counter::SrtPrewalkNotRecorded));
+		std::fprintf(file, ",%.0f,%.0f,%.0f,%.0f", rate(Counter::TexturePlanMemoHits),
+		             rate(Counter::TexturePlanMemoMisses), rate(Counter::TextureInfoMemoHits),
+		             rate(Counter::TextureInfoMemoMisses));
+		std::fprintf(file, ",%.0f,%.0f,%.0f", rate(Counter::ReadFastHits),
+		             rate(Counter::ReadFastMisses), rate(Counter::ReadFastImageSyncs));
+		std::fprintf(file, ",%.0f,%.0f,%.0f,%.0f,%.0f,%.2f,%.2f,%.2f,%.2f",
+		             rate(Counter::ComputeHintHits), rate(Counter::ComputeHintStageHits),
+		             rate(Counter::ComputeHintMisses), rate(Counter::ComputePipeMemoHits),
+		             rate(Counter::DispatchesTiny), rate(Counter::DispatchNs) / 1e6,
+		             rate(Counter::DispatchProgramNs) / 1e6, rate(Counter::DispatchBindNs) / 1e6,
+		             rate(Counter::DispatchCommitNs) / 1e6);
 		std::fputc('\n', file);
 		std::fflush(file);
 		// The variant applies from the next row on, so every row measures a single variant.

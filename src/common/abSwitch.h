@@ -34,7 +34,8 @@ inline constexpr uint64_t DEFAULT_MASK = Bit(0) | Bit(1) | Bit(2) | Bit(3) | Bit
                                          Bit(15) | Bit(16) | Bit(17) | Bit(19) | Bit(20) | Bit(21) |
                                          Bit(22) | Bit(23) | Bit(24) | Bit(27) | Bit(28) | Bit(31) |
                                          Bit(32) | Bit(33) | Bit(34) | Bit(36) | Bit(37) | Bit(45) |
-                                         Bit(46) | Bit(47) | Bit(49) | Bit(52);
+                                         Bit(46) | Bit(47) | Bit(49) | Bit(52) | Bit(54) | Bit(55) | Bit(57) | Bit(58) |
+                                         Bit(59) | Bit(60) | Bit(62) | Bit(7) | Bit(43) | Bit(44);
 
 // The first call reads KYTY_AB; a mask stored meanwhile (KYTY_AB_FILE) is kept.
 [[nodiscard]] inline uint64_t ReadInitialMask() noexcept {
@@ -91,6 +92,19 @@ inline constexpr uint32_t EAGER_FLUSH = 6;
 // about 13 us of CPU in the fight). Together with EARLY_FLUSH_WRITERS, which spends those submits
 // on the writers that readbacks wait for, the fight ran ~3-5% faster.
 inline constexpr uint32_t EAGER_FLUSH_COARSE = 8;
+// In DEFAULT_MASK since 2026-11-20 (no crowd 1.024 9/13, crowd 1.021 12/17; verify clean): with TEXTURE_MEMO_WIDE, a texture plan memo entry also keeps the image
+// FindImage returned for it and the texture cache's structure generation; while no image was
+// registered or unregistered since, the next hit reuses that image (ReuseImage) without the region
+// search. Only when FindImage did not move the view. KYTY_VERIFY_TEXTURE_IMAGE=1 checks every reuse.
+inline constexpr uint32_t TEXTURE_IMAGE_MEMO = 7;
+// Correctness experiment (2026-11-20): a guest mprotect sets the host protection of its pages
+// directly (ProtectMemory -> GuestAddressSpace::Protect -> VirtualProtect) and so drops the GPU
+// tracker's protections: CPU writes to write-watched pages stop faulting (the GPU keeps stale copies)
+// and GPU-modified pages become readable with stale guest bytes. With this bit, a guest mprotect to
+// any accessible mode first calls Memory::InvalidateMemory on the range (downloads GPU-written data,
+// marks the pages CPU-written, untracks images), as host file reads do. Suspected cause of the
+// intermittent page-sized tile corruption in UFC 6 (it imports sceKernelMprotect).
+inline constexpr uint32_t MPROTECT_TRACKING = 30;
 // Images that DeleteImage frees are kept, up to 512 MiB, for a CreateImage with the same
 // parameters: Frostbite recreates its transient render targets every frame, and creating and
 // freeing their dedicated memory costs the command processor about 3% in the fight.
@@ -206,6 +220,15 @@ inline constexpr uint32_t BUFFER_IDLE_GC = 41;
 // private UFC 6 build does this). Reads of GPU-written memory still wait on their write ticks,
 // so the guest cannot observe stale bytes; only the wake-up itself moves earlier.
 inline constexpr uint32_t EOP_IRQ_AT_CP = 42;
+// Experimental, default off (2026-11-21): the resource-table walker (SrtWalker JIT) runs a second
+// code variant compiled next to the reference one, with the same results: the last page found
+// without GPU-written bytes stays in a register, so a load from it skips the page-table lookup
+// (one lookup per page and walk instead of one per DWORD); the lookup and the slow path run out
+// of line; the walker zeroes its state bytes and the flat SRT with vector stores instead of
+// rep stosb and vector::assign. Both variants are compiled when this bit is set at startup, with
+// KYTY_AB_FILE or with KYTY_VERIFY_WALKER=1 (which runs both on every walk and exits on a
+// difference); KYTY_WALKER_PREFETCH=1 also prefetches the walked descriptor lines at walk entry.
+inline constexpr uint32_t SRT_WALKER_FAST = 43;
 // A draw keeps its resolved render targets (descriptions, attachments and the rendering state)
 // for the next draw while no command that could change them ran and the same rendering instance
 // is open; that draw then skips resolving registers and acquiring the targets again (Bruno
@@ -246,6 +269,54 @@ inline constexpr uint32_t TEXTURE_PLAN_MEMO = 53;
 // Experimental, default off: return an empty vertex binding before constructing guest ranges
 // when the shader has no vertex-buffer slots. Disabled on the VI probe path; A/B with probes off.
 inline constexpr uint32_t EMPTY_VERTEX_FAST_PATH = 54;
+// Experimental, default off (2026-11-18): a readback of GPU-written guest memory widens to a 64 KiB
+// window around the read instead of 512 KiB. The BAR copy of the wider window cost ~4.9 ms/flip
+// in the UFC 6 fight (16 readbacks/flip, ~300 us each); a narrower one may fault more often.
+inline constexpr uint32_t SMALL_DOWNLOAD_WINDOW = 55;
+// Experimental, same idea: 16 KiB (bit 56) or 4 KiB (bit 57) windows; the smallest set bit wins.
+inline constexpr uint32_t DOWNLOAD_WINDOW_16K = 56;
+inline constexpr uint32_t DOWNLOAD_WINDOW_4K  = 57;
+// Experimental (2026-11-18): a CPU write queues its pages for the BDA sync even when no DMA shader
+// has accessed them yet. Without it, a shader's first read of such a page returns the GPU copy from
+// before the write (only a fault is recorded); UFC 6's b059f33ca3077aac then walks stale lists and a
+// dispatch takes up to ~130 ms ("GPU stall" episodes in localLightShadow).
+inline constexpr uint32_t BDA_SYNC_ALL_WRITES = 58;
+// Experimental (2026-11-19): an SRT walker load that only decides block conditions reads as
+// unknown, instead of waiting, when a GPU write still in flight covers it; the unknown condition
+// reaches both successors (the conservative resource set). In UFC 6's fight such loads (counters
+// written by compute shaders ad1a9c77/085e9fdd/f9c1e0b0, tested by `count <= undef` conditions in
+// b54f4ecc/9ad619ec/a2932b1d) waited ~90 ms/s of the GPU thread for a result that is unknown anyway.
+inline constexpr uint32_t SRT_OPTIONAL_DIRTY_UNKNOWN = 59;
+// Experimental (2026-11-19): WAIT_REG_MEM reads its value from the backing store when the page is
+// GPU-written but the waited bytes are not (as CP_READ_BACKING does for other command-processor
+// reads). In UFC 6 every such wait read clean bytes, and the fault's 4 KiB download waited only for
+// writes still in flight to other bytes of the page (~4% of the GPU thread in the no-crowd fight).
+inline constexpr uint32_t WAIT_REG_MEM_BACKING = 60;
+// Experimental (2026-11-19): skip the SRT walk itself when a Program's walker inputs are unchanged
+// since its last walk (user data, shader base, and every DWORD the walker loaded, on pages without
+// GPU-written bytes, with no guest map change in between). Builds on SRT_REFRESH_MEMO (whose L1
+// key hit 72% of the eligible materializations in UFC 6's no-crowd fight). KYTY_VERIFY_PREWALK=1
+// walks anyway and exits on a difference.
+inline constexpr uint32_t SRT_PREWALK_MEMO = 61;
+// In DEFAULT_MASK since 2026-11-20 (no crowd FPS 1.033 16/17, crowd 1.013 8/12; verify clean): wider texture memos. TEXTURE_INFO_MEMO uses 4096 slots instead of 512,
+// and the pre-FindImage texture plan memo (as TEXTURE_PLAN_MEMO, which it implies) is addressed by
+// the plan's inputs - the resource fields it reads and the T# - in 4096 slots instead of by
+// (module, resource index) in 128. UFC 6 binds more distinct textures per frame than either held.
+// KYTY_VERIFY_TEXTURE_PLAN=1 still recomputes every plan hit.
+inline constexpr uint32_t TEXTURE_MEMO_WIDE = 62;
+// Correctness experiment (2026-11-20): the kernel's read, pread and readv read guest files through a
+// host buffer and copy into guest memory (as AMPR reads already do). A host read straight into guest
+// memory fails (ERROR_NOACCESS, ignored before) when the GPU thread write-protects its pages while
+// it runs - InvalidateMemory queues them for BDA sync, which uploads and re-protects them - leaving
+// the rest of the buffer unread. Suspected cause of the intermittent tile corruption under load.
+inline constexpr uint32_t GUEST_READ_BOUNCE = 63;
+// Experimental (2026-11-21): a read-only buffer binding none of whose pages the CPU wrote since their
+// last upload (the lock-free UPLOAD_PRECHECK test, or the small-range region query ObtainBuffer has
+// already made) returns from ObtainBuffer without entering SynchronizeBuffer, and a texel binding
+// skips the image search when no image can start at its address (the IMAGE_START_INDEX bucket bit,
+// read without the texture-cache lock: only the GPU thread registers images). Needs UPLOAD_PRECHECK.
+// KYTY_VERIFY_READ_FAST_PATH=1 runs the full path as well and exits on a difference.
+inline constexpr uint32_t READ_BINDING_FAST_PATH = 44;
 
 // The CP_DELAY_PROBE spin.
 inline void DelayProbe() noexcept {

@@ -1,9 +1,11 @@
 #include "common/emulatorConfig.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 
 namespace Config {
@@ -142,6 +144,15 @@ bool GuestTscEnabled() {
 }
 
 uint32_t GetVblankFrequency() {
+	// Measurement only (2026-11-20): KYTY_VBLANK_ALT=<Hz> makes AbSwitch bit 39 (reserved, no other
+	// code) select that vblank frequency, so a same-process A/B (-AbBit 39) compares two rates.
+	static const uint32_t alt = []() {
+		const char* v = std::getenv("KYTY_VBLANK_ALT");
+		return v != nullptr ? static_cast<uint32_t>(std::atoi(v)) : 0u;
+	}();
+	if (alt != 0 && Common::AbSwitch::Enabled(Common::AbSwitch::RECORD_BINDINGS_PAYLOAD)) {
+		return std::clamp(alt, 30u, 360u);
+	}
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
 

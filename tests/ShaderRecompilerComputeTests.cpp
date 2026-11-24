@@ -1567,6 +1567,7 @@ constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
 constexpr ShaderProfile SrgbViewProfile{
     .maintenance8 = true, .r8_srgb_views = true, .r8g8_srgb_views = true};
 constexpr ShaderProfile RelaxedFloatProfile{.maintenance8 = true, .relaxed_float = true};
+constexpr ShaderProfile IncDecAddProfile{.maintenance8 = true, .inc_dec_add = true};
 
 struct TestCase {
   const char *name = "";
@@ -5064,12 +5065,50 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckBufferWordProbe() {
+    constexpr const char *name = "BufferWordProbe";
+    const char *path = std::getenv("KYTY_GPU_BUFFER_WORD_PROBE");
+    Require(name, "probe enabled", path != nullptr && *path != '\0', "probe output path required");
+    EnsureRuntimeContext();
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      context.InitializeGpu(nullptr);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      Libs::Graphics::Buffer source(m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+                                   0, AllFlags, 64);
+      source.Fill(0, 64, 0);
+      source.Fill(8, 4, 0x7fffffffu);
+      scheduler.ProbeBufferWord(source.Handle(), 8, "probe-first");
+      source.Fill(8, 4, 8);
+      scheduler.ProbeBufferWord(source.Handle(), 8, "probe-second");
+      scheduler.Finish();
+      scheduler.ReportBufferWordProbes();
+    }
+    auto *file = std::fopen(path, "r");
+    Require(name, "output readable", file != nullptr, "cannot read probe output");
+    std::array<char, 2048> output{};
+    const auto bytes = std::fread(output.data(), 1, output.size() - 1, file);
+    std::fclose(file);
+    const std::string text(output.data(), bytes);
+    Require(name, "first GPU value", text.find(",2147483647,2147483647,probe-first") != std::string::npos,
+            "first native dword copy lost its pre-overwrite value");
+    Require(name, "second GPU value", text.find(",8,8,probe-second") != std::string::npos,
+            "second native dword copy did not see the later GPU write");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // Focused compatibility case: a general R8 read/write storage descriptor
   // aliases an existing stencil plane. It must acquire a storage-capable image
   // containing the current GPU stencil bytes. Writeback, preserved depth and
   // partial-write/lifetime cases still need coverage before alias support ships.
-  void CheckStencilStorageAlias() {
-    constexpr const char *name = "StencilStorageAlias";
+  // htile: the depth owner has HTILE metadata with stencil compression (UFC 6 live case,
+  // 2026-11-18), no pending HTILE clear. Covers acquisition of current GPU stencil only.
+  void CheckStencilStorageAlias(bool htile = false) {
+    const char *name = htile ? "StencilStorageAliasHtile" : "StencilStorageAlias";
     constexpr uintptr_t base = 0x0000000258000000ull;
     constexpr uint64_t allocation_size = 0x100000;
     constexpr uint64_t stencil_address = base + 0x20000;
@@ -5096,7 +5135,7 @@ public:
       context.MapMemory(base, allocation_size);
       auto &cache = context.GetTextureCache();
       TileSizeAlign stencil_layout{};
-      TileGetTextureTotalSize(Prospero::BufferFormat::k8UInt, 1, 1, 1, 1,
+      TileGetTextureTotalSize(Prospero::BufferFormat::k8UInt, 3, 2, 1, 1,
                               Prospero::TileMode::kLinear, false, stencil_layout);
       TextureCache::ImageDesc depth{};
       depth.type = TextureCache::BindingType::DepthTarget;
@@ -5105,19 +5144,32 @@ public:
       depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
       depth.info.guest_format = Prospero::BufferFormat::k32Float;
       depth.info.type = Prospero::ImageType::kColor2D;
-      depth.info.extent = {1, 1, 1};
+      depth.info.extent = {3, 2, 1};
       depth.info.resources = {1, 1};
-      depth.info.pitch = 1;
+      depth.info.pitch = 3;
       depth.info.bytes_per_block = 4;
       depth.info.samples = 1;
       depth.info.tile_mode = Prospero::TileMode::kLinear;
       depth.info.UpdateSize();
+      if (htile) {
+        depth.info.metadata.kind = ImageMetadataKind::Htile;
+        depth.info.metadata.range = {base + 0x40000, 0x1000};
+        depth.info.metadata.stencil_compressed = true;
+      }
       depth.view_info.format = depth.info.pixel_format;
       depth.view_info.type = vk::ImageViewType::e2D;
       depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
       const auto depth_id = cache.FindImage(depth);
       (void)cache.FindDepthTarget(depth_id, depth);
+      if (htile) {
+        // A new HTILE image starts with its initial clear pending; binding it as a depth target
+        // applies and consumes that clear (renderDraw.cpp). Model that consumption here.
+        Require(name, "consume initial HTILE clear",
+                cache.IsMetaCleared(depth.info.metadata.range.address, 0) &&
+                    cache.TouchMeta(depth.info.metadata.range.address, 0, false),
+                "new HTILE depth image did not start with a pending clear");
+      }
       vk::ClearValue initial{};
       initial.depthStencil = vk::ClearDepthStencilValue{0.625f, 0x91};
       TextureCacheTestAccess::ClearImage(
@@ -5129,7 +5181,8 @@ public:
       const uint64_t encoded_address = stencil_address >> 8u;
       descriptor.dwords[0] = static_cast<uint32_t>(encoded_address);
       descriptor.dwords[1] = static_cast<uint32_t>(encoded_address >> 32u) |
-          (static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u);
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u) | (2u << 30u);
+      descriptor.dwords[2] = 1u << 14u;
       descriptor.dwords[3] = DstSel(4, 5, 6, 7) |
           (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
           (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
@@ -5139,6 +5192,8 @@ public:
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       resource.mip_count = 1;
       resource.read = resource.written = true;
+      auto &utility = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+      utility.Fill(0, 64, 0x5aa55aa5u);
       auto binding = RenderExecutorTestAccess::ResolveTexture(
           context.GetRenderExecutor(), resource, descriptor);
       auto &native = cache.GetImage(binding.image_id);
@@ -5148,11 +5203,11 @@ public:
               "general R8 storage alias resolved to a depth/stencil image without STORAGE usage");
       Require(name, "storage view", cache.FindTexture(binding.image_id, binding.desc) != nullptr,
               "stencil storage alias could not acquire a legal native view");
-      auto readback = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {});
+      auto readback = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
       vk::BufferImageCopy copy{};
       copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-      copy.imageExtent = {1, 1, 1};
-      native.Download(std::span(&copy, 1), readback.buffer, 0, 4);
+      copy.imageExtent = {3, 2, 1};
+      native.Download(std::span(&copy, 1), readback.buffer, 0, 8);
       const vk::MemoryBarrier ready{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                     .dstAccessMask = vk::AccessFlagBits::eHostRead};
       scheduler.Current().Handle().pipelineBarrier(
@@ -5161,9 +5216,155 @@ public:
       scheduler.Finish();
       Require(name, "GPU stencil preserved", (ReadBuffer(name, readback, 1)[0] & 0xffu) == 0x91,
               "storage acquisition used stale CPU bytes instead of current GPU stencil");
+      if (!htile) {
+      auto scratch_guard = CreateHostBuffer(name, 64, vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::MemoryBarrier scratch_ready{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                            .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+          {}, 1, &scratch_ready, 0, nullptr, 0, nullptr);
+      const vk::BufferCopy scratch_copy{0, 0, 64};
+      scheduler.Current().Handle().copyBuffer(utility.Handle(), scratch_guard.buffer, 1, &scratch_copy);
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+          {}, 1, &ready, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto guard = ReadBuffer(name, scratch_guard, 16);
+      Require(name, "shared allocation preserved",
+              std::ranges::all_of(guard, [](u32 value) { return value == 0x5aa55aa5u; }),
+              "stencil acquisition clobbered the device buffer used for shader shared memory");
+      DestroyBuffer(&scratch_guard);
+
+      // Exercise a real general IMAGE_STORE through DispatchDirect/ResetBindings.
+      // Constant coordinates write only (1,0), so this cannot be a full-image clear.
+      std::vector<u32> code;
+      AppendVMovU32(&code, 20, 1);
+      AppendVMovU32(&code, 21, 0);
+      AppendVMovU32(&code, 22, 0);
+      AppendVMovU32(&code, 0, 0x35);
+      code.push_back(EncodeMimg0(0x08, 1));
+      code.push_back(EncodeMimg1(0, 20));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 32, .user_sgpr = 8});
+      for (u32 i = 0; i < 8; ++i) shaders.SetCsUserSgpr(i, descriptor.dwords[i]);
+      context.GetGpu().SendCommandSync([&] {
+        context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u, false);
+        scheduler.Finish();
+      });
+      auto planes = CreateHostBuffer(name, 32, vk::BufferUsageFlagBits::eTransferDst, {});
+      const std::array<vk::BufferImageCopy, 2> copies{{
+          {0, 0, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, {3, 2, 1}},
+          {24, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {3, 2, 1}}}};
+      cache.GetImage(depth_id).Download(copies, planes.buffer, 0, planes.size);
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+          {}, 1, &ready, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, planes, 8);
+      const auto *bytes = reinterpret_cast<const uint8_t *>(words.data() + 6);
+      for (u32 i = 0; i < 6; ++i) {
+        Require(name, "depth unchanged", words[i] == std::bit_cast<u32>(0.625f),
+                "R8 storage write changed native depth");
+        Require(name, "partial writeback", bytes[i] == (i == 1 ? 0x35 : 0x91),
+                "stencil storage writeback lost a write or an untouched texel");
+      }
+      Require(name, "CPU download", TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+              "materialized stencil could not publish to guest memory");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::array<uint8_t, 2> cpu{};
+      Require(name, "CPU stencil bytes",
+              LibKernel::Memory::TryReadBacking(stencil_address, cpu.data(), cpu.size()) &&
+                  cpu[0] == 0x91 && cpu[1] == 0x35,
+              "CPU stencil readback retained stale bytes");
+      DestroyBuffer(&planes);
+      // Changing stencil address must freeze the old native GPU plane, not
+      // overwrite it later from the owner's newly bound address.
+      initial.depthStencil.stencil = 0x77;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, initial);
+      auto second_depth = depth;
+      second_depth.info.stencil.address = base + 0x30000;
+      (void)cache.FindDepthTarget(depth_id, second_depth);
+      Require(name, "old plane detached", !cache.GetImage(binding.image_id).depth_id,
+              "changing the stencil address kept the old storage plane attached");
+      native.Download(std::span(&copy, 1), readback.buffer, 0, 8);
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+          {}, 1, &ready, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto frozen = ReadBuffer(name, readback, 2);
+      for (u32 i = 0; i < 6; ++i)
+        Require(name, "frozen GPU plane", reinterpret_cast<const uint8_t *>(frozen.data())[i] == 0x77,
+                "detaching stencil retained an outdated R8 copy");
+      initial.depthStencil.stencil = 0x62;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, initial);
+      auto second_descriptor = descriptor;
+      const auto second_address = second_depth.info.stencil.address >> 8u;
+      second_descriptor.dwords[0] = static_cast<u32>(second_address);
+      second_descriptor.dwords[1] = (second_descriptor.dwords[1] & ~0xffu) |
+                                    static_cast<u32>(second_address >> 32u);
+      auto sampled = resource;
+      sampled.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled.written = false;
+      ShaderModule mixed;
+      mixed.info.stage = ShaderType::Compute;
+      mixed.info.info.images = {sampled, sampled, resource};
+      ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
+      mixed_snapshot.images = {second_descriptor, second_descriptor, second_descriptor};
+      ShaderStageRuntime mixed_runtime{&mixed, &mixed_snapshot};
+      PreparedBindings mixed_bindings;
+      auto &executor = context.GetRenderExecutor();
+      executor.PrepareBindings(mixed_runtime, mixed_bindings);
+      executor.RebindImages(mixed_bindings);
+      const auto second_plane = mixed_bindings.images[2].image_id;
+      for (const auto &image : mixed_bindings.images)
+        Require(name, "sampled and storage alias identity",
+                image.image_id == second_plane && image.image_view != nullptr,
+                "a sampled stencil descriptor retained the native owner after storage materialization");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      // Retiring the depth owner must leave its latest stencil bytes available.
+      initial.depthStencil.stencil = 0x29;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, initial);
+      TextureCacheTestAccess::DeleteImage(cache, depth_id);
+      Require(name, "retired owner preserves R8", !cache.GetImage(second_plane).depth_id,
+              "retiring depth also destroyed its materialized stencil bytes");
+      Require(name, "retired plane download", TextureCacheTestAccess::TryDownload(cache, second_plane),
+              "detached stencil plane is no longer downloadable");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      uint8_t retired = 0;
+      Require(name, "retired plane contents",
+              LibKernel::Memory::TryReadBacking(second_depth.info.stencil.address, &retired, 1) && retired == 0x29,
+              "owner retirement lost the last GPU stencil update");
+      vk::ClearValue updated{};
+      updated.color.uint32[0] = 0x4d;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), second_plane,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, updated);
+      const auto adopted_depth = cache.FindImage(second_depth);
+      (void)cache.FindDepthTarget(adopted_depth, second_depth);
+      auto stencil_copy = copy;
+      stencil_copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
+      cache.GetImage(adopted_depth).Download(std::span(&stencil_copy, 1), readback.buffer, 0, 8);
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+          {}, 1, &ready, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto adopted = ReadBuffer(name, readback, 2);
+      for (u32 i = 0; i < 6; ++i)
+        Require(name, "GPU R8 re-adoption", reinterpret_cast<const uint8_t *>(adopted.data())[i] == 0x4d,
+                "re-adopting R8 storage uploaded stale CPU stencil bytes");
       DestroyBuffer(&readback);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      }
       context.ShutdownGpu();
     }
     Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
@@ -7063,6 +7264,17 @@ public:
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    const auto saved_mask = Common::AbSwitch::Mask();
+    struct RestoreMask {
+      uint64_t mask;
+      ~RestoreMask() { Common::AbSwitch::g_mask.store(mask, std::memory_order_relaxed); }
+    } restore_mask{saved_mask};
+    // Cover the legacy accessed-page policy explicitly, with the current per-slice gate.
+    // Requests below model the slice/synchronization boundaries a real caller supplies.
+    Common::AbSwitch::g_mask.store(
+        (saved_mask | Common::AbSwitch::Bit(Common::AbSwitch::BDA_SYNC_PER_SUBMIT)) &
+            ~Common::AbSwitch::Bit(Common::AbSwitch::BDA_SYNC_ALL_WRITES),
+        std::memory_order_relaxed);
     EnsureRuntimeContext();
     // Direct memory, so readbacks can publish GPU-dirty bytes.
     int64_t direct = -1;
@@ -7115,6 +7327,7 @@ public:
 
     // A write queues a page only once a DMA access reported it; the report queues it too.
     cache.InvalidateMemory(base + 17, 1);
+      context.RequestBdaSync();
     context.PrepareBda();
     Require(name, "unaccessed write", cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
             "a write queued a page no DMA shader accessed");
@@ -7122,6 +7335,7 @@ public:
                                  1u << (BufferCache::PageIndex(base) % 32));
     cache.ProcessFaultBuffer();
     scheduler.Finish();
+      context.RequestBdaSync();
     context.PrepareBda();
     Require(name, "accessed page", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
             "a DMA access report did not queue its page");
@@ -7184,6 +7398,7 @@ public:
             "garbage collection kept the clean buffer");
     const auto low = cache.FindBuffer(base, page);
     const auto high = cache.FindBuffer(base + page, 2 * page);
+    context.RequestBdaSync();
     {
       const RecordedCommandCounter counter;
       context.PrepareBda();
@@ -7218,6 +7433,27 @@ public:
                                          BufferCache::BDA_ACCESSED),
                         static_cast<u32>(cache.GetBuffer(high).BufferDeviceAddress())},
         "stale bytes on the GPU, or page-table entries with wrong accessed tags");
+
+    // The adopted policy must also upload a CPU write on a page that no DMA shader accessed.
+    Common::AbSwitch::g_mask.store(
+        Common::AbSwitch::Mask() | Common::AbSwitch::Bit(Common::AbSwitch::BDA_SYNC_ALL_WRITES),
+        std::memory_order_relaxed);
+    cache.InvalidateMemory(base + page + 12, sizeof(u32));
+    words[page / sizeof(u32) + 3] = 0x13579bdfu;
+    context.PrepareBda();
+    Require(name, "same slice gated", cache.IsRegionCpuModified(base + page + 12, sizeof(u32)),
+            "PrepareBda unexpectedly synchronized again without a new request");
+    context.RequestBdaSync();
+    context.PrepareBda();
+    Require(name, "first-access write queued", !cache.IsRegionCpuModified(base + page + 12, sizeof(u32)),
+            "all-writes policy ignored a CPU write on a never-accessed DMA page");
+    snapshot_of(cache.GetBuffer(high), 12, 0);
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "first-access GPU bytes", ReadBuffer(name, readback, 1)[0] == 0x13579bdfu,
+            "all-writes policy left stale GPU bytes before the first DMA access");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
@@ -43865,12 +44101,25 @@ TestCase DsBoundedAtomicBoundaries(bool decrement, bool gds) {
   return test;
 }
 
-TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
+// all_ones: an all-ones limit, run through the native add of IncDecAddProfile
+// (KYTY_GDS_FIX); the counter then never wraps and old & 15 forms the histogram.
+TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size,
+                                   bool all_ones = false) {
   using O = ShaderOpcode;
   constexpr u32 guard = 0x13579bdfu;
   constexpr u32 limit = 15;
   TestCase test;
-  if (wave_size == 32) {
+  if (all_ones) {
+    test.name = decrement
+                    ? (gds ? (wave_size == 32 ? "DsDecReturnGdsAllOnesWave32"
+                                              : "DsDecReturnGdsAllOnesWave64")
+                           : (wave_size == 32 ? "DsDecReturnLdsAllOnesWave32"
+                                              : "DsDecReturnLdsAllOnesWave64"))
+                    : (gds ? (wave_size == 32 ? "DsIncReturnGdsAllOnesWave32"
+                                              : "DsIncReturnGdsAllOnesWave64")
+                           : (wave_size == 32 ? "DsIncReturnLdsAllOnesWave32"
+                                              : "DsIncReturnLdsAllOnesWave64"));
+  } else if (wave_size == 32) {
     test.name = decrement ? (gds ? "DsDecReturnGdsContentionWave32"
                                  : "DsDecReturnLdsContentionWave32")
                           : (gds ? "DsIncReturnGdsContentionWave32"
@@ -43883,7 +44132,10 @@ TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
   }
   auto &code = test.code;
   AppendVMovU32(&code, 2, 0);
-  AppendVMovU32(&code, 3, limit);
+  if (all_ones)
+    AppendVMovLiteral(&code, 3, 0xffffffffu);
+  else
+    AppendVMovU32(&code, 3, limit);
   AppendVMovU32(&code, 5, 1);
   AppendVMovLiteral(&code, 6, guard);
   if (!gds) {
@@ -43903,6 +44155,9 @@ TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
   AppendSMovLiteral(&code, 127, 0xaaaaaaaau);
   code.push_back(EncodeDs0(decrement ? 0x24 : 0x23, 4, gds));
   code.push_back(EncodeDs1(6, 3, 2));
+  // 64 consecutive values fill each of 16 bins four times.
+  if (all_ones)
+    code.push_back(EncodeVop2(0x1b, 6, InlineU32(15), 6));
   // Returned old values form a histogram; no lane ordering is assumed.
   code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));
   AppendBufferStoreOpcode(&code, 0x32, 5, 7);
@@ -43923,7 +44178,10 @@ TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
     test.expected.push_back(
         (mask & (uint64_t{1} << (lane % wave_size))) == 0 ? 1 : 0);
   }
-  test.expected.resize(272, 0);
+  // 64 changes from zero: four wraps return to zero; without a wrap the
+  // counter ends at +64 or -64.
+  const u32 final_value = !all_ones ? 0u : decrement ? 0u - 64u : 64u;
+  test.expected.resize(272, final_value);
   test.initial.resize(test.expected.size());
   test.compute_info.threads_num[0] = 128;
   test.compute_info.threads_num[1] = 1;
@@ -43947,9 +44205,15 @@ TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
                   O::S_ENDPGM};
   test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange",
                          "OpLoopMerge"};
+  if (all_ones) {
+    test.profile = &IncDecAddProfile;
+    test.opcodes.push_back(O::V_AND_B32);
+    // Other limits keep the loop beside the native operation.
+    test.required_spirv.push_back(decrement ? "OpAtomicISub" : "OpAtomicIAdd");
+  }
   if (gds) {
     test.gds_initial = {guard, 0, guard};
-    test.expected_gds = test.gds_initial;
+    test.expected_gds = {guard, final_value, guard};
   } else
     test.opcodes.push_back(O::DS_WRITE_B32);
   return test;
@@ -54122,6 +54386,8 @@ std::vector<TestCase> MakeCases() {
       cases.push_back(DsBoundedAtomicBoundaries(decrement, gds));
       for (u32 wave_size : {32u, 64u}) {
         cases.push_back(DsBoundedAtomicContention(decrement, gds, wave_size));
+        cases.push_back(
+            DsBoundedAtomicContention(decrement, gds, wave_size, true));
       }
     }
   }
@@ -59233,6 +59499,37 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4GuardBandRegisterRanges");
 }
 
+void CheckPm4GdsReadback(VulkanHarness &vulkan) {
+  constexpr const char *name = "Pm4GdsReadback";
+  RenderContext renderer(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = renderer.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  // Exercise the non-BAR contract: the actual CPU read must provide its own visibility.
+  scheduler.SetHostReadBarrier(false);
+  CommandProcessor processor(renderer, 0);
+  auto &gds = *renderer.GetBufferCache().GetGdsBuffer();
+  Require(name, "coherent mapping", gds.IsCoherent() && !gds.Mapped().empty(),
+          "this regression requires coherent mapped GDS");
+  for (uint32_t index = 0; index < 16; ++index) {
+    const uint32_t value = 0x13579bdfu ^ (index * 0x01010101u);
+    std::array<uint32_t, 5> output{};
+    output.fill(0xdeadbeefu);
+    scheduler.EndRendering();
+    scheduler.Current().Handle().fillBuffer(gds.Handle(), 7 * sizeof(uint32_t),
+                                           3 * sizeof(uint32_t), value);
+    processor.ReleaseMem(5, 0, output.data() + 1, (uint64_t{3} << 16u) | 7u, 0, false);
+    Require(name, "GPU write then CPU read",
+            output[0] == 0xdeadbeefu && output[4] == 0xdeadbeefu &&
+                output[1] == value && output[2] == value && output[3] == value,
+            "GDS readback was stale or copied outside the selected dword range");
+  }
+  scheduler.Finish();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetBlendColor({1.0f, 2.0f, 3.0f, 4.0f});
@@ -61368,6 +61665,32 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
+  // Offline inspection of captured guest ISA with the same decoder used by the emulator.
+  // No Vulkan instance or guest runtime is needed for this selector.
+  if (argc == 3 && std::strcmp(argv[1], "--decode-shader") == 0) {
+    auto *file = std::fopen(argv[2], "rb");
+    if (file == nullptr) {
+      std::fprintf(stderr, "cannot open shader capture\n");
+      return 2;
+    }
+    std::fseek(file, 0, SEEK_END);
+    const auto bytes = std::ftell(file);
+    std::rewind(file);
+    if (bytes <= 0 || bytes > 4 * 1024 * 1024 || bytes % sizeof(u32) != 0) {
+      std::fclose(file);
+      std::fprintf(stderr, "invalid shader capture size\n");
+      return 2;
+    }
+    std::vector<u32> words(static_cast<size_t>(bytes) / sizeof(u32));
+    const auto count = std::fread(words.data(), sizeof(u32), words.size(), file);
+    std::fclose(file);
+    if (count != words.size()) return 2;
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(words, decoded);
+    std::printf("%s", ShaderRecompiler::Decoder::ProgramToString(decoded).c_str());
+    return 0;
+  }
+
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
@@ -62474,6 +62797,11 @@ int main(int argc, char **argv) {
     vulkan.CheckOrderedDispatch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--gds-readback-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4GdsReadback(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--zero-stride-binding-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckZeroStrideBufferBinding();
@@ -62485,9 +62813,15 @@ int main(int argc, char **argv) {
     vulkan.CheckCubeFaceStorage();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-word-probe-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferWordProbe();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stencil-storage-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStencilStorageAlias();
+    vulkan.CheckStencilStorageAlias(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-copy-bounds-only") == 0) {
@@ -62708,6 +63042,7 @@ int main(int argc, char **argv) {
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
+  CheckPm4GdsReadback(vulkan);
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());

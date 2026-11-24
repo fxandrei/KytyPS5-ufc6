@@ -33,6 +33,12 @@ struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
 
+namespace HW {
+class Context;
+class UserConfig;
+class Shader;
+} // namespace HW
+
 namespace ShaderRecompiler {
 struct CompileOptions;
 struct ShaderSource;
@@ -180,6 +186,39 @@ struct DrawRenderState {
 	}
 };
 
+// KYTY_DRAW_PREP (agents/2026-11-20/parallel-cp-design.md, M1/M2): why a pure preparation left a
+// draw to the serial path.
+enum class DrawPrepRefusal : uint8_t {
+	None,
+	Tessellation, // the tess layout cache is written on a miss
+	MeshDropped,  // beyond the host mesh limits: the serial path drops the draw and warns
+	NoProgram,    // first use of the program key: the serial path translates and compiles
+	SkipProgram,  // unsupported GPU-selected call target
+	CallProgram,  // call programs refresh their source and plan per draw
+	Materialize,  // MaterializeResources failed (the serial path exits)
+	NoModule,     // new permutation: the serial path compiles a module
+	Certificate,  // something the certificate covers changed before the commit
+	Count
+};
+
+// The caller-owned outputs and the coherence certificate of one draw's program preparation from
+// a register snapshot (PipelineCache::PrepareGraphicsPrograms). A prepared DrawRenderState's stage
+// runtimes point into `resources`, so this must outlive the draw that uses them.
+struct DrawProgramPrep {
+	// [0] the vertex (or mesh) stage, [1] the pixel stage. Tessellation is refused.
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, 2>       resources;
+	std::array<ShaderRecompiler::IR::ResourceSpecialization, 2> specialization;
+	// Certificate, loaded before the first guest read: a change of either between the preparation
+	// and its commit refuses it. Inline (M2) both are trivially unchanged; with a window (M3) the
+	// certificate also needs the read set (see drawprep.md).
+	uint64_t guest_map_epoch       = 0;
+	uint64_t shader_map_generation = 0;
+	// Walker loads on pages with GPU-written bytes during this preparation (statistics: a worker
+	// would refuse such a draw).
+	uint64_t        guarded_loads = 0;
+	DrawPrepRefusal refusal       = DrawPrepRefusal::None;
+};
+
 // Writes the shader store on its own thread, running jobs in the order they were posted.
 class ShaderStoreWriter {
 public:
@@ -229,6 +268,15 @@ public:
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// KYTY_DRAW_PREP: GetGraphicsPrograms as a function of register copies that changes nothing in
+	// the cache: no translation or compile, no program, hint or tess-layout insert, no SRT memo, the
+	// materialized resources in `prep`. False, with prep.refusal set and `state` partly written, when
+	// the draw needs the serial path. GPU thread only for now (walker scratch, m_prep_key).
+	bool PrepareGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+	                             const HW::Shader& shaders, DrawRenderState& state,
+	                             DrawProgramPrep& prep);
+	// Whether nothing the certificate covers changed since `prep` was prepared.
+	[[nodiscard]] static bool DrawPrepCertificateHolds(const DrawProgramPrep& prep);
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
@@ -305,6 +353,29 @@ private:
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
+	// KYTY_DRAW_PREP: the lookup key of the pure path, apart from m_lookup_key (one per worker in M3).
+	ProgramKey                             m_prep_key;
+	// KYTY_PROGRAM_HINT=1: the program each stage found last. Elements of m_program_cache keep their
+	// address across rehashes; only WarmUp erases (before any lookup), and an erase must clear these.
+	using ProgramEntry = std::pair<const ProgramKey, Program>;
+	std::array<ProgramEntry*, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>
+	         m_program_hints {};
+	uint64_t m_program_hint_lookups = 0; // KYTY_VERIFY_PROGRAM_HINT statistics
+	uint64_t m_program_hint_hits    = 0;
+	// KYTY_COMPUTE_HINT=1: the program and the pipeline each compute shader found last, direct-mapped
+	// by the shader hash and the module id. The per-stage hint above holds a single compute program,
+	// and a frame cycles through ~60 compute shaders. A slot is used only when its stored key equals
+	// the lookup key, so a collision is a miss. Same lifetime rules as m_program_hints; elements of
+	// m_compute_pipelines are never erased before the destructor.
+	struct ComputePipelineHint {
+		uint64_t  module_id = 0;
+		Pipeline* pipeline  = nullptr;
+	};
+	static constexpr size_t COMPUTE_HINT_SLOTS = 1024; // ~66 shaders per frame: ~2 colliding pairs
+	std::array<ProgramEntry*, COMPUTE_HINT_SLOTS>       m_compute_program_hints {};
+	std::array<ComputePipelineHint, COMPUTE_HINT_SLOTS> m_compute_pipeline_hints {};
+	uint64_t m_compute_hint_lookups = 0; // KYTY_VERIFY_COMPUTE_HINT statistics
+	uint64_t m_compute_hint_hits    = 0;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -318,6 +389,20 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor);
+	// The register part of GetGraphicsPrograms, shared by the serial path (Pure = false, which
+	// always returns true) and PrepareGraphicsPrograms (Pure = true, `prep` non-null).
+	template <bool Pure>
+	bool GraphicsProgramsImpl(const HW::Context& context, const HW::UserConfig& user_config,
+	                          const HW::Shader& shaders, DrawRenderState& state,
+	                          DrawProgramPrep* prep);
+	// GetProgram without side effects on the cache: an existing program and module only, the
+	// resources materialized into `resources`. Null with `refusal` set otherwise.
+	template <typename InputInfo>
+	const ShaderModule* GetProgramPure(const ShaderParams& params, InputInfo& input_info,
+	                                   uint32_t&                                     push_data_cursor,
+	                                   ShaderRecompiler::IR::ResourceSnapshot&       resources,
+	                                   ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                   DrawPrepRefusal&                              refusal);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
@@ -340,6 +425,11 @@ private:
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
 };
+
+// KYTY_VERIFY_DRAW_PREP: the first field in which two program preparations of one draw differ
+// (modules, input infos, materialized resources, mrt mask), or null when they are equal.
+[[nodiscard]] const char* DiffGraphicsPrograms(const DrawRenderState& left,
+                                               const DrawRenderState& right);
 
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.

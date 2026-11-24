@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
 #include "graphics/host_gpu/renderer/upscaler/fsr.h"
+#include "graphics/presentation/window/streamline.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
@@ -1008,6 +1009,7 @@ void WindowContext::CreateVulkan() {
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	Streamline::Probe(graphic_ctx.physical_device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

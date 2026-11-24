@@ -1,0 +1,23 @@
+{
+    "id":  "PPSA23566",
+    "version":  "01.005.000",
+    "process":  "eboot.bin",
+    "mods":  [
+                 {
+                     "name":  "EXPERIMENT UNVALIDATED: elapsed / game frame budget, elapsed capped at 100 ms; alternative to elapsed/25 ms",
+                     "enabled":  false,
+                     "memory":  [
+                                    {
+                                        "offset":  "0x353db",
+                                        "off":  "4c89f84c29e0498946184c897b38",
+                                        "on":  "4c89f84c29e0e91aacfc0e909090"
+                                    },
+                                    {
+                                        "offset":  "0xf000000",
+                                        "off":  "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                                        "on":  "498946184c897b38498b4610483d00e1f5057e05b800e1f505498b4e084885c97e0e4839c87e0949f72e48f7f9498906e9b45303f1"
+                                    }
+                                ]
+                 }
+             ]
+}

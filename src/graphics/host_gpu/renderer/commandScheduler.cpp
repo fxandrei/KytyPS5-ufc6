@@ -8,11 +8,14 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -82,6 +85,348 @@ void MarkGpuCheckpoint(vk::CommandBuffer command, std::string_view name) {
 	}
 	// The marker is the name's index plus one, so that no marker is null.
 	command.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(it->second) + 1));
+}
+
+bool GpuBufferWordProbeEnabled() noexcept {
+	static const bool enabled = [] {
+		const auto* path = std::getenv("KYTY_GPU_BUFFER_WORD_PROBE");
+		return path != nullptr && *path != '\0';
+	}();
+	return enabled;
+}
+
+struct CommandScheduler::BufferWordProbe {
+	static constexpr uint32_t CAPACITY = 4096;
+	struct Sample {
+		uint64_t tick = 0;
+		uint64_t source_offset = 0;
+		std::string label;
+	};
+	GraphicContext& graphics;
+	std::FILE* file = nullptr;
+	std::unique_ptr<Buffer> readback;
+	vk::QueryPool queries;
+	std::array<Sample, CAPACITY> samples;
+	uint64_t stride = 4;
+	uint32_t next = 0;
+	uint32_t reported = 0;
+
+	BufferWordProbe(GraphicContext& graphics_, CommandScheduler& scheduler): graphics(graphics_) {
+		const auto* path = std::getenv("KYTY_GPU_BUFFER_WORD_PROBE");
+		file = path != nullptr ? std::fopen(path, "w") : nullptr;
+		if (file == nullptr) return;
+		vk::QueryPoolCreateInfo create{};
+		create.queryType = vk::QueryType::eTimestamp;
+		create.queryCount = CAPACITY;
+		if (graphics.device.createQueryPool(&create, nullptr, &queries) != vk::Result::eSuccess) {
+			std::fclose(std::exchange(file, nullptr));
+			return;
+		}
+		stride = std::max<uint64_t>(4, graphics.GetPhysicalDeviceProperties().limits.nonCoherentAtomSize);
+		readback = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, CAPACITY * stride);
+		SetVulkanObjectNameF(graphics.device, readback->Handle(), "GPU Buffer Word Probe");
+		if (graphics.host_query_reset_enabled) graphics.device.resetQueryPool(queries, 0, CAPACITY);
+		std::fprintf(file, "sample,tick,source_offset,gpu_timestamp,gpu_word_u32,gpu_word_i32,label\n");
+		std::fflush(file);
+	}
+
+	~BufferWordProbe() {
+		if (queries) graphics.device.destroyQueryPool(queries);
+		if (file != nullptr) std::fclose(file);
+	}
+
+	void Report(bool stalled, uint64_t completed_tick) {
+		if (file == nullptr) return;
+		for (; reported < next; ++reported) {
+			// Without host reset, even querying availability is invalid until the recorded
+			// reset has executed. Such devices can report only completed submission ticks.
+			if (!graphics.host_query_reset_enabled && samples[reported].tick > completed_tick) break;
+			std::array<uint64_t, 2> result{};
+			const auto status = graphics.device.getQueryPoolResults(
+			    queries, reported, 1, sizeof(result), result.data(), sizeof(result),
+			    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+			if (status != vk::Result::eSuccess || result[1] == 0) break;
+			const auto offset = reported * stride;
+			readback->Invalidate(offset, 4);
+			uint32_t word = 0;
+			std::memcpy(&word, readback->Mapped().data() + offset, sizeof(word));
+			const auto& sample = samples[reported];
+			std::fprintf(file, "%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%" PRId32 ",%s\n",
+			             reported, sample.tick, sample.source_offset, result[0], word,
+			             std::bit_cast<int32_t>(word), sample.label.c_str());
+		}
+		std::fflush(file);
+		if (stalled) {
+			std::printf("GPU buffer word probe: %u/%u copies available (capacity %u; no slot reuse)\n",
+			            reported, next, CAPACITY);
+			for (uint32_t i = reported; i < next; ++i) {
+				std::printf("GPU buffer word probe: pending sample %u tick %" PRIu64 " %s\n",
+				            i, samples[i].tick, samples[i].label.c_str());
+			}
+		}
+	}
+};
+
+void CommandScheduler::ProbeBufferWord(vk::Buffer source, uint64_t offset, std::string_view label) {
+	if (!GpuBufferWordProbeEnabled() || source == nullptr || (offset & 3u) != 0) return;
+	if (!m_buffer_word_probe) m_buffer_word_probe = std::make_unique<BufferWordProbe>(m_graphics, *this);
+	auto& probe = *m_buffer_word_probe;
+	if (probe.file == nullptr) return;
+	probe.Report(false, m_master.KnownGpuTick());
+	// Every slot/query is written only once, so an old availability bit cannot publish a new copy.
+	if (probe.next == BufferWordProbe::CAPACITY) return;
+	EndRendering();
+	const auto command = Current().Handle();
+	const auto index = probe.next++;
+	probe.samples[index] = {CurrentTick(), offset, std::string(label)};
+	if (!m_graphics.host_query_reset_enabled) command.resetQueryPool(probe.queries, index, 1);
+	vk::BufferMemoryBarrier2 before{};
+	before.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	before.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	before.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	before.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	before.srcQueueFamilyIndex = before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer = source;
+	before.offset = offset;
+	before.size = 4;
+	vk::DependencyInfo dependency{};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers = &before;
+	command.pipelineBarrier2(dependency);
+	command.copyBuffer(source, probe.readback->Handle(), vk::BufferCopy{offset, index * probe.stride, 4});
+	auto after = before;
+	after.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+	after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	after.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+	after.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	after.buffer = probe.readback->Handle();
+	after.offset = index * probe.stride;
+	dependency.pBufferMemoryBarriers = &after;
+	command.pipelineBarrier2(dependency);
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, probe.queries, index);
+}
+
+void CommandScheduler::ReportBufferWordProbes() {
+	if (m_buffer_word_probe) m_buffer_word_probe->Report(true, m_master.KnownGpuTick());
+}
+
+bool CommandScheduler::ReadbackTimingEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_TIMING");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+int64_t CommandScheduler::NowNs() noexcept {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void CommandScheduler::NoteReadbackWait(uint64_t write_tick, bool writer_in_open_buffer,
+                                        uint64_t in_flight, int64_t start_ns, int64_t flushed_ns,
+                                        int64_t done_ns, int64_t end_ns) {
+	struct Totals {
+		uint64_t n = 0, open = 0, waited = 0, flight = 0;
+		int64_t  total = 0, flush = 0, until_submit = 0, gpu = 0, priority = 0, max_total = 0;
+	};
+	static std::mutex mutex;
+	static Totals     sums;
+	static int64_t    window_start = 0;
+	const int64_t     submit_ns =
+	    m_submit_ns[write_tick % m_submit_ns.size()].load(std::memory_order_acquire);
+	std::lock_guard lock(mutex);
+	if (window_start == 0) window_start = start_ns;
+	sums.n++;
+	sums.open += writer_in_open_buffer ? 1 : 0;
+	sums.flight += in_flight;
+	sums.total += end_ns - start_ns;
+	sums.max_total = std::max(sums.max_total, end_ns - start_ns);
+	sums.flush += flushed_ns - start_ns;
+	if (done_ns - flushed_ns > 2000) sums.waited++;
+	// The writer's buffer may have been submitted before this readback started (submit_ns < start).
+	const int64_t submitted = std::max(submit_ns, start_ns);
+	sums.until_submit += std::clamp<int64_t>(submitted - start_ns, 0, done_ns - start_ns);
+	sums.gpu += std::max<int64_t>(done_ns - submitted, 0);
+	sums.priority += end_ns - done_ns;
+	if (end_ns - window_start >= 5'000'000'000) {
+		const double n       = static_cast<double>(sums.n);
+		const double seconds = static_cast<double>(end_ns - window_start) / 1e9;
+		std::printf("readback-timing: %.1fs n/s=%.1f avg_us total=%.1f flush=%.1f until_submit=%.1f "
+		            "gpu=%.1f priority=%.1f max_total_us=%.0f writer_open=%.0f%% waited=%.0f%% "
+		            "in_flight=%.2f\n",
+		            seconds, n / seconds, static_cast<double>(sums.total) / n / 1e3,
+		            static_cast<double>(sums.flush) / n / 1e3,
+		            static_cast<double>(sums.until_submit) / n / 1e3,
+		            static_cast<double>(sums.gpu) / n / 1e3,
+		            static_cast<double>(sums.priority) / n / 1e3,
+		            static_cast<double>(sums.max_total) / 1e3,
+		            100.0 * static_cast<double>(sums.open) / n,
+		            100.0 * static_cast<double>(sums.waited) / n,
+		            static_cast<double>(sums.flight) / n);
+		std::fflush(stdout);
+		sums         = {};
+		window_start = end_ns;
+	}
+}
+
+bool CommandScheduler::IndirectNotesEnabled() noexcept {
+	static const bool env_enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_NOTES");
+		return value != nullptr && *value == '1';
+	}();
+	return env_enabled || GpuCheckpointsEnabled() || HangDiagEnabled();
+}
+
+bool CommandScheduler::HangDiagEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HANG_DIAG");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+void CommandScheduler::NoteHangWork(char kind, uint64_t hash_a, uint64_t hash_b, uint32_t x,
+                                    uint32_t y, uint32_t z, const Buffer* args,
+                                    uint64_t args_offset, bool indexed, bool indirect) {
+	if (!HangDiagEnabled()) return;
+	std::lock_guard lock(m_hang_mutex);
+	if (m_hang_work.empty()) m_hang_work.resize(HANG_WORK_NOTES);
+	m_hang_work[m_hang_work_next++ % HANG_WORK_NOTES] = {
+	    args, args_offset, CurrentTick(), hash_a, hash_b, x, y, z, kind, indexed,
+	    indirect || args != nullptr};
+}
+
+void CommandScheduler::NoteHangBoundWord(const Buffer* buffer, uint64_t offset, uint64_t guest,
+                                         uint64_t shader_hash, uint32_t cpu_word_at_record,
+                                         bool gpu_dirty) {
+	if (!HangDiagEnabled()) return;
+	std::lock_guard lock(m_hang_mutex);
+	m_hang_bounds[m_hang_bound_next++ % HANG_BOUND_NOTES] = {
+	    buffer, offset, guest, CurrentTick(), shader_hash, cpu_word_at_record, gpu_dirty};
+}
+
+// Reads only host-coherent mappings (no Invalidate, no commands, no waits): safe while the GPU
+// hangs. Buffers used by unfinished ticks are still alive (see ReportIndirectDraws).
+void CommandScheduler::ReportHangNotes(uint64_t finished) {
+	if (!HangDiagEnabled()) return;
+	std::lock_guard lock(m_hang_mutex);
+	const uint64_t stuck = finished + 1;
+	const auto read_word = [](const Buffer* buffer, uint64_t offset, uint32_t* out,
+	                          uint32_t words) -> const char* {
+		if (buffer == nullptr) return "none";
+		const auto mapped = buffer->Mapped();
+		if (mapped.empty()) return "unmapped";
+		if (!buffer->IsCoherent()) return "noncoherent";
+		if (offset > mapped.size() || mapped.size() - offset < uint64_t {words} * 4u) {
+			return "out-of-range";
+		}
+		std::memcpy(out, mapped.data() + offset, words * 4u);
+		return "mapped";
+	};
+	// The work of the started, unfinished command buffer, in recording order.
+	const uint64_t total = m_hang_work_next;
+	const uint64_t first = total > HANG_WORK_NOTES ? total - HANG_WORK_NOTES : 0;
+	uint64_t       in_stuck = 0;
+	uint64_t       in_flight = 0;
+	uint64_t       oldest_flight = 0;
+	for (uint64_t i = first; i < total; ++i) {
+		const auto& note = m_hang_work[i % HANG_WORK_NOTES];
+		if (note.tick <= finished) continue;
+		if (in_flight++ == 0) oldest_flight = note.tick;
+		if (note.tick == stuck) ++in_stuck;
+	}
+	std::printf("hang-diag: finished %" PRIu64 ", stuck tick %" PRIu64 ": %" PRIu64
+	            " draws/dispatches in it, %" PRIu64 " in unfinished ticks (oldest noted %" PRIu64
+	            ", ring %s)\n",
+	            finished, stuck, in_stuck, in_flight, oldest_flight,
+	            first > 0 && oldest_flight > stuck ? "TOO SMALL" : "ok");
+	uint64_t shown = 0;
+	for (uint64_t i = first; i < total; ++i) {
+		const auto& note = m_hang_work[i % HANG_WORK_NOTES];
+		if (note.tick != stuck) continue;
+		// The first 48 and the last 48 entries of the stuck command buffer.
+		++shown;
+		if (shown > 48 && in_stuck - shown >= 48) continue;
+		std::array<uint32_t, 5> args {};
+		const char*             state = "-";
+		if (note.args != nullptr) {
+			state = read_word(note.args, note.args_offset, args.data(), note.indexed ? 5u : 4u);
+		}
+		if (note.kind == 'D') {
+			std::printf("hang-diag: #%" PRIu64 " draw vs-h%016" PRIx64 " ps-h%016" PRIx64
+			            " rt%ux%u n%u%s args[%s] %u %u %u %u %u\n",
+			            shown, note.hash_a, note.hash_b, note.x, note.y, note.z,
+			            note.indirect ? " indirect" : "", state, args[0], args[1], args[2],
+			            args[3], args[4]);
+		} else {
+			std::printf("hang-diag: #%" PRIu64 " dispatch cs-h%016" PRIx64 " g%ux%ux%u%s\n",
+			            shown, note.hash_a, note.x, note.y, note.z,
+			            note.indirect ? " indirect" : "");
+		}
+	}
+	// The filter loop bound (signed compare: a word in [bound, INT32_MAX] loops that many times).
+	for (uint64_t i = m_hang_bound_next; i > 0 && i + HANG_BOUND_NOTES > m_hang_bound_next; --i) {
+		const auto& note = m_hang_bounds[(i - 1) % HANG_BOUND_NOTES];
+		if (note.buffer == nullptr || note.tick <= finished) continue;
+		uint32_t   gpu_word = 0;
+		const auto state    = read_word(note.buffer, note.offset, &gpu_word, 1);
+		uint32_t   cpu_now  = 0;
+		const bool cpu_ok   = LibKernel::Memory::TryReadBacking(note.guest, &cpu_now, 4);
+		std::printf("hang-diag: filter bound tick %" PRIu64 " ps-h%016" PRIx64 " guest 0x%" PRIx64
+		            " gpu[%s] %d cpu@record %d cpu-now[%s] %d gpu-dirty@record %d\n",
+		            note.tick, note.shader_hash, note.guest, state,
+		            std::bit_cast<int32_t>(gpu_word), std::bit_cast<int32_t>(note.cpu_word),
+		            cpu_ok ? "ok" : "unreadable", std::bit_cast<int32_t>(cpu_now),
+		            note.gpu_dirty ? 1 : 0);
+	}
+	std::fflush(stdout);
+}
+
+void CommandScheduler::NoteIndirectDraw(const Buffer* args, uint64_t offset, uint32_t count,
+                                        uint32_t stride, bool indexed, uint64_t vs_hash,
+                                        uint64_t ps_hash) {
+	if (!IndirectNotesEnabled() || args == nullptr) return;
+	std::lock_guard lock(m_indirect_notes_mutex);
+	auto& note = m_indirect_notes[m_indirect_notes_next++ % INDIRECT_NOTES];
+	note       = {args, offset, args->CpuAddress() + offset, CurrentTick(), vs_hash, ps_hash,
+	              count, stride, indexed};
+}
+
+// Buffers that draws of an unfinished tick use are destroyed only after that tick completes, so
+// the notes of in-flight ticks still point at live buffers.
+void CommandScheduler::ReportIndirectDraws(uint64_t finished) {
+	if (!IndirectNotesEnabled()) return;
+	std::lock_guard lock(m_indirect_notes_mutex);
+	const uint64_t total = m_indirect_notes_next;
+	const uint64_t first = total > INDIRECT_NOTES ? total - INDIRECT_NOTES : 0;
+	int            shown = 0;
+	for (uint64_t i = total; i > first && shown < 24; --i) {
+		const auto& note = m_indirect_notes[(i - 1) % INDIRECT_NOTES];
+		if (note.args == nullptr || note.tick <= finished) continue;
+		++shown;
+		const uint32_t words = note.indexed ? 5u : 4u;
+		std::array<uint32_t, 5> gpu {};
+		std::array<uint32_t, 5> cpu {};
+		const auto mapped = note.args->Mapped();
+		// Only host-coherent mappings (resizable BAR) are read; Invalidate() is for Download buffers.
+		const bool gpu_ok = note.args->IsCoherent() && mapped.size() >= note.offset + words * 4u;
+		if (gpu_ok) {
+			std::memcpy(gpu.data(), mapped.data() + note.offset, words * 4u);
+		}
+		const bool cpu_ok = LibKernel::Memory::TryReadBacking(note.guest, cpu.data(), words * 4u);
+		std::printf("GPU stall: indirect draw tick %" PRIu64 " vs-h%016" PRIx64 " ps-h%016" PRIx64
+		            " guest 0x%" PRIx64 " count %u stride %u %s gpu[%s] %u %u %u %u %u cpu[%s] %u "
+		            "%u %u %u %u\n",
+		            note.tick, note.vs_hash, note.ps_hash, note.guest, note.count, note.stride,
+		            note.indexed ? "indexed" : "plain", gpu_ok ? "mapped" : (mapped.empty() ? "unmapped" : "noncoherent"), gpu[0],
+		            gpu[1], gpu[2], gpu[3], gpu[4], cpu_ok ? "ok" : "unreadable", cpu[0], cpu[1],
+		            cpu[2], cpu[3], cpu[4]);
+	}
+	std::printf("GPU stall: %d indirect draws in flight shown (of %" PRIu64 " noted)\n", shown,
+	            total);
 }
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
@@ -160,6 +505,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	ReportBufferWordProbes();
 	if (m_gpu_timer_pool) {
 		m_graphics.device.destroyQueryPool(m_gpu_timer_pool);
 	}
@@ -339,17 +685,24 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	QueueOperation(std::move(operation), false);
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              uint64_t guest_vaddr, uint64_t guest_size) {
+	EXIT_IF(guest_size > UINT64_MAX - guest_vaddr);
+	QueueOperation(std::move(operation), true, guest_vaddr, guest_vaddr + guest_size);
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                      uint64_t guest_begin, uint64_t guest_end) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		if (priority) {
+			m_priority_operations.push_back(
+			    {std::move(operation), CurrentTick(), guest_begin, guest_end});
+		} else {
+			m_pending_operations.push({std::move(operation), CurrentTick()});
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -369,6 +722,38 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 	return !m_priority_operations.empty() || m_priority_active_tick != 0;
 }
 
+uint64_t CommandScheduler::NewestGuestPublicationTick(uint64_t vaddr, uint64_t size) {
+	const uint64_t   end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	uint64_t         tick = 0;
+	std::lock_guard  lock(m_operation_mutex);
+	const auto overlaps = [&](uint64_t begin, uint64_t finish) {
+		return begin < finish && begin < end && vaddr < finish;
+	};
+	if (m_priority_active_tick != 0 && overlaps(m_priority_active_begin, m_priority_active_end)) {
+		tick = m_priority_active_tick;
+	}
+	// Queue order is tick order, so the last overlapping entry is the newest; the queue holds a
+	// few entries (completions of the last frames).
+	for (const auto& operation: m_priority_operations) {
+		if (overlaps(operation.guest_begin, operation.guest_end)) {
+			tick = std::max(tick, operation.tick);
+		}
+	}
+	return tick;
+}
+
+uint64_t CommandScheduler::PendingGuestPublications() {
+	std::lock_guard lock(m_operation_mutex);
+	uint64_t        count = m_priority_active_tick != 0 &&
+	                         m_priority_active_begin < m_priority_active_end
+	                            ? 1
+	                            : 0;
+	for (const auto& operation: m_priority_operations) {
+		count += operation.guest_begin < operation.guest_end ? 1 : 0;
+	}
+	return count;
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
@@ -381,8 +766,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active_tick = operation.tick;
+			m_priority_operations.pop_front();
+			m_priority_active_tick  = operation.tick;
+			m_priority_active_begin = operation.guest_begin;
+			m_priority_active_end   = operation.guest_end;
 		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
@@ -390,7 +777,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active_tick = 0;
+			m_priority_active_tick  = 0;
+			m_priority_active_begin = 0;
+			m_priority_active_end   = 0;
 		}
 		m_operation_available.notify_all();
 	}
@@ -478,8 +867,26 @@ uint32_t CommandScheduler::AllocateGpuTimer() {
 	if ((m_gpu_timer_pending.size() + 1) * 2 >= GPU_TIMER_QUERIES) {
 		return UINT32_MAX;
 	}
+	// KYTY_GPU_MARKERS (diagnostic): a guest marker keeps its pair from PUSH to POP, possibly for
+	// seconds, while the ring wraps. Handing that pair to a new timer let the marker's late end
+	// stamp overwrite the new timer's end (inflating it) and vice versa. Skip pairs still owned.
+	static const bool track_pairs = std::getenv("KYTY_GPU_MARKERS") != nullptr;
+	if (track_pairs) {
+		if (m_gpu_pair_busy.empty()) {
+			m_gpu_pair_busy.assign(GPU_TIMER_QUERIES / 2, 0);
+		}
+		for (uint32_t tries = 0; m_gpu_pair_busy[m_gpu_timer_next / 2] != 0; tries++) {
+			m_gpu_timer_next = (m_gpu_timer_next + 2) % GPU_TIMER_QUERIES;
+			if (tries == 64) {
+				return UINT32_MAX;
+			}
+		}
+	}
 	const auto query = m_gpu_timer_next;
 	m_gpu_timer_next = (m_gpu_timer_next + 2) % GPU_TIMER_QUERIES;
+	if (track_pairs) {
+		m_gpu_pair_busy[query / 2] = 1;
+	}
 	if (m_graphics.host_query_reset_enabled) {
 		m_graphics.device.resetQueryPool(m_gpu_timer_pool, query, 2);
 	} else {
@@ -507,8 +914,18 @@ uint32_t CommandScheduler::BeginGpuMarker() {
 	return query;
 }
 
+void CommandScheduler::ReleaseGpuTimerPair(uint32_t query) {
+	if (query != UINT32_MAX && !m_gpu_pair_busy.empty()) {
+		m_gpu_pair_busy[(query % GPU_TIMER_QUERIES) / 2] = 0;
+	}
+}
+
 void CommandScheduler::EndGpuMarker(uint32_t scope, std::string_view name) {
-	if (scope == UINT32_MAX || m_command.IsInvalid()) {
+	if (scope == UINT32_MAX) {
+		return;
+	}
+	if (m_command.IsInvalid()) {
+		ReleaseGpuTimerPair(scope);
 		return;
 	}
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_timer_pool,
@@ -559,7 +976,8 @@ void CommandScheduler::DumpGpuMarkers() {
 	                         std::chrono::system_clock::now().time_since_epoch())
 	                         .count();
 	std::fprintf(file, "# unix_ms %lld\n", static_cast<long long>(unix_ms));
-	for (size_t i = 0; i < order.size() && i < 300; i++) {
+	// 1500, not 300: names that drop out of a truncated list make per-window deltas unusable.
+	for (size_t i = 0; i < order.size() && i < 1500; i++) {
 		const auto id = order[i];
 		std::fprintf(file, "%s\t%llu\t%.3f\n", m_marker_names[id].c_str(),
 		             static_cast<unsigned long long>(m_marker_counts[id]),
@@ -600,7 +1018,11 @@ uint32_t CommandScheduler::BeginGpuScope() {
 }
 
 void CommandScheduler::EndGpuScope(uint32_t scope, Common::DebugCounters::Counter counter) {
-	if (scope == UINT32_MAX || m_command.IsInvalid()) {
+	if (scope == UINT32_MAX) {
+		return;
+	}
+	if (m_command.IsInvalid()) {
+		ReleaseGpuTimerPair(scope);
 		return;
 	}
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_gpu_timer_pool,
@@ -657,6 +1079,9 @@ void CommandScheduler::ReportStall(uint64_t tick) {
 			            id != 0 && id <= names.names.size() ? names.names[id - 1].c_str() : "?");
 		}
 	}
+	ReportIndirectDraws(finished);
+	ReportHangNotes(finished);
+	if (GuestGpu::IsGpuThread()) ReportBufferWordProbes();
 	// The pending timers belong to the GPU thread, which records here.
 	if (!m_gpu_timer_pool || !GuestGpu::IsGpuThread()) {
 		std::fflush(stdout);
@@ -699,6 +1124,7 @@ void CommandScheduler::ReadGpuTimers() {
 	while (!m_gpu_timer_pending.empty() && m_master.IsFree(m_gpu_timer_pending.front().tick)) {
 		const auto timer = m_gpu_timer_pending.front();
 		m_gpu_timer_pending.pop_front();
+		ReleaseGpuTimerPair(timer.query);
 		std::array<uint64_t, 2> stamps {};
 		if (m_graphics.device.getQueryPoolResults(
 		        m_gpu_timer_pool, timer.query, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
@@ -741,7 +1167,10 @@ void CommandScheduler::ReadGpuTimers() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
-	if (m_host_read_barrier) {
+	// Diagnostic only: with unmapped guest buffers, bit 11 otherwise has no readback effect.
+	// Alternate the blanket host visibility operation without exposing direct BAR reads.
+	if (m_host_read_barrier ||
+	    (m_host_read_barrier_ab && Common::AbSwitch::Enabled(Common::AbSwitch::DIRECT_READBACK))) {
 		m_command.EndRendering();
 		vk::MemoryBarrier barrier {};
 		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
@@ -826,6 +1255,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		if (ReadbackTimingEnabled()) [[unlikely]] {
+			m_submit_ns[tick % m_submit_ns.size()].store(NowNs(), std::memory_order_release);
+		}
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
@@ -930,6 +1362,9 @@ void CommandScheduler::SubmitQueuedJob(const QueuedSubmit& job) {
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_graphics.queue_mutex);
+		if (ReadbackTimingEnabled()) [[unlikely]] {
+			m_submit_ns[job.tick % m_submit_ns.size()].store(NowNs(), std::memory_order_release);
+		}
 		result = m_graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	if (result != vk::Result::eSuccess) {

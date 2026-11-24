@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -33,6 +34,7 @@ namespace Libs::Graphics {
 // operation of the renderer's own (copies, tiling, blits), for the stall and lost-device report.
 [[nodiscard]] bool GpuCheckpointsEnabled() noexcept;
 void               MarkGpuCheckpoint(vk::CommandBuffer command, std::string_view name);
+[[nodiscard]] bool GpuBufferWordProbeEnabled() noexcept;
 
 class CommandScheduler {
 public:
@@ -69,8 +71,18 @@ public:
 	void WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// A priority operation that writes guest memory (or changes its page protection) names that
+	// guest range, so an unmap waits only for the publications into its own range
+	// (KYTY_UNMAP_TARGETED). Operations without a range must not touch guest memory.
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                                                 uint64_t guest_vaddr = 0,
+	                                                 uint64_t guest_size  = 0);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// The newest tick of a queued or running priority operation whose guest range overlaps
+	// [vaddr, vaddr + size), or 0 when none does.
+	[[nodiscard]] uint64_t NewestGuestPublicationTick(uint64_t vaddr, uint64_t size);
+	// Queued or running priority operations that carry a guest range (KYTY_VERIFY_UNMAP_TARGETED).
+	[[nodiscard]] uint64_t PendingGuestPublications();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Installs the Vulkan command hooks and, with AbSwitch RECORD_THREAD (or KYTY_AB_FILE, so the
 	// switch can be toggled inside a run), starts the submit thread that records the GPU thread's
@@ -97,6 +109,39 @@ public:
 	// With KYTY_GPU_SHADERS (and KYTY_GPU_MARKERS for the output): the same per draw or dispatch,
 	// keyed by its shader addresses.
 	[[nodiscard]] uint32_t BeginGpuShaderTimer();
+	// Opt-in diagnostics: snapshot one native dword before a suspect operation, without
+	// submitting or waiting. Query availability permits reporting completed copies on a stall.
+	void ProbeBufferWord(vk::Buffer source, uint64_t offset, std::string_view label);
+	void ReportBufferWordProbes();
+	// With KYTY_GPU_CHECKPOINTS: remembers the argument range of the latest indirect draws. A
+	// stall report then prints, for draws still in flight, the argument words as the GPU sees
+	// them (read through the buffer's host mapping) next to the guest's CPU backing. Adds no GPU
+	// commands, so it does not change the timing of the run.
+	void NoteIndirectDraw(const Buffer* args, uint64_t offset, uint32_t count, uint32_t stride,
+	                      bool indexed, uint64_t vs_hash, uint64_t ps_hash);
+	[[nodiscard]] bool CheckpointsEnabled() const noexcept { return m_graphics_checkpoints; }
+	// Indirect-draw notes are on with KYTY_GPU_CHECKPOINTS or, without the checkpoint labels'
+	// cost (~12% of the GPU thread), with KYTY_INDIRECT_NOTES=1.
+	[[nodiscard]] static bool IndirectNotesEnabled() noexcept;
+	// KYTY_HANG_DIAG=1 (diagnostic, default off, adds no GPU commands): a ring of the latest draws
+	// and dispatches (programs, size, indirect) and of the GPU-visible loop-bound word of the two
+	// screen-space filter pixel shaders seen at the arena-transition hang. A stall report prints,
+	// for the command buffer the GPU started and has not finished (tick finished + 1), a summary
+	// of its work and the bound word as the GPU sees it (host mapping) and as the CPU backing has
+	// it. Also turns on the indirect-draw notes.
+	[[nodiscard]] static bool HangDiagEnabled() noexcept;
+	void NoteHangWork(char kind, uint64_t hash_a, uint64_t hash_b, uint32_t x, uint32_t y,
+	                  uint32_t z, const Buffer* args = nullptr, uint64_t args_offset = 0,
+	                  bool indexed = false, bool indirect = false);
+	void NoteHangBoundWord(const Buffer* buffer, uint64_t offset, uint64_t guest,
+	                       uint64_t shader_hash, uint32_t cpu_word_at_record, bool gpu_dirty);
+	// KYTY_READBACK_TIMING=1 (diagnostic): every direct readback wait is split into the time until
+	// the writer's command buffer was submitted (record stream lag included) and the time the GPU
+	// then needed; a summary line is printed every 5 s.
+	[[nodiscard]] static bool ReadbackTimingEnabled() noexcept;
+	void NoteReadbackWait(uint64_t write_tick, bool writer_in_open_buffer, uint64_t in_flight,
+	                      int64_t start_ns, int64_t flushed_ns, int64_t done_ns, int64_t end_ns);
+	[[nodiscard]] static int64_t NowNs() noexcept;
 
 	// With KYTY_GPU_CHECKPOINTS: marks the GPU position before a draw or dispatch, named by
 	// make_name() (only called when checkpoints are on), for the stall and lost-device report.
@@ -116,7 +161,10 @@ public:
 	}
 	// Every submitted command buffer then ends with a barrier that makes its writes visible to the
 	// host, for guest buffers read in place (AbSwitch DIRECT_READBACK).
-	void SetHostReadBarrier(bool enabled) noexcept { m_host_read_barrier = enabled; }
+	void SetHostReadBarrier(bool enabled, bool diagnostic_ab = false) noexcept {
+		m_host_read_barrier = enabled;
+		m_host_read_barrier_ab = diagnostic_ab;
+	}
 	// The tick clock that image ages use (TextureCache, ImageHeap): eager submits do not count,
 	// so they do not make cached images look older than before.
 	[[nodiscard]] uint64_t AgeTick() const noexcept { return CurrentTick() - m_eager_submits; }
@@ -132,6 +180,55 @@ public:
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
+	struct BufferWordProbe;
+	std::unique_ptr<BufferWordProbe> m_buffer_word_probe;
+	struct IndirectDrawNote {
+		const Buffer* args     = nullptr;
+		uint64_t      offset   = 0;
+		uint64_t      guest    = 0;
+		uint64_t      tick     = 0;
+		uint64_t      vs_hash  = 0;
+		uint64_t      ps_hash  = 0;
+		uint32_t      count    = 0;
+		uint32_t      stride   = 0;
+		bool          indexed  = false;
+	};
+	static constexpr uint32_t                   INDIRECT_NOTES = 256;
+	std::mutex                                  m_indirect_notes_mutex;
+	std::array<IndirectDrawNote, INDIRECT_NOTES> m_indirect_notes {};
+	uint64_t                                    m_indirect_notes_next = 0;
+	void                                        ReportIndirectDraws(uint64_t finished);
+	struct HangWorkNote {
+		const Buffer* args        = nullptr;
+		uint64_t      args_offset = 0;
+		uint64_t      tick        = 0;
+		uint64_t      hash_a      = 0;
+		uint64_t      hash_b      = 0;
+		uint32_t      x           = 0;
+		uint32_t      y           = 0;
+		uint32_t      z           = 0;
+		char          kind        = 0;
+		bool          indexed     = false;
+		bool          indirect    = false;
+	};
+	struct HangBoundNote {
+		const Buffer* buffer      = nullptr;
+		uint64_t      offset      = 0;
+		uint64_t      guest       = 0;
+		uint64_t      tick        = 0;
+		uint64_t      shader_hash = 0;
+		uint32_t      cpu_word    = 0;
+		bool          gpu_dirty   = false;
+	};
+	static constexpr uint32_t                   HANG_WORK_NOTES  = 8192;
+	static constexpr uint32_t                   HANG_BOUND_NOTES = 64;
+	std::mutex                                  m_hang_mutex;
+	std::vector<HangWorkNote>                   m_hang_work;
+	std::array<HangBoundNote, HANG_BOUND_NOTES> m_hang_bounds {};
+	uint64_t                                    m_hang_work_next  = 0;
+	uint64_t                                    m_hang_bound_next = 0;
+	void                                        ReportHangNotes(uint64_t finished);
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
@@ -158,6 +255,9 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		// The guest range a priority operation writes, [guest_begin, guest_end); empty for none.
+		uint64_t guest_begin = 0;
+		uint64_t guest_end   = 0;
 	};
 
 	void                   BeginNext();
@@ -182,7 +282,8 @@ private:
 	void SubmitQueuedJob(const QueuedSubmit& job);
 	// Returns once every queued submit is in the queue, so a direct submit cannot overtake one.
 	void DrainQueuedSubmits();
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                    uint64_t guest_begin = 0, uint64_t guest_end = 0);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -192,7 +293,8 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	// A deque, not a queue: an unmap looks for the publications into its range (KYTY_UNMAP_TARGETED).
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
@@ -206,7 +308,10 @@ private:
 	// recorded and submitted in order by the submit thread (see CommandStream).
 	std::unique_ptr<CommandStream> m_stream;
 	uint64_t                       m_priority_active_tick = 0; // 0 while none runs
-	OperationState                 m_operation_state      = OperationState::Open;
+	// The running priority operation's guest range (m_operation_mutex).
+	uint64_t                       m_priority_active_begin = 0;
+	uint64_t                       m_priority_active_end   = 0;
+	OperationState                m_operation_state      = OperationState::Open;
 
 	// Diagnostics while the counters are on: GPU execution time of each command buffer, from
 	// timestamps at its start and end, read once its tick completes (Counter::GpuBusyNs).
@@ -235,6 +340,10 @@ private:
 	uint32_t                  m_gpu_timer_next  = 0;
 	uint32_t                  m_gpu_timer_query = UINT32_MAX;
 	std::deque<GpuTimerQuery> m_gpu_timer_pending;
+	// With KYTY_GPU_MARKERS: query pairs still owned by a timer (1 per pair). Guest markers stay
+	// open across many command buffers and are not in m_gpu_timer_pending until they close.
+	std::vector<uint8_t>      m_gpu_pair_busy;
+	void                      ReleaseGpuTimerPair(uint32_t query);
 
 	std::unordered_map<std::string, uint32_t> m_marker_ids;
 	std::vector<std::string>                  m_marker_names;
@@ -246,8 +355,11 @@ private:
 	uint64_t                                  m_eager_submits         = 0;
 	bool                                      m_graphics_checkpoints  = false;
 	bool                                      m_host_read_barrier     = false;
+	bool                                      m_host_read_barrier_ab  = false;
 	bool                                      m_direct_submit         = false; // FlushUrgent
 	bool                                      m_flush_after_record    = false;
+	// KYTY_READBACK_TIMING: steady-clock ns of each tick's vkQueueSubmit call (tick % 4096).
+	std::array<std::atomic<int64_t>, 4096> m_submit_ns {};
 	uint32_t                                  m_pop_calls             = 0; // AbSwitch LAZY_GPU_POLL
 	uint64_t                                  m_last_verify_tick = UINT64_MAX; // KYTY_VERIFY_RECORD
 	// A chained compute dispatch left its access barrier for the next sync point (AbSwitch

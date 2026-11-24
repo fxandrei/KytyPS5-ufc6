@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
+#include "kernel/memory.h"
 #if defined(TRACY_ENABLE)
 // Standalone IR tests do not link the emulator's profiling runtime.
 #include "common/profiler.h"
@@ -1618,6 +1621,89 @@ static bool MaterializeWalked(const ResourcePlan& program, const SrtRuntime& obs
                               ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                               MaterializationMemo* memo);
 
+const bool g_verify_prewalk = std::getenv("KYTY_VERIFY_PREWALK") != nullptr;
+
+// AbSwitch SRT_PREWALK_MEMO: the inputs of the walk that just ran, if it may be reused (see
+// MaterializationMemo).
+static void RecordPrewalk(const ResourcePlan& program, const SrtRuntime& runtime,
+                          MaterializationMemo& memo, uint64_t skipped_before) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	if (SrtWalkerLastOptionalUnknowns() != 0 || SrtWalkerSkippedLoads() != skipped_before) {
+		Add(Counter::SrtPrewalkNotRecorded);
+		return;
+	}
+	uint64_t mask = 0;
+	memo.prewalk_user_data.clear();
+	if (SrtWalkerUserDataMask(program, mask) && mask != 0) {
+		for (auto bits = mask; bits != 0; bits &= bits - 1)
+			memo.prewalk_user_data.push_back(runtime.user_data[std::countr_zero(bits)]);
+	} else {
+		mask = 0;
+		memo.prewalk_user_data.assign(runtime.user_data.begin(),
+		                              runtime.user_data.begin() + program.srt_user_data);
+	}
+	memo.prewalk_user_mask   = mask;
+	memo.prewalk_workgroups.assign(runtime.workgroup_counts.begin(), runtime.workgroup_counts.end());
+	memo.prewalk_shader_base = runtime.shader_base;
+	memo.prewalk_epoch       = LibKernel::Memory::GuestMapEpoch();
+	memo.prewalk_addresses.clear();
+	memo.prewalk_values.clear();
+	for (const auto& [address, size]: memo.prewalk_captures) {
+		// The walker read a GPU-written page through the slow path: its bytes are not the guest's.
+		if (SrtPageReadWatched(address)) {
+			Add(Counter::SrtPrewalkNotRecorded);
+			return;
+		}
+		memo.prewalk_addresses.push_back(address);
+		const uint32_t value = *reinterpret_cast<const volatile uint32_t*>(address);
+		memo.prewalk_values.push_back(value);
+	}
+	memo.prewalk_valid = true;
+}
+
+static bool PrewalkUserDataUnchanged(const SrtRuntime& runtime, const MaterializationMemo& memo) {
+	const auto& recorded = memo.prewalk_user_data;
+	if (memo.prewalk_user_mask == 0) {
+		return runtime.user_data.size() >= recorded.size() &&
+		       std::memcmp(runtime.user_data.data(), recorded.data(),
+		                   recorded.size() * sizeof(uint32_t)) == 0;
+	}
+	size_t i = 0;
+	for (auto bits = memo.prewalk_user_mask; bits != 0; bits &= bits - 1, ++i) {
+		const auto index = static_cast<size_t>(std::countr_zero(bits));
+		if (index >= runtime.user_data.size() || runtime.user_data[index] != recorded[i]) return false;
+	}
+	return true;
+}
+
+static bool PrewalkUnchanged(const SrtRuntime& runtime, const MaterializationMemo& memo) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	if (memo.prewalk_epoch != LibKernel::Memory::GuestMapEpoch()) {
+		Add(Counter::SrtPrewalkEpochMiss);
+		return false;
+	}
+	if (memo.prewalk_shader_base != runtime.shader_base ||
+	    !std::ranges::equal(memo.prewalk_workgroups, runtime.workgroup_counts) ||
+	    !PrewalkUserDataUnchanged(runtime, memo)) {
+		Add(Counter::SrtPrewalkUserDataMiss);
+		return false;
+	}
+	for (size_t i = 0; i < memo.prewalk_addresses.size(); ++i) {
+		const auto address = memo.prewalk_addresses[i];
+		if (SrtPageReadWatched(address)) {
+			Add(Counter::SrtPrewalkWatchedMiss);
+			return false;
+		}
+		if (*reinterpret_cast<const volatile uint32_t*>(address) != memo.prewalk_values[i]) {
+			Add(Counter::SrtPrewalkValueMiss);
+			return false;
+		}
+	}
+	return true;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           MaterializationMemo* memo) {
@@ -1629,14 +1715,53 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
 	    (runtime.indirect_args_address != 0u &&
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
+	// AbSwitch SRT_PREWALK_MEMO: only plans whose materialization reads no guest memory besides the
+	// walker's loads, selects no keys and uses no image heap (direct dispatch dimensions are part of
+	// the recorded inputs).
+	const bool prewalk = memo != nullptr && !capture_reads && program.selector_keys.empty() &&
+	                     !program.info.uses_image_heap &&
+	                     Common::AbSwitch::Enabled(Common::AbSwitch::SRT_PREWALK_MEMO);
+	bool                  verify_prewalk = false;
+	std::vector<uint32_t> verify_flat;
+	std::vector<uint8_t>  verify_key;
+	if (memo != nullptr) {
+		if (prewalk && !(memo->valid && memo->prewalk_valid))
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtPrewalkNoRecord);
+		if (prewalk && memo->valid && memo->prewalk_valid && PrewalkUnchanged(runtime, *memo)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtPrewalkHits);
+			if (!g_verify_prewalk) {
+				// The shader's own user data (push data) may differ beyond the walker's DWORDs.
+				snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+				memo->reused = true;
+				return true;
+			}
+			verify_prewalk = true;
+			verify_flat    = snapshot.flattened_srt;
+			const auto key = WalkedResourceKey(program);
+			verify_key.assign(key.begin(), key.end());
+		}
+		memo->prewalk_valid = false;
+	}
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
+	const uint64_t skipped_before = prewalk ? SrtWalkerSkippedLoads() : 0;
+	if (prewalk) memo->prewalk_captures.clear();
 	bool walked;
 	{
 #if defined(TRACY_ENABLE)
 		KYTY_PROFILER_BLOCK("SRT: walk");
 #endif
-		walked = WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
+		walked = WalkSrt(program, runtime, snapshot.flattened_srt,
+		                 capture_reads ? &reads : (prewalk ? &memo->prewalk_captures : nullptr));
+	}
+	if (walked && prewalk) RecordPrewalk(program, runtime, *memo, skipped_before);
+	if (verify_prewalk) [[unlikely]] {
+		const auto key = WalkedResourceKey(program);
+		if (!walked || verify_flat != snapshot.flattened_srt ||
+		    !std::ranges::equal(verify_key, key)) {
+			EXIT("SRT prewalk verify: a reused walk differs (stage={} hash=0x{:016x})\n",
+			     static_cast<uint32_t>(program.stage), program.shader_hash);
+		}
 	}
 	if (!walked) {
 		if (memo != nullptr) {
@@ -1699,10 +1824,12 @@ static bool MaterializeWalked(const ResourcePlan& program, const SrtRuntime& obs
 		} else {
 			if (memo->eligible < 0) memo->eligible = EligibleForMemo(program) ? 1 : 0;
 			if (memo->eligible != 0) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtMemoCalls);
 				if (memo->valid) {
 					const auto key = WalkedResourceKey(program);
 					if (memo->key.size() == key.size() &&
 					    (key.empty() || std::memcmp(memo->key.data(), key.data(), key.size()) == 0)) {
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::SrtMemoHits);
 						snapshot.user_data.assign(observed.user_data.begin(),
 						                          observed.user_data.end());
 						memo->reused      = true;

@@ -93,6 +93,28 @@ public:
 	[[nodiscard]] std::pair<uint64_t, uint64_t> GpuDirtyRangeAt(uint64_t vaddr) const {
 		return m_gpu_modified_ranges.Containing(vaddr);
 	}
+	// KYTY_SRT_DIRTY_STATS diagnostics (2026-11-19): the newest recorded GPU write that covers
+	// `vaddr` (end == 0 when none), tagged with the shader whose bindings were being prepared.
+	struct CoveringWrite {
+		uint64_t begin  = 0;
+		uint64_t end    = 0;
+		uint64_t tick   = 0;
+		uint64_t writer = 0;
+	};
+	[[nodiscard]] CoveringWrite NewestCoveringWrite(uint64_t vaddr) const;
+	// True when a recorded GPU write the GPU has not completed yet (as far as the CPU knows) may
+	// cover `vaddr`, conservatively true when such a write left the ring (AbSwitch
+	// SRT_OPTIONAL_DIRTY_UNKNOWN). GPU thread only.
+	[[nodiscard]] bool HasInFlightWriteAt(uint64_t vaddr) const;
+	// KYTY_SRT_DIRTY_STATS diagnostics: the newest in-flight write tick covering [vaddr, vaddr + size)
+	// and the newest overlapping [window_begin, window_end), 0 when none; writer of the first.
+	struct InFlightTicks {
+		uint64_t exact = 0, window = 0, writer = 0, known = 0;
+	};
+	[[nodiscard]] InFlightTicks DiagInFlightTicks(uint64_t vaddr, uint64_t size,
+	                                              uint64_t window_begin, uint64_t window_end) const;
+	// The tag of later GPU writes: the shader hash RebindBuffers prepares, else 0.
+	static inline uint64_t diag_writer = 0;
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
@@ -108,6 +130,18 @@ public:
 	// dispatch's written bindings are marked during its preparation, and a flush there moves the
 	// command into a later command buffer. Called right after each draw or dispatch is recorded.
 	void RetagGpuWrites();
+	// KYTY_UNMAP_TARGETED (2026-11-21): a program that may address guest buffers through BDA is
+	// being prepared; it may use every registered buffer.
+	void NoteBdaProgram() noexcept { m_bda_pending = m_track_uses; }
+	// Use ticks are kept only for the unmap rule=use and the unmap verify mode.
+	void SetUseTracking(bool enabled) noexcept { m_track_uses = enabled; }
+	// An upper bound of the newest tick at which recorded GPU work may use a cached buffer
+	// overlapping [vaddr, vaddr + size) (bindings, uploads, copies, BDA programs), or 0 when no
+	// cached buffer overlaps it (the current tick when an overlapping buffer is cached and use
+	// tracking is off). GPU thread only. Cached buffers are separate allocations, so this
+	// work never touches guest memory; the unmap rule=use and its verify mode use it.
+	[[nodiscard]] uint64_t NewestUseTick(uint64_t vaddr, uint64_t size);
+	static constexpr uint64_t PENDING_USE = UINT64_MAX;
 	// Bumped whenever JoinOverlap merges a buffer away (and deletes it).
 	[[nodiscard]] uint64_t MergeCount() const { return m_merge_count; }
 	void               RunGarbageCollector();
@@ -136,6 +170,16 @@ private:
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(Buffer& buffer);
+	// A use by the draw, dispatch or command being prepared: its tick is known once RetagGpuWrites
+	// runs after it is recorded (a flush during the preparation moves it to a later tick).
+	void NoteUse(BufferId id, Buffer& buffer) {
+		if (m_track_uses && buffer.use_tick != PENDING_USE) {
+			buffer.use_tick = PENDING_USE;
+			m_pending_uses.push_back(id);
+		}
+	}
+	// A command recorded right now into the current command buffer uses the buffer.
+	void NoteRecordedUse(Buffer& buffer);
 	// A GPU write into [vaddr, vaddr + size) at the current tick (AbSwitch RANGE_WRITE_TICKS).
 	void RecordGpuWrite(uint64_t vaddr, uint64_t size);
 	// The tick a readback of `copies` must wait for: the newest write in flight that covers them.
@@ -193,9 +237,10 @@ private:
 	// decrease from oldest to newest: entries are recorded at the current tick, and RetagGpuWrites
 	// raises every entry since the previous call to the same tick.
 	struct GpuWrite {
-		uint64_t begin = 0;
-		uint64_t end   = 0;
-		uint64_t tick  = 0;
+		uint64_t begin  = 0;
+		uint64_t end    = 0;
+		uint64_t tick   = 0;
+		uint64_t writer = 0; // diag_writer when recorded.
 	};
 	static constexpr size_t GPU_WRITE_RING   = 2048;
 	std::vector<GpuWrite>   m_gpu_writes     = std::vector<GpuWrite>(GPU_WRITE_RING);
@@ -205,6 +250,12 @@ private:
 	// The first entry not re-tagged yet.
 	size_t   m_first_unretagged = 0;
 	uint64_t m_merge_count      = 0;
+	// KYTY_UNMAP_TARGETED: buffers whose use_tick is PENDING_USE, retagged by RetagGpuWrites.
+	std::vector<BufferId> m_pending_uses;
+	// The tick of the newest recorded BDA program; m_bda_pending while one is being prepared.
+	uint64_t m_bda_tick    = 0;
+	bool     m_bda_pending = false;
+	bool     m_track_uses  = false;
 };
 
 } // namespace Libs::Graphics

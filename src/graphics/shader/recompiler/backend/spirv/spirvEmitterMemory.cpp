@@ -1703,9 +1703,40 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitSharedIncDec(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto replacement =
-	    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicInc32 ? AtomicIncrement : AtomicDecrement;
-	return EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement);
+	const bool increment   = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicInc32;
+	const auto replacement = increment ? AtomicIncrement : AtomicDecrement;
+	const auto& mem        = ctx.Memory(inst);
+	if (!ctx.state.profile.inc_dec_add) {
+		return EmitAtomicUpdate(ctx, inst, mem, replacement);
+	}
+	// With an all-ones limit, DS_INC gives old + 1 and DS_DEC gives old - 1: the limit rules wrap
+	// exactly where 32-bit addition wraps. One native atomic then replaces the load and
+	// compare-exchange loop, which contending waves retry once per round trip. Other limits keep
+	// the loop.
+	auto&      state = ctx.state;
+	const auto limit = ctx.Arg(inst, inst.NumArgs() - 2);
+	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		const auto scope =
+		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+		const auto all_ones = Binary(state, spv::OpIEqual, TypeBool(state), limit,
+		                             ConstantU32(state, UINT32_MAX));
+		const auto native = EmitValueOrZeroIfCondition(state, all_ones, [&]() {
+			const auto old = state.builder.AllocateId();
+			state.builder.AddFunction(increment ? spv::OpAtomicIAdd : spv::OpAtomicISub,
+			                          TypeU32(state), old, pointer, ConstantU32(state, scope),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+			                          ConstantU32(state, 1u));
+			EmitAtomicMemoryBarrier(state, mem.kind);
+			return old;
+		});
+		const auto other_limit = Unary(state, spv::OpLogicalNot, TypeBool(state), all_ones);
+		const auto emulated    = EmitValueOrZeroIfCondition(state, other_limit, [&]() {
+			   return AtomicUpdate(state, pointer, mem.kind, [&](uint32_t old) {
+				   return replacement(state, old, limit);
+			   });
+		   });
+		return Select(state, TypeU32(state), all_ones, native, emulated);
+	});
 }
 
 void EmitSharedAtomicMaskedOr32(ValueEmitContext& ctx, const IR::Inst& inst) {

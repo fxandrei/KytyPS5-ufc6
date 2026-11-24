@@ -51,6 +51,8 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	// Also used when a lightweight stencil association first needs native R8 storage.
+	void CreateBacking();
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -66,7 +68,8 @@ public:
 	void CopyImage(Image& source, bool stencil = false);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
-	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
+	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler,
+	                         bool stencil = false);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void MarkCpuDirty() {
@@ -146,6 +149,9 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// A materialized stencil association retains depth_id, but binds its own R8 image.
+	bool stencil_storage = false;
+	bool stencil_storage_pending = false;
 	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.

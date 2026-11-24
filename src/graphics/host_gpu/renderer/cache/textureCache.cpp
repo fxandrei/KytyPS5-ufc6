@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
@@ -35,6 +37,46 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+// KYTY_GPU_MARKERS (diagnostic, 2026-11-21): GPU time of the emulator's own image work, keyed by
+// kind and size class, next to the guest markers. Zero cost without the variable (BeginGpuMarker
+// returns UINT32_MAX). An interval that spans a submit also contains the gap between the two
+// command buffers.
+static std::string EmuMarkerName(const char* kind, uint64_t bytes) {
+	constexpr uint64_t MiB    = 1024ull * 1024ull;
+	const char*        bucket = bytes < MiB        ? "<1MB"
+	                            : bytes < 8 * MiB  ? "1-8MB"
+	                            : bytes < 32 * MiB ? "8-32MB"
+	                                               : "32MB+";
+	return std::string(kind) + " " + bucket;
+}
+
+// KYTY_DIAG_IMAGE_LOSS=1 (2026-11-20 tile-corruption investigation): report images whose GPU-written
+// contents are discarded (unmapped without a download) or overwritten by a CPU-dirty refresh.
+static bool DiagImageLoss() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DIAG_IMAGE_LOSS");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+static void ReportImageLoss(const char* what, const ImageInfo& info, bool gpu_modified,
+                            bool buffer_modified, bool cpu_dirty) {
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) >= 3000) return;
+	std::printf("image-loss: %s t=%.3f addr=0x%016" PRIx64 " size=0x%" PRIx64
+	            " fmt=%u extent=%ux%ux%u tile=%u gpu_mod=%d buf_mod=%d cpu_dirty=%d\n",
+	            what,
+	            std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+	                .count(),
+	            info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
+	            info.extent.width, info.extent.height, info.extent.depth,
+	            static_cast<uint32_t>(info.tile_mode), gpu_modified ? 1 : 0,
+	            buffer_modified ? 1 : 0, cpu_dirty ? 1 : 0);
+	std::fflush(stdout);
+}
+
 
 namespace {
 
@@ -304,7 +346,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image.stencil_ids, {})) {
-			FreeImage(association);
+			if (m_slot_images[association].stencil_storage) {
+				DetachStencilStorage(association);
+			} else {
+				FreeImage(association);
+			}
 		}
 	}
 	m_download_images.erase(id);
@@ -608,6 +654,8 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	const auto  marker = m_scheduler.BeginGpuMarker();
+	const char* kind   = "emu: copy-image direct";
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -616,6 +664,12 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		}
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
+		kind = "emu: copy-image via-buffer";
+	} else {
+		kind = "emu: copy-image d16";
+	}
+	if (marker != UINT32_MAX) {
+		m_scheduler.EndGpuMarker(marker, EmuMarkerName(kind, destination.info.data.size));
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
@@ -1025,6 +1079,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	auto       copies          = info.BufferCopies(linear.offset);
 	if (image.depth_id) {
 		for (auto& copy: copies) {
+			copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
 			copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
 		}
 	}
@@ -1079,12 +1134,23 @@ void TextureCache::InitializeImage(ImageId id) {
 		// Diagnostics: GPU buffer writes over the image (refresh from the buffer copy) or guest
 		// CPU writes.
 		const bool from_gpu = image.IsBufferModified();
+		if (DiagImageLoss() && image.IsGpuModified()) {
+			ReportImageLoss(from_gpu ? "buffer-refresh-over-gpu-image" : "cpu-refresh-over-gpu-image",
+			                image.info, true, image.IsBufferModified(), image.IsCpuDirty());
+		}
 		Common::DebugCounters::Add(from_gpu ? Common::DebugCounters::Counter::TextureRefreshesGpu
 		                                    : Common::DebugCounters::Counter::TextureRefreshesCpu,
 		                           image.info.data.size);
 		TraceTextureRefresh(image.info, from_gpu);
-		const auto scope = m_scheduler.BeginGpuScope();
+		const auto scope  = m_scheduler.BeginGpuScope();
+		const auto marker = m_scheduler.BeginGpuMarker();
 		UploadImage(image, *source, source_offset);
+		if (marker != UINT32_MAX) {
+			m_scheduler.EndGpuMarker(
+			    marker, EmuMarkerName(from_gpu ? "emu: refresh after gpu write"
+			                                   : "emu: refresh after cpu write",
+			                          image.info.data.size));
+		}
 		m_scheduler.EndGpuScope(scope, Common::DebugCounters::Counter::TextureUploadGpuNs);
 		image.ClearBufferModified();
 	}
@@ -1289,6 +1355,32 @@ ImageId TextureCache::FindStencilPlane(const Image& depth, GuestRange range) con
 	return {};
 }
 
+Buffer& TextureCache::StencilScratch() {
+	if (!m_stencil_scratch) {
+		// Image acquisition runs after LDS descriptors are prepared: do not reuse
+		// the device utility allocation bound as shader shared memory.
+		m_stencil_scratch = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 4 * 1024 * 1024);
+		SetVulkanObjectNameF(m_graphics.device, m_stencil_scratch->Handle(), "Stencil Transfer Scratch");
+	}
+	return *m_stencil_scratch;
+}
+
+void TextureCache::DetachStencilStorage(ImageId id) {
+	auto& plane = m_slot_images[id];
+	EXIT_IF(!plane.depth_id || !plane.stencil_storage || plane.stencil_storage_pending);
+	auto& owner = m_slot_images[plane.depth_id];
+	RefreshImage(id);
+	auto& scratch = StencilScratch();
+	plane.CopyImageWithBuffer(owner, scratch, m_tiler, true);
+	plane.MarkGpuModified();
+	std::erase(owner.stencil_ids, id);
+	plane.depth_id = {};
+	plane.stencil_storage = false;
+	plane.HeapChanged();
+	++m_structure_generation;
+}
+
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
@@ -1314,6 +1406,11 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	if (record.stencil_storage &&
+	    (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources ||
+	     record.info.extent != depth.info.extent)) {
+		DetachStencilStorage(association);
+	}
 	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
 		ImageInfo plane {};
 		plane.data         = stencil;
@@ -1328,6 +1425,15 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		    plane.IsTiled() ? TileGetRenderTargetPitch(plane.extent.width, 1) : depth.info.pitch;
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
+		// A former storage plane (or ordinary R8 alias) can hold newer GPU bytes
+		// than guest RAM when a depth attachment adopts it again.
+		const bool retained_gpu_plane = record.backing.image != nullptr &&
+		    record.backing.format == vk::Format::eR8Uint && record.backing.samples == 1 &&
+		    record.backing.extent == plane.extent && record.backing.layers == 1 &&
+		    record.backing.mip_levels == 1 && depth.backing.layers == 1 &&
+		    depth.backing.mip_levels == 1 && depth.backing.samples == 1 &&
+		    !depth.info.metadata.stencil_compressed && record.IsGpuModified() &&
+		    !record.IsDefinitelyCpuDirty() && !record.IsBufferModified();
 		if (record.depth_id != depth_id) {
 			if (record.depth_id) {
 				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
@@ -1337,6 +1443,13 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
+		if (retained_gpu_plane) {
+			record.info.pixel_format = vk::Format::eR8Uint;
+			record.stencil_storage = true;
+			auto& scratch = StencilScratch();
+			depth.CopyImageWithBuffer(record, scratch, m_tiler, true);
+			depth.MarkGpuModified();
+		}
 	}
 
 	return association;
@@ -1486,7 +1599,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
 		const auto* owner = &image;
-		if (ensure_valid && owner->depth_id) {
+		if (ensure_valid && owner->depth_id && !owner->stencil_storage) {
 			owner = &m_slot_images[owner->depth_id];
 		}
 		if (ensure_valid && !owner->SafeToDownload()) {
@@ -1506,17 +1619,97 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 			}
 		}
 	}
-	if (selected && ensure_valid && m_slot_images[selected].depth_id) {
+	if (selected && ensure_valid && m_slot_images[selected].depth_id &&
+	    !m_slot_images[selected].stencil_storage) {
 		selected = m_slot_images[selected].depth_id;
 	}
 	return selected;
+}
+
+// A compressed (HTILE) stencil keeps its logical values in the native image; only a pending
+// HTILE clear, applied when the depth target is next bound, would make them stale. Requires
+// m_lock.
+void TextureCache::CheckStencilStorageMeta(const Image& owner) {
+	if (!owner.info.metadata.stencil_compressed) return;
+	const auto* metadata = FindMeta(owner.info.metadata.range.address);
+	if (metadata != nullptr && metadata->clear_mask.test(0)) {
+		EXIT("stencil storage over a pending HTILE stencil clear is unsupported: htile=0x%016" PRIx64 "\n",
+		     owner.info.metadata.range.address);
+	}
+}
+
+void TextureCache::MaterializeStencilStorage(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock{m_lock};
+	auto& plane = m_slot_images[id];
+	EXIT_IF(!plane.depth_id);
+	auto& owner = m_slot_images[plane.depth_id];
+	const auto& view = desc.view_info;
+	// Other layouts require subresource-aware copies rather than silently clipping writes.
+	if (owner.info.stencil != plane.info.data || owner.binding.is_target ||
+	    owner.info.samples != 1 || owner.backing.samples != 1 ||
+	    owner.info.IsVolume() ||
+	    owner.backing.mip_levels != 1 || owner.backing.layers != 1 ||
+	    plane.stencil_subresources != ImageSubresourceRange{0, 1, 0, 1} ||
+	    plane.info.extent != owner.info.extent || desc.info.extent != plane.info.extent ||
+	    view.base_level != 0 || view.level_count != 1 || view.base_layer != 0 ||
+	    view.layer_count != 1 || view.format != vk::Format::eR8Uint) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Stencil storage layout diagnostic: plane=0x{:x}+0x{:x} owner_stencil=0x{:x}+0x{:x} "
+		    "target={} samples={}/{} compressed={} volume={} native_mips={} layers={} "
+		    "plane_extent={}x{}x{} owner_extent={}x{}x{} desc_extent={}x{}x{} "
+		    "mapping={}+{},{}+{} view={}+{},{}+{} format={}\n",
+		    plane.info.data.address, plane.info.data.size, owner.info.stencil.address, owner.info.stencil.size,
+		    owner.binding.is_target, owner.info.samples, owner.backing.samples,
+		    owner.info.metadata.stencil_compressed, owner.info.IsVolume(), owner.backing.mip_levels,
+		    owner.backing.layers, plane.info.extent.width, plane.info.extent.height, plane.info.extent.depth,
+		    owner.info.extent.width, owner.info.extent.height, owner.info.extent.depth,
+		    desc.info.extent.width, desc.info.extent.height, desc.info.extent.depth,
+		    plane.stencil_subresources.base_level, plane.stencil_subresources.level_count,
+		    plane.stencil_subresources.base_layer, plane.stencil_subresources.layer_count,
+		    view.base_level, view.level_count, view.base_layer, view.layer_count, static_cast<uint32_t>(view.format)));
+		EXIT("unsupported stencil storage layout: address=0x%016" PRIx64 "\n",
+		     plane.info.data.address);
+	}
+	CheckStencilStorageMeta(owner);
+	if (plane.stencil_storage) return;
+	const auto old_size = plane.AccountedSize();
+	if (plane.backing.image != nullptr &&
+	    (plane.backing.format != vk::Format::eR8Uint ||
+	     !(plane.backing.usage & vk::ImageUsageFlagBits::eStorage) ||
+	     plane.backing.extent != plane.info.extent || plane.backing.layers != 1 ||
+	     plane.backing.mip_levels != 1)) {
+		EXIT("unsupported existing stencil storage backing\n");
+	}
+	plane.info.pixel_format = vk::Format::eR8Uint;
+	if (plane.backing.image == nullptr) plane.CreateBacking();
+	plane.stencil_storage = true;
+	m_total_used_memory += plane.AccountedSize() - old_size;
+	plane.HeapChanged();
+	owner.HeapChanged();
+	++m_structure_generation;
+	// An earlier sampled-stencil discovery may still name the native owner.
+	if (owner.binding.is_bound || owner.binding.is_target) owner.binding.needs_rebind = true;
+}
+
+void TextureCache::FinishStencilStorage(ImageId id) {
+	std::scoped_lock lock{m_lock};
+	auto& plane = m_slot_images[id];
+	if (!plane.stencil_storage || !plane.stencil_storage_pending) return;
+	plane.stencil_storage_pending = false;
+	if (!plane.binding.shader_write) return;
+	auto& owner = m_slot_images[plane.depth_id];
+	auto& scratch = StencilScratch();
+	owner.CopyImageWithBuffer(plane, scratch, m_tiler, true);
+	// Preserve independent CPU/buffer dirtiness of depth, and any CPU write that
+	// arrived after acquisition. Do not call CommitGpuWrite here to clear it.
+	owner.MarkGpuModified();
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+	if (!image.registered || (image.depth_id && !image.stencil_storage) || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
 	// Storage readback also queues the first GPU write since the CPU last wrote the image: an
@@ -1526,7 +1719,21 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
-	RefreshImage(id);
+	bool acquired_stencil = false;
+	if (image.stencil_storage && !image.stencil_storage_pending) {
+		auto& owner = m_slot_images[image.depth_id];
+		EXIT_IF(owner.binding.is_target);
+		CheckStencilStorageMeta(owner);
+		RefreshImage(image.depth_id);
+		RefreshImage(id);
+		auto& scratch = StencilScratch();
+		image.CopyImageWithBuffer(owner, scratch, m_tiler, true);
+		image.stencil_storage_pending = image.binding.is_bound;
+		acquired_stencil = true;
+		if (image.binding.shader_write) CommitGpuWrite(image);
+	} else if (!image.stencil_storage) {
+		RefreshImage(id);
+	}
 	if (image.info.HasStencil() && desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
 		if (const auto stencil_id = FindStencilPlane(image, image.info.stencil)) {
@@ -1536,7 +1743,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			CommitGpuWrite(image);
+			if (!image.stencil_storage || acquired_stencil) CommitGpuWrite(image);
 			TrackImageDownload(id, image);
 			if (first_write) {
 				m_download_images.insert(id);
@@ -1579,6 +1786,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		image.stencil_subresources = {0, desc.info.resources.levels,
 		                              static_cast<uint32_t>(offset / slice_size),
 		                              desc.info.resources.layers};
+	}
+	if (image.info.stencil != desc.info.stencil) {
+		for (const auto plane_id : std::vector<ImageId>(image.stencil_ids)) {
+			if (m_slot_images[plane_id].stencil_storage) DetachStencilStorage(plane_id);
+		}
 	}
 	image.info.stencil  = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
@@ -1935,7 +2147,11 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
+	const auto marker = m_scheduler.BeginGpuMarker();
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	if (marker != UINT32_MAX) {
+		m_scheduler.EndGpuMarker(marker, EmuMarkerName("emu: image->buffer sync", copy_size));
+	}
 	// Read the tick after DownloadImage, whose staging copy can submit.
 	buffer.MarkGpuWrite(m_scheduler.CurrentTick());
 	RecordGpuWrite(image.info.data.address, copy_size);
@@ -1944,7 +2160,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id) {
+	if (image.depth_id && !image.stencil_storage) {
 		return false;
 	}
 	if (!image.SafeToDownload() || !CanDownload(image)) {
@@ -1983,6 +2199,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
+	// Tagged with the pages it writes and re-protects: an unmap of them waits for it
+	// (KYTY_UNMAP_TARGETED).
+	const auto page_begin = Common::AlignDown(range.address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(range.End(), TRACKER_PAGE_SIZE);
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
 	                                    trapped = m_readback_storage_images] {
 		download.buffer->Invalidate(download.offset, range.size);
@@ -1994,7 +2214,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 			m_write_backs.erase(m_write_backs.begin());
 		}
 		m_pending_publishes.fetch_sub(1, std::memory_order_acq_rel);
-	});
+	}, page_begin, page_end - page_begin);
 	return true;
 }
 
@@ -2193,6 +2413,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		if (DiagImageLoss() && owner->IsGpuModified()) {
+			ReportImageLoss("unmap-drops-gpu-image", owner->info, true, owner->IsBufferModified(),
+			                owner->IsCpuDirty());
+		}
 		FreeImage(id);
 	}
 }
@@ -2209,13 +2433,27 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
+		// KYTY_TEX_GC=<age>,<pressured age>,<critical age>,<critical deletions> (2026-11-21, experiment):
+		// GC ages in GC ticks. The defaults keep LONGER-unused images under pressure (16/80/160).
+		static const std::array<uint64_t, 4> gc = [] {
+			// Defaults since 2026-11-21 (were 16/80/160/40): under pressure evict sooner, not later; at 4K
+			// the old ages let VRAM fill to the budget (driver paging, 1-6 FPS menus).
+			std::array<uint64_t, 4> v {16, 8, 4, 200};
+			if (const char* e = std::getenv("KYTY_TEX_GC"); e != nullptr) {
+				std::sscanf(e, "%llu%*c%llu%*c%llu%*c%llu", reinterpret_cast<unsigned long long*>(&v[0]),
+				            reinterpret_cast<unsigned long long*>(&v[1]),
+				            reinterpret_cast<unsigned long long*>(&v[2]),
+				            reinterpret_cast<unsigned long long*>(&v[3]));
+			}
+			return v;
+		}();
+		uint64_t age        = gc[0];
 		size_t   deletions  = 10;
 		if (aggressive) {
-			age       = 160;
-			deletions = 40;
+			age       = gc[2];
+			deletions = static_cast<size_t>(gc[3]);
 		} else if (pressured) {
-			age       = 80;
+			age       = gc[1];
 			deletions = 20;
 		}
 		age = std::min(age, tick);

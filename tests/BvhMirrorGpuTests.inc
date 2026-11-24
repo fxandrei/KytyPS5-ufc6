@@ -118,6 +118,8 @@
       // Mirrors the TLAS and traces each origin; returns {valid, instances, hit
       // words...}.
       const auto trace = [&](std::span<const Hit> hits) {
+        // Each fixture trace is a new submitted workload, including the fault-report retry.
+        context.RequestBdaSync();
         auto *origin = reinterpret_cast<float *>(origins.Mapped().data());
         for (size_t i = 0; i < hits.size(); ++i) {
           origin[i * 4] = hits[i].origin[0];

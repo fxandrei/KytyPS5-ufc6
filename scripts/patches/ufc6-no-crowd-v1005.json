@@ -1,0 +1,54 @@
+{
+  "id": "PPSA23566",
+  "version": "01.005.000",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Real-time game speed: gameplay time scale = elapsed / 25 ms, elapsed capped at 100 ms (a 50 ms cap loses time on hitches below 20 FPS)",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0x353db",
+          "off": "4c89f84c29e0498946184c897b38",
+          "on": "4c89f84c29e0e91aacfc0e909090"
+        },
+        {
+          "offset": "0xf000000",
+          "off": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "on": "498946184c897b38498b4610483d40787d017e20483d00e1f5057e05b800e1f505498b0e48f7e948c7c140787d0148f7f9498906e9b05303f1"
+        }
+      ]
+    },
+    {
+      "name": "No crowd: skip four crowd renderer work paths (01.005.000 test candidate)",
+      "type": "checkbox",
+      "enabled": false,
+      "memory": [
+        {
+          "offset": "0x4a27305",
+          "off": "0f8447030000",
+          "on": "90e947030000"
+        },
+        {
+          "offset": "0x4a27ccb",
+          "off": "0f8453010000",
+          "on": "90e953010000"
+        },
+        {
+          "offset": "0x4a280dc",
+          "off": "0f84ab010000",
+          "on": "90e9ab010000"
+        },
+        {
+          "offset": "0x4a29bdc",
+          "off": "0f84a0010000",
+          "on": "90e9a0010000"
+        }
+      ]
+    }
+  ],
+  "credits": [
+    "Kyty 2P session"
+  ],
+  "name": "EA SPORTS UFC 6"
+}
