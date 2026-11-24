@@ -1,14 +1,20 @@
-CURRENT RESUME: 2026-11-24 - UPDATE / RELEASE IN PROGRESS
+CURRENT RESUME: 2026-11-24 - RELEASE PREPARATION CHECKPOINT
 Read docs/releases/2026-11-24-integration.md and the LAST entry in
-D:/Projects/kyty-dev/handoff/2026-11-24/HANDOFF.txt first.
-User authorized refresh, push to fxandrei/KytyPS5-ufc6 and publication. Do not ask again.
-Branch release/ufc6-20261124, backup snapshot 8d40d8b2a; upstream b446af9d2 integrated.
-Build PASS; eight focused GPU functional checks PASS. Eleven CPU/resource/kernel CTests PASS.
-Full GPU suite FAIL at inherited adjacent-download stride. Filesystem suite FAIL at Linux /proc
-helper on Windows; network-only FAIL at initial NP callback sign-in state. No Vulkan validation.
-Live integrated-source control and publication still pending. Finish clean Fork/tag build,
-portable package/source archive/checksums, fast-forward personal ufc6-perf and publish prerelease.
-Preserve uploads; artifacts/TEMP on D:. Earlier dated notes below retain historical state.
+D:/Projects/kyty-dev/handoff/2026-11-24/HANDOFF.txt, then investigation.json.
+User authorized refresh, personal push and publication. Sources already pushed to ufc6-perf at46a5657e2.
+Upstream b446af9d2 integrated; original local work preserved in8d40d8b2a/backup branch.
+Build PASS; eight focused GPU functional checks PASS; eleven CPU/resource/kernel CTests PASS.
+Full GPU FAIL at inherited download stride; filesystem FAIL at Linux /proc helper on Windows;
+network-only FAIL at NP initial callback state. No Vulkan validation (RTSS left alone).
+Live source46a5657/exeBB09611E: default BAR1080p observed clean combat +four attack buttons;
+18 zero-compilation samples in20.2s: mean46.82/median46.39FPS. Guest watchdog before fight.
+Default4K: visible black/white corruption and severe menu slowdown/memory pressure. Unmapped4K/1080p:
+fatal Vulkan semaphore waits before combat. No new FPS gain, backend adoption or60FPS combat claim.
+Prepare/publish experimental tagufc6-v20261124-preview.1 with clean Fork provenance and exact hashes.
+Release URL: https://github.com/fxandrei/KytyPS5-ufc6/releases/tag/ufc6-v20261124-preview.1
+Final remote state/package results live in that release and the detailed local handoff.
+Next: isolate native4K correctness/pressure +fatal waits, then a clean warm fight-only profile.
+Preserve user uploads; artifacts/TEMP onD:. Earlier notes retain historical state.
 
 Kyty / UFC 6 active development handoff
 CURRENT RESUME: 2026-11-23 22:06 Europe/Bucharest. Read RESULTS_2205.md and the LAST entry in

@@ -12,7 +12,14 @@ first-run shader/pipeline compilation is not a performance benchmark.
 
 Optional UFC 6 helper (PowerShell, example path; replace it with your own):
 
-  powershell -ExecutionPolicy Bypass -File .\Run-UFC6.ps1 -GamePath "D:\games\UFC6"
+  powershell -ExecutionPolicy Bypass -File .\Run-UFC 6.ps1 -GamePath "D:\games\UFC 6"
+
+Latest integrated live controls: default BAR allocation reached one visually
+clean 1080p fight and accepted four attack buttons. The bounded compilation-free
+sample was about 47 FPS; this is not an A/B improvement or a 60 FPS result.
+A pre-fight guest watchdog still occurred. The 4K control showed major graphical
+corruption and severe slowdown before combat. Use this preview for testing.
+For the configuration that reached combat, add -Output1080p to the example above.
 
 The helper reports 4K output in a 1280x720 window; the game's dynamic internal
 resolution remains active. Add -Output1080p for the lower-output mode. Window size
@@ -25,11 +32,12 @@ disable it. The normal launcher does not automatically apply this patch.
 
 Experimental allocation control:
 
-  powershell -ExecutionPolicy Bypass -File .\Run-UFC6.ps1 -GamePath "D:\games\UFC6" -ExperimentalUnmappedBuffers
+  powershell -ExecutionPolicy Bypass -File .\Run-UFC 6.ps1 -GamePath "D:\games\UFC 6" -ExperimentalUnmappedBuffers
 
-This selects GPU buffers without a CPU mapping. Previous controls avoided the
-worst menu slowdown, but a pre-fight watchdog still occurred and combat did not
-reach 60 FPS. It is opt-in; the normal allocation default is unchanged.
+This selects GPU buffers without a CPU mapping. The current integrated 4K and
+1080p controls using this experiment ended with fatal Vulkan semaphore waits
+before combat. Earlier revisions behaved differently; it is not recommended as
+a performance option for this snapshot. The normal allocation default is unchanged.
 
 Research scripts in the source repository include rejected/unvalidated timing
 and crowd experiments. They are not enabled by this package. Optional Streamline

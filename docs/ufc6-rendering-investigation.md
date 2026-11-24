@@ -19,8 +19,22 @@ Eleven CPU/resource/kernel CTests passed during integration. The full GPU suite 
 previously recorded adjacent-download-stride assertion. The filesystem suite stops in an upstream
 Linux `/proc` waiter helper on Windows; its separate network mode fails the initial NP callback state
 assertion. Those paths remain unverified. No Vulkan-validation pass: RTSS remains active.
-Live merged-source control and release publication are still pending. Known watchdog/corruption,
-replay and BAR menu issues require a prerelease. No 60 FPS combat claim.
+Live controls used clean integration commit `46a5657e2`, executable SHA256
+`BB09611E57159C758EC4834EC38C20950E352FB455DD86B035E18BA276D49C59`.
+Default BAR +1080p reached observed clean combat and accepted all four attack buttons. Between
+18:45:55.138 and18:46:15.338,18 compilation-free rows averaged46.82/median46.39FPS at1920x1080 depth.
+This is descriptive evidence from one bounded fight, not a matched A/B or an optimization claim.
+Pre-fight guest watchdogs remain. The default 4K control showed severe pre-fight slowdown and visible
+black bands/white regions under memory pressure; no performance claim is valid for that image.
+Unmapped-buffer 4K and1080p controls failed in Vulkan semaphore waits before combat. No backend
+change is adopted. The previous Nov23 ~39FPS native4K/no-crowd observation is a different control.
+
+Release preparation: `ufc6-v20261124-preview.1` at
+https://github.com/fxandrei/KytyPS5-ufc6/releases/tag/ufc6-v20261124-preview.1 .
+The owner requested publication; final remote state is recorded in the GitHub release and the detailed
+local handoff. Remaining priority: isolate native4K corruption/pressure and the unmapped fatal waits,
+then obtain a clean, warm, fight-only CPU/GPU profile. Replay/long-session stability and60FPS remain
+unverified. The Accelerated clock is not a wall-clock physics test.
 
 ## Previous entry point, 2026-11-23
 

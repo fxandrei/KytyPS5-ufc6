@@ -28,4 +28,14 @@ Validation checkpoint before live control:
   bypass clear-key invalidation. Buffered stencil bridges retain GENERAL, ordinary transfers use the
   upstream layout contract. S8 plane reparenting and indirect writer dependencies pass their tests.
 - Functional execution is not a Vulkan validation run. RTSS remains active and was left alone.
-- A merged-source live control and final package checks are pending at this checkpoint.
+- Merged-source live controls used executable `BB09611E57159C758EC4834EC38C20950E352FB455DD86B035E18BA276D49C59`
+  from clean integration commit `46a5657e2`. Default BAR + 1080p reached visually clean combat and accepted
+  Square/Triangle/Cross/Circle. The screenshot-bounded 20.2 s interval contains18 compilation-free samples:
+  mean 46.82 / median 46.39 FPS,1920x1080 depth. No matched A/B or 60 FPS claim. Pre-fight watchdogs occurred.
+- Default BAR +4K produced visible black bands/white regions and severe pre-fight slowdown; memory
+  pressure was observed. This is a correctness failure, not a usable FPS benchmark. Unmapped-buffer
+  controls at both output sizes failed in Vulkan semaphore waits before combat. The cause and any
+  regression relative to older, differently configured controls remain unisolated.
+- Final artifact hashes, package verification and publication state are supplied with the release at
+  https://github.com/fxandrei/KytyPS5-ufc6/releases/tag/ufc6-v20261124-preview.1 . Native 4K correctness,
+  allocator pressure and fatal waits take priority over further performance changes.
